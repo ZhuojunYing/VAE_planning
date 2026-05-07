@@ -1,0 +1,21 @@
+# Virtual environments
+vae_env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Results, outputs, and logs
+results/
+outputs/
+logs/
+
+# Log files
+*.log
+*.out
+*.err
+
+# System files
+.DS_Store
