@@ -1,11 +1,14 @@
 # Virtual environments
-vae_env/
+vae_env
 
 # Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 .ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Results, outputs, and logs
 results/
