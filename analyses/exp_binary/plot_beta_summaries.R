@@ -9,10 +9,11 @@ get_arg <- function(i, default) {
 beta_arg <- get_arg(1, "0.01,0.1,1.0,10.0,100.0")
 lambda_arg <- get_arg(2, "1.0")
 alpha_arg <- get_arg(3, "0.0")
-opportunity_arg <- get_arg(4, "0.0001")
+opportunity_arg <- get_arg(4, "0.0")
 input_dir <- get_arg(5, "outputs/simulations")
 results_dir <- get_arg(6, "results")
 tree_size <- as.integer(get_arg(7, "2"))
+input_type <- get_arg(8, "uniform")
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -46,8 +47,8 @@ simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_v
         for (opportunity_candidate in opportunity_candidates) {
           file_names <- c(
             sprintf(
-              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_seed_%d_%dn_binary.csv",
-              lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate, seed, tree_size
+              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_seed_%d_%dn_%s.csv",
+              lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate, seed, tree_size, input_type
             )
           )
           for (file_name in file_names) {
@@ -207,6 +208,57 @@ v_mi_summary <- aggregate(
   FUN = mean
 )
 
+build_kl_summary <- function(dat) {
+  kl_cols <- grep("^kl_d_t[0-9]+$", names(dat), value = TRUE)
+  kl_cols <- kl_cols[order(as.integer(sub("^kl_d_t", "", kl_cols)))]
+
+  if (length(kl_cols) == 0) {
+    stop(
+      paste(
+        "Expected kl_d_t* columns for KL plotting, but none were found.",
+        "Please re-run simulate.py with the updated model outputs."
+      )
+    )
+  }
+
+  trial_id_cols <- intersect(c("beta", "seed", "graph"), names(dat))
+  trial_cols <- unique(c(trial_id_cols, kl_cols))
+  trial_data <- unique(dat[, trial_cols, drop = FALSE])
+
+  rows <- list()
+  row_i <- 1
+  for (i in seq_len(nrow(trial_data))) {
+    for (kl_col in kl_cols) {
+      timestep <- as.integer(sub("^kl_d_t", "", kl_col))
+      kl_value <- suppressWarnings(as.numeric(trial_data[[kl_col]][[i]]))
+      if (!is.na(kl_value)) {
+        rows[[row_i]] <- data.frame(
+          beta = trial_data$beta[[i]],
+          seed = trial_data$seed[[i]],
+          graph = trial_data$graph[[i]],
+          timestep = timestep,
+          kl_d = kl_value,
+          stringsAsFactors = FALSE
+        )
+        row_i <- row_i + 1
+      }
+    }
+  }
+
+  if (length(rows) == 0) {
+    stop("KL columns were found, but all kl_d_t* values are NA.")
+  }
+
+  kl_data <- do.call(rbind, rows)
+  aggregate(
+    kl_d ~ beta + timestep,
+    data = kl_data,
+    FUN = mean
+  )
+}
+
+kl_summary <- build_kl_summary(all_data)
+
 beta_levels <- beta_values[beta_values %in% unique(all_data$beta)]
 if (length(beta_levels) == 0) {
   beta_levels <- unique(all_data$beta)
@@ -229,8 +281,8 @@ expand_range <- function(x, pad = 0.5) {
 stop_pdf <- file.path(
   results_dir,
   sprintf(
-    "binary_stop_probability_lambda_%s_alpha_%s_opportunity_%s_%dn.pdf",
-    lambda_arg, alpha_arg, opportunity_arg, tree_size
+    "stop_probability_%s_lambda_%s_alpha_%s_opportunity_%s_%dn.pdf",
+    input_type, lambda_arg, alpha_arg, opportunity_arg, tree_size
   )
 )
 
@@ -326,8 +378,8 @@ dev.off()
 v_mi_pdf <- file.path(
   results_dir,
   sprintf(
-    "binary_average_V_vs_MI_lambda_%s_alpha_%s_opportunity_%s_%dn.pdf",
-    lambda_arg, alpha_arg, opportunity_arg, tree_size
+    "average_V_vs_MI_%s_lambda_%s_alpha_%s_opportunity_%s_%dn.pdf",
+    input_type, lambda_arg, alpha_arg, opportunity_arg, tree_size
   )
 )
 
@@ -364,5 +416,55 @@ legend(
 )
 dev.off()
 
+kl_pdf <- file.path(
+  results_dir,
+  sprintf(
+    "average_kl_d_%s_lambda_%s_alpha_%s_opportunity_%s_%dn.pdf",
+    input_type, lambda_arg, alpha_arg, opportunity_arg, tree_size
+  )
+)
+
+pdf(kl_pdf, width = 7, height = 5.5)
+plot(
+  NA,
+  xlim = expand_range(kl_summary$timestep, pad = 0.1),
+  ylim = expand_range(kl_summary$kl_d, pad = 0.05),
+  xlab = "Timestep",
+  ylab = "Average kl_d",
+  main = sprintf(
+    "Average kl_d by timestep (lambda=%s, alpha=%s, opportunity=%s)",
+    lambda_arg, alpha_arg, opportunity_arg
+  ),
+  xaxt = "n"
+)
+axis(1, at = sort(unique(kl_summary$timestep)))
+grid()
+
+for (beta_value in beta_levels) {
+  beta_dat <- kl_summary[kl_summary$beta == beta_value, , drop = FALSE]
+  beta_dat <- beta_dat[order(beta_dat$timestep), , drop = FALSE]
+  if (nrow(beta_dat) > 0) {
+    lines(
+      beta_dat$timestep,
+      beta_dat$kl_d,
+      type = "b",
+      pch = 19,
+      lwd = 2,
+      col = beta_cols[[beta_value]]
+    )
+  }
+}
+
+legend(
+  "topright",
+  legend = paste("beta", beta_levels),
+  col = beta_cols[beta_levels],
+  pch = 19,
+  lwd = 2,
+  bty = "n"
+)
+dev.off()
+
 message("Wrote: ", stop_pdf)
 message("Wrote: ", v_mi_pdf)
+message("Wrote: ", kl_pdf)

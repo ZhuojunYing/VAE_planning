@@ -130,14 +130,14 @@ def run_simulation(config):
     num_trials = 2000
     time_steps = config.time_steps
 
-    if config.tree_size != 2:
+    if config.input_type == "binary":
         rewards_list = [
-            [random.choice([-4, -3, -2, -1, 1, 2, 3, 4]) for _ in range(time_steps)]
+            [random.choice([0, 1]) for _ in range(time_steps)]
             for _ in range(num_trials)
         ]
     else:
         rewards_list = [
-            [random.choice([0, 1]) for _ in range(time_steps)]
+            [random.choice([-4, -3, -2, -1, 1, 2, 3, 4]) for _ in range(time_steps)]
             for _ in range(num_trials)
         ]
 

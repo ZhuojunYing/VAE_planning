@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Check if all required arguments are provided
-if [ "$#" -ne 13 ]; then
+if [ "$#" -ne 15 ]; then
     echo "Usage: $0 beta_log10_min beta_log10_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_str seed_min seed_max train"
     echo "Example: $0 -2 2 5 0 0 1 0 0.2 5 1.0 1 5 train"
     exit 1
@@ -22,6 +22,8 @@ echo "10: '${10}'"
 echo "11: '${11}'"
 echo "12: '${12}'"
 echo "13: '${13}'"
+echo "14: '${14}'"
+echo "15: '${15}'"
 echo "================================="
 
 # Assign arguments to variables
@@ -38,6 +40,8 @@ lambda_str=${10}
 seed_str=${11}
 seed_max=${12}
 train=${13}
+input_type=${14}
+tree_size=${15}
 # Create a Python script to generate the commands
 cat > generate_commands.py << 'EOL'
 import numpy as np
@@ -51,11 +55,13 @@ lambda_str = sys.argv[10]
 seed_min = int(sys.argv[11])
 seed_max= int(sys.argv[12])
 train = sys.argv[13]
+input_type = sys.argv[14]
+tree_size = sys.argv[15]
 if np.isinf(beta_log_min) or np.isinf(beta_log_max):
     beta_exp_values = np.zeros(beta_steps)
 else:
     beta_log_values = np.linspace(beta_log_min, beta_log_max, beta_steps)
-    beta_exp_values=np.array( [ 10**  l for l in beta_log_values])
+    beta_exp_values=np.array( [10** l for l in beta_log_values])
 
 # Handle alpha values
 if np.isinf(alpha_log_min) or np.isinf(alpha_log_max):
@@ -69,7 +75,7 @@ if np.isinf(opportunity_min) or np.isinf(opportunity_max):
     opportunity_values = np.zeros(opportunity_steps)
 else:
     opportunity_log_values = np.linspace(opportunity_min, opportunity_max, opportunity_steps)
-    opportunity_values =np.array( [ 10**  l for l in opportunity_log_values])
+    opportunity_values =np.array( [   l for l in opportunity_log_values])
 
 # Split into lists of length 5
 def split_list(lst, n):
@@ -90,7 +96,7 @@ for seed_list in seed_values_split:
                 seed_str = ", ".join([f"{x}" for x in seed_list])
                 opportunity_str = ", ".join([f"{x}" for x in opportunity_list])
                 # NOTE: We removed the extra double quotes inside the python print to make parsing easier in bash
-                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model_2n_binary.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "binary" "{seed_str}" "{train}" "{opportunity_str}"'
+                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size}'
                 print(command)
 EOL
 
@@ -98,7 +104,7 @@ EOL
 JID_FILE=$(mktemp)
 
 # Run the Python script and execute each command
-python generate_commands.py "$beta_log_min" "$beta_log_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_min" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" | while read -r cmd; do
+python generate_commands.py "$beta_log_min" "$beta_log_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_min" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size"| while read -r cmd; do
     echo "Executing: $cmd"
     
     # 1. Execute the command and capture the output (e.g., "Submitted batch job 12345")

@@ -133,6 +133,7 @@ class VariationalRNN(tf.keras.Model):
         all_action_outputs = []
         all_node_selections = []
         all_stop_decisions = []
+        all_stop_value_preds = []
         all_kl_d = []
         valid_step_masks = []
 
@@ -153,9 +154,9 @@ class VariationalRNN(tf.keras.Model):
         observed_inputs = tf.zeros_like(inputs)
 
         cumulative_critic_loss = tf.constant(0.0, dtype=tf.float32)
-        cumulative_action_loss = tf.constant(0.0, dtype=tf.float32)
         for t in range(self.time_steps):
             valid_step_masks.append(active_mask)
+            all_stop_value_preds.append(self.critic_head(hidden_state_flat))
             expansion_logits = self.expansion_head(hidden_state_flat)
             masked_expansion_logits = expansion_logits + (visited_mask * -1e9)
 
@@ -225,8 +226,6 @@ class VariationalRNN(tf.keras.Model):
             observed_inputs = inputs * observed_mask
             all_observed_masks.append(tf.squeeze(observed_mask, axis=-1))
 
-            step_action_loss = self.compute_final_actor_loss(observed_inputs, step_action_output)
-            cumulative_action_loss += step_action_loss
             rec_decoder_input = tf.concat([hidden_state_flat], axis=1)
 
             dist_params = self.reconstruction_head(rec_decoder_input)
@@ -259,26 +258,14 @@ class VariationalRNN(tf.keras.Model):
 
             prior_mean, prior_var = self.compute_time_conditional_prior(t, batch_size)
             kl_per_sample = self.calculate_kl_per_sample(z_mean, z_log_var, prior_mean, prior_var)
-            kl = tf.reduce_mean(kl_per_sample)
+            kl_mask = tf.squeeze(active_mask, axis=-1)
+            masked_kl_per_sample = kl_per_sample * kl_mask
+            kl = tf.reduce_mean(masked_kl_per_sample)
             all_kl_d.append(tf.expand_dims(kl_per_sample, axis=-1))
-            information_cost += kl * tf.reduce_mean(active_mask)
+            information_cost += kl
 
             visited_mask = tf.minimum(visited_mask + node_onehot * active_mask, 1.0)
             active_mask = next_active_mask
-
-        final_action_decoder_input = tf.concat([hidden_state_flat], axis=1)
-        action_logits = self.action_head(final_action_decoder_input)
-        action_output = tf.nn.softmax(action_logits, axis=-1)
-
-        # final actor loss only
-        action_loss = self.compute_final_actor_loss(inputs, action_output)
-        aux_action_loss = cumulative_action_loss / tf.cast(self.time_steps, tf.float32)
-        # average critic loss across time
-        critic_loss = cumulative_critic_loss / tf.cast(self.time_steps, tf.float32)
-
-        # final critic prediction/target for logging only
-        value_pred = self.critic_head(final_action_decoder_input)
-        value_target = self.compute_best_achievable_value_target(observed_inputs)
 
         all_z_means = tf.stack(all_z_means, axis=1)
         all_z_log_vars = tf.stack(all_z_log_vars, axis=1)
@@ -286,8 +273,34 @@ class VariationalRNN(tf.keras.Model):
         action_outputs_sequence = tf.stack(all_action_outputs, axis=1)
         node_selections = tf.stack(all_node_selections, axis=1)
         stop_decisions = tf.stack(all_stop_decisions, axis=1)
+        stop_value_preds = tf.stack(all_stop_value_preds, axis=1)
         kl_d_sequence = tf.stack(all_kl_d, axis=1)
         valid_step_masks = tf.stack(valid_step_masks, axis=1)
+
+        stop_flags = tf.squeeze(stop_decisions > 0, axis=-1)
+        has_stop = tf.reduce_any(stop_flags, axis=1)
+        first_stop_index = tf.argmax(
+            tf.cast(stop_flags, tf.int32),
+            axis=1,
+            output_type=tf.int32
+        )
+        selected_action_index = tf.where(
+            has_stop,
+            first_stop_index,
+            tf.fill([batch_size], self.time_steps - 1)
+        )
+        batch_indices = tf.range(batch_size, dtype=tf.int32)
+        gather_indices = tf.stack([batch_indices, selected_action_index], axis=1)
+        action_output = tf.gather_nd(action_outputs_sequence, gather_indices)
+
+        # Train the actor on the policy available at the model's stopping point.
+        action_loss = self.compute_final_actor_loss(inputs, action_output)
+        # average critic loss across time
+        critic_loss = cumulative_critic_loss / tf.cast(self.time_steps, tf.float32)
+
+        # final critic prediction/target for logging only
+        value_pred = self.critic_head(hidden_state_flat)
+        value_target = self.compute_best_achievable_value_target(observed_inputs)
 
         kl_scaler = 1
         information_loss = information_cost / self.time_steps / kl_scaler
@@ -302,8 +315,11 @@ class VariationalRNN(tf.keras.Model):
             tf.stack(all_expansion_log_probs, axis=1),
             tf.stack(all_expansion_entropies, axis=1),
             action_outputs_sequence,
+            stop_value_preds,
             valid_step_masks,
-            stop_decisions
+            stop_decisions,
+            kl_d_sequence,
+            current_beta
         )
 
         if training:
@@ -325,16 +341,14 @@ class VariationalRNN(tf.keras.Model):
             first_decoder_loss += (
                 information_loss * current_beta
                 + action_loss * self.lambda_
-                + expansion_loss * self.lambda_
+              
                 + critic_loss *  self.lambda_* current_critic_coef
                 + reconstruction_loss * self.alpha
             )
             second_decoder_loss += reconstruction_loss
             action_head_loss += action_loss * self.lambda_
             expansion_head_loss += (
-                information_loss * current_beta
-                + action_loss * self.lambda_
-                + expansion_loss * self.lambda_
+                 expansion_loss * self.lambda_
             )
 
         category_outputs = tf.stack(all_category_outputs, axis=1)
@@ -468,8 +482,11 @@ class VariationalRNN(tf.keras.Model):
         log_probs,
         entropies,
         action_outputs_sequence,
+        stop_value_preds,
         valid_step_masks,
-        stop_decisions
+        stop_decisions,
+        kl_d_sequence,
+        current_beta
     ):
         _, path_rewards = self._prepare_path_rewards(inputs)
         step_expected_reward = tf.reduce_sum(
@@ -491,10 +508,12 @@ class VariationalRNN(tf.keras.Model):
         stop_decisions = tf.cast(stop_decisions, tf.float32)
         non_stop_expansion = mask * (1.0 - stop_decisions)
         opportunity_penalty = self.opportunity_cost * non_stop_expansion
+        kl_penalty = current_beta * kl_d_sequence * mask
 
-        returns = (step_expected_reward / reward_norm) - opportunity_penalty
-        returns = tf.stop_gradient(returns)
-        policy_loss = -log_probs * returns * mask
+        stop_now_baseline = tf.stop_gradient(stop_value_preds / reward_norm)
+        sampled_return = (step_expected_reward / reward_norm) - opportunity_penalty - kl_penalty
+        advantages = tf.stop_gradient(sampled_return - stop_now_baseline)
+        policy_loss = -log_probs * advantages * mask
 
         entropy_beta = 0.01
         entropy_bonus = entropies * mask
@@ -528,7 +547,7 @@ class VariationalRNN(tf.keras.Model):
         normalized_path_rewards = actual_path_rewards 
         return actual_path_rewards, normalized_path_rewards
 
-    def compute_final_actor_loss(self, inputs, action_probs):
+    def compute_final_actor_loss(self, inputs, action_probs, sample_mask=None):
         _, normalized_path_rewards = self._prepare_path_rewards(inputs)
 
         expected_reward = tf.reduce_sum(
@@ -537,14 +556,21 @@ class VariationalRNN(tf.keras.Model):
             keepdims=True
         )
 
-        mean_expected_reward = tf.reduce_mean(expected_reward)
-
         entropy = -tf.reduce_sum(
             action_probs * tf.math.log(action_probs + 1e-8),
             axis=1,
             keepdims=True
         )
-        mean_entropy = tf.reduce_mean(entropy)
+
+        if sample_mask is None:
+            sample_mask = tf.ones_like(expected_reward)
+        else:
+            sample_mask = tf.cast(sample_mask, tf.float32)
+
+        active_count = tf.reduce_sum(sample_mask)
+        valid_count = active_count + 1e-6
+        mean_expected_reward = tf.reduce_sum(expected_reward * sample_mask) / valid_count
+        mean_entropy = tf.reduce_sum(entropy * sample_mask) / valid_count
         if self.time_steps == 12:
             entropy_beta = 0.05
         else:       
@@ -563,6 +589,11 @@ class VariationalRNN(tf.keras.Model):
             # else:
             #     mean_expected_reward = mean_expected_reward  / (6.4726)
         action_loss = (1.0 - mean_expected_reward) - entropy_beta * mean_entropy
+        action_loss = tf.where(
+            active_count > 0.0,
+            action_loss,
+            tf.constant(0.0, dtype=tf.float32)
+        )
 
         action_loss = tf.where(
             tf.math.is_finite(action_loss),

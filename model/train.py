@@ -196,7 +196,7 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
     if model.time_steps  == 6:
         target_critic_coef = 1
     elif model.time_steps == 2:
-        target_critic_coef = 0
+        target_critic_coef = 0.1
     elif model.time_steps == 30:
         target_critic_coef =0
     else:

@@ -13,6 +13,7 @@ echo "7: '$7'"
 echo "8: '$8'"
 echo "9: '$9'"
 echo "10: '${10}'"
+echo "11: '${11}'"
 echo "================================="
 lambda_string=$1
 alpha_string=$2
@@ -24,6 +25,7 @@ input_type=$7
 seed=$8
 train=$9
 opportunity_cost_string=${10:-"0.0"}
+tree_size=${11}
 # Navigate to the directory containing the virtual environment if it's not in the current directory
 # Uncomment and modify the next line if needed
 # cd /path/to/your/project
@@ -31,7 +33,7 @@ module unload cuda/11.0
 module load cuda/11.2
 # Activate the virtual environment
 source vae_env/bin/activate
-python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "120" "$input_type" "$seed" "2" "$train" "" "$opportunity_cost_string"
+python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "120" "$input_type" "$seed" "$tree_size" "$train" "" "$opportunity_cost_string"
 
 
 # Deactivate the virtual environment when done
