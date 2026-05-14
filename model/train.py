@@ -13,7 +13,7 @@ import helper
 import csv
 import config
 @tf.function
-def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef, input_data, input_type_str, clip_value=10.0):
+def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef, input_data, input_type_str, clip_value=10.0, ppo_epochs=3):
     """
     Executes one training step: forward pass, loss computation, and backpropagation.
     """
@@ -29,6 +29,17 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
     expansion_params = model.expansion_head.trainable_variables
     critic_params = model.critic_head.trainable_variables
     with tf.device('/GPU:0'):
+        rollout_outputs = model(
+            input_data,
+            training=True,
+            current_alpha=current_alpha,
+            current_beta=current_beta,
+            current_critic_coef=current_critic_coef,
+            compute_losses=False
+        )
+        old_node_selections = tf.stop_gradient(rollout_outputs[12])
+        old_expansion_log_probs = tf.stop_gradient(rollout_outputs[18])
+
         with tf.GradientTape(persistent=True) as tape:
             time_steps = model.time_steps
             feature_dim = 1
@@ -39,8 +50,17 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
             (reconstructed, action, total_loss, 
              first_decoder_loss, second_decoder_loss, 
              action_head_loss, critic_loss, information_loss, action_loss, reconstruction_loss,
-             information_cost, all_z_means, *extra_outputs) = model(input_data, training=True, current_alpha=current_alpha, current_beta=current_beta, current_critic_coef=current_critic_coef)
-            expansion_head_loss = extra_outputs[-1]
+             information_cost, all_z_means, *extra_outputs) = model(
+                input_data,
+                training=True,
+                current_alpha=current_alpha,
+                current_beta=current_beta,
+                current_critic_coef=current_critic_coef,
+                forced_node_selections=old_node_selections,
+                old_expansion_log_probs=old_expansion_log_probs,
+                use_ppo_loss=True
+            )
+            expansion_head_loss = extra_outputs[5]
              
             # --- THE FIX: Create the weighted tensors INSIDE the tape scope ---
             weighted_kl_for_logging = information_loss * current_beta
@@ -100,6 +120,26 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
     
     # Must explicitly delete a persistent tape when done
     del tape
+
+    for _ in range(max(ppo_epochs - 1, 0)):
+        with tf.GradientTape() as ppo_tape:
+            (reconstructed, action, total_loss,
+             first_decoder_loss, second_decoder_loss,
+             action_head_loss, critic_loss, information_loss, action_loss, reconstruction_loss,
+             information_cost, all_z_means, *extra_outputs) = model(
+                input_data,
+                training=True,
+                current_alpha=current_alpha,
+                current_beta=current_beta,
+                current_critic_coef=current_critic_coef,
+                forced_node_selections=old_node_selections,
+                old_expansion_log_probs=old_expansion_log_probs,
+                use_ppo_loss=True
+            )
+            ppo_expansion_loss = extra_outputs[5]
+
+        ppo_expansion_gradients = ppo_tape.gradient(ppo_expansion_loss, expansion_params)
+        optimizer.apply_gradients(zip(ppo_expansion_gradients, expansion_params))
     
     # Return all 13 values
     return (total_loss, information_loss, action_loss, reconstruction_loss, 
@@ -119,8 +159,10 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
    
 
     
+    ppo_epochs = 3
+
     # --- REVERTED: Standard Cosine Decay with Warmup ---
-    total_steps = epochs * trials_per_epoch
+    total_steps = epochs * trials_per_epoch * ppo_epochs
     lr_warmup_epochs = 0
     warmup_steps = lr_warmup_epochs * trials_per_epoch
 
@@ -188,8 +230,8 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         'act_grad_norm_enc': [], 'act_grad_norm_lstm': [], 'act_grad_norm_dec': [],
         'rec_grad_norm_enc': [], 'rec_grad_norm_lstm': [], 'rec_grad_norm_dec': []
     }
-    kl_warmup_epochs = 10   # Keep beta at 0.0 while learning rate warms up
-    kl_annealing_epochs = 70 # How many epochs it takes to go from 0.0 to target_beta
+    kl_warmup_epochs = 0   # Keep beta at 0.0 while learning rate warms up
+    kl_annealing_epochs = 0 # How many epochs it takes to go from 0.0 to target_beta
     target_beta =1/model.beta
     critic_warmup_epochs = 80
     critic_annealing_epochs =120
@@ -249,7 +291,8 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 current_beta=tf.constant(current_beta, dtype=tf.float32),
                 current_critic_coef=tf.constant(current_critic_coef, dtype=tf.float32),
                 input_data=batch_input_data,
-                input_type_str=input_type
+                input_type_str=input_type,
+                ppo_epochs=ppo_epochs
             )
             
             # Accumulate metrics

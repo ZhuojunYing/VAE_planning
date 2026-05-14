@@ -45,6 +45,8 @@ def build_model(config, alpha, beta, lambda_, opportunity_cost):
         lambda_=lambda_,
         tree_type=getattr(config, "tree_type", "deep"),
         opportunity_cost=opportunity_cost,
+        input_type=config.input_type,
+        expansion_decision_version=config.expansion_decision_version,
     )
 
 
@@ -52,10 +54,12 @@ def model_name_for(config, lambda_, alpha, beta, opportunity_cost):
     if config.tree_size == 30:
         return (
             f"lambda_{lambda_}_alpha_{alpha}_beta_{beta}_opportunity_{opportunity_cost}_"
+            f"expansion_{config.expansion_decision_version}_"
             f"seed_{config.seed}_{config.tree_size}n_{config.tree_type}"
         )
     return (
         f"lambda_{lambda_}_alpha_{alpha}_beta_{beta}_opportunity_{opportunity_cost}_"
+        f"expansion_{config.expansion_decision_version}_"
         f"seed_{config.seed}_{config.tree_size}n"
     )
 
@@ -147,7 +151,8 @@ def run_simulation(config):
                 for opportunity_cost in config.opportunity_cost_values:
                     print(
                         f"\nEvaluating -> lambda: {lambda_}, alpha: {alpha}, "
-                        f"beta: {beta}, opportunity_cost: {opportunity_cost}"
+                        f"beta: {beta}, opportunity_cost: {opportunity_cost}, "
+                        f"expansion_decision_version: {config.expansion_decision_version}"
                     )
 
                     model_name = model_name_for(config, lambda_, alpha, beta, opportunity_cost)
@@ -180,6 +185,7 @@ def run_simulation(config):
 
                     df = pd.DataFrame(sim_data)
                     df["opportunity_cost"] = opportunity_cost
+                    df["expansion_decision_version"] = config.expansion_decision_version
                     output_file = os.path.join(config.sim_dir_name, model_name + "_"+ config.input_type+ ".csv")
                     os.makedirs(os.path.dirname(output_file), exist_ok=True)
                     df.to_csv(output_file, index=False)

@@ -27,18 +27,21 @@ def main():
                     for opportunity_cost in config.opportunity_cost_values:
                         print(
                             f"\n--- Training -> lambda: {lambda_}, alpha: {alpha}, "
-                            f"beta: {beta}, opportunity_cost: {opportunity_cost} ---"
+                            f"beta: {beta}, opportunity_cost: {opportunity_cost}, "
+                            f"expansion_decision_version: {config.expansion_decision_version} ---"
                         )
                         if config.tree_size == 30:
                             model_name = (
                                 f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
-                                f'opportunity_{opportunity_cost}_seed_{config.seed}_'
+                                f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
+                                f'seed_{config.seed}_'
                                 f'{config.tree_size}n_{config.tree_type}'
                             )
                         else:
                             model_name = (
                                 f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
-                                f'opportunity_{opportunity_cost}_seed_{config.seed}_{config.tree_size}n'
+                                f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
+                                f'seed_{config.seed}_{config.tree_size}n'
                             )
                         # 1. Initialize Model Architecture
                         encoder = build_encoder(config.rnn_units * 2, config.latent_dim, config.rnn_units)
@@ -59,7 +62,9 @@ def main():
                                 beta=beta, 
                                 lambda_=lambda_,
                                 tree_type = config.tree,
-                                opportunity_cost=opportunity_cost
+                                opportunity_cost=opportunity_cost,
+                                input_type=config.input_type,
+                                expansion_decision_version=config.expansion_decision_version
                             )
                         else:
                             
@@ -76,7 +81,9 @@ def main():
                                 alpha=alpha, 
                                 beta=beta, 
                                 lambda_=lambda_,
-                                opportunity_cost=opportunity_cost
+                                opportunity_cost=opportunity_cost,
+                                input_type=config.input_type,
+                                expansion_decision_version=config.expansion_decision_version
                             )
                         # 2. Run the Training Loop
                         train_model(

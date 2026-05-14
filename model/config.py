@@ -41,10 +41,34 @@ try:
     tree_type = str(sys.argv[10])
     opportunity_cost_string = sys.argv[11] if len(sys.argv) > 11 else "0.0"
     opportunity_cost_values = [float(x) for x in opportunity_cost_string.split(',')]
+    expansion_decision_version = sys.argv[12] if len(sys.argv) > 12 else "decoder"
 except IndexError:
     print("Error: Missing command-line arguments.")
-    print("Usage: python main.py <lambda> <alpha> <beta> <dir_name> <epochs> <input_type> <seed> <tree_size> <train/simulate> <tree_type> [opportunity_cost]")
+    print("Usage: python main.py <lambda> <alpha> <beta> <dir_name> <epochs> <input_type> <seed> <tree_size> <train/simulate> <tree_type> [opportunity_cost] [expansion_decision_version]")
     sys.exit(1)
+
+def normalize_expansion_decision_version(version):
+    aliases = {
+        "1": "decoder",
+        "decoder": "decoder",
+        "after_decoder": "decoder",
+        "2": "lstm",
+        "lstm": "lstm",
+        "after_lstm": "lstm",
+        "3": "pre_lstm",
+        "pre_lstm": "pre_lstm",
+        "before_lstm": "pre_lstm",
+    }
+    version_key = str(version).strip().lower()
+    if version_key not in aliases:
+        valid = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"expansion_decision_version must be one of: {valid}. "
+            f"Got {version!r}."
+        )
+    return aliases[version_key]
+
+expansion_decision_version = normalize_expansion_decision_version(expansion_decision_version)
 
 sim_dir_name = dir_name.replace("model", "simulation")
 

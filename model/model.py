@@ -47,7 +47,8 @@ class VariationalRNN(tf.keras.Model):
     def __init__(self, encoder, decoder, rnn_units, latent_dim, time_steps, num_paths, 
                  index_path_map, path_map, path_cov_mat, 
                  alpha=0.0, beta=1.0, lambda_=1.0, tree_type = "deep",
-                 opportunity_cost=0.0):
+                 opportunity_cost=0.0, input_type="uniform",
+                 expansion_decision_version="decoder"):
         super(VariationalRNN, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -88,6 +89,10 @@ class VariationalRNN(tf.keras.Model):
         self.beta = beta
         self.lambda_ = lambda_
         self.opportunity_cost = opportunity_cost
+        self.input_type = input_type
+        self.expansion_decision_version = self.normalize_expansion_decision_version(
+            expansion_decision_version
+        )
         self.num_categories = 9 
         self.tree_type = tree_type
         # Store the maps explicitly so they don't rely on global variables
@@ -115,7 +120,50 @@ class VariationalRNN(tf.keras.Model):
             name='critic_head'
         )
 
-    def call(self, inputs, training=True, current_alpha=1.0, current_beta=1.0, current_critic_coef=1.0):
+    def normalize_expansion_decision_version(self, version):
+        version = str(version).strip().lower()
+        aliases = {
+            "1": "decoder",
+            "decoder": "decoder",
+            "after_decoder": "decoder",
+            "2": "lstm",
+            "lstm": "lstm",
+            "after_lstm": "lstm",
+            "3": "pre_lstm",
+            "pre_lstm": "pre_lstm",
+            "before_lstm": "pre_lstm",
+        }
+        if version not in aliases:
+            raise ValueError(
+                "expansion_decision_version must be one of: "
+                "decoder/1, lstm/2, pre_lstm/3"
+            )
+        return aliases[version]
+
+    def reward_norm(self):
+        if self.time_steps == 6:
+            return 3.58
+        if self.time_steps == 2:
+            if self.input_type == "binary":
+                return 0.75
+            return 1.5625
+        if self.time_steps == 12:
+            return 5.11
+        return 8.1574
+
+    def call(
+        self,
+        inputs,
+        training=True,
+        current_alpha=1.0,
+        current_beta=1.0,
+        current_critic_coef=1.0,
+        forced_node_selections=None,
+        old_expansion_log_probs=None,
+        use_ppo_loss=False,
+        compute_losses=True,
+        ppo_clip=0.2
+    ):
         batch_size = tf.shape(inputs)[0]
 
         critic_loss = tf.constant(0.0, dtype=tf.float32)
@@ -148,6 +196,11 @@ class VariationalRNN(tf.keras.Model):
         state = self.lstm_cell.get_initial_state(batch_size=batch_size)
         hidden_state_flat = state[0]
         c_flat = state[1]
+        pre_lstm_expansion_context = tf.zeros(
+            [batch_size, self.rnn_units + self.time_steps + 2],
+            dtype=tf.float32
+        )
+        lstm_expansion_context = hidden_state_flat
         active_mask = tf.ones([batch_size, 1], dtype=tf.float32)
         visited_mask = tf.zeros([batch_size, self.time_steps + 1], dtype=tf.float32)
         observed_mask = tf.zeros([batch_size, self.time_steps, 1], dtype=tf.float32)
@@ -157,10 +210,19 @@ class VariationalRNN(tf.keras.Model):
         for t in range(self.time_steps):
             valid_step_masks.append(active_mask)
             all_stop_value_preds.append(self.critic_head(hidden_state_flat))
-            expansion_logits = self.expansion_head(hidden_state_flat)
+            if self.expansion_decision_version == "decoder":
+                expansion_input = hidden_state_flat
+            elif self.expansion_decision_version == "lstm":
+                expansion_input = lstm_expansion_context
+            else:
+                expansion_input = pre_lstm_expansion_context
+
+            expansion_logits = self.expansion_head(expansion_input)
             masked_expansion_logits = expansion_logits + (visited_mask * -1e9)
 
-            if training:
+            if forced_node_selections is not None:
+                next_node_indices = tf.cast(forced_node_selections[:, t], tf.int32)
+            elif training:
                 sampled_indices = tf.random.categorical(masked_expansion_logits, num_samples=1, dtype=tf.int32)
                 next_node_indices = tf.squeeze(sampled_indices, axis=-1)
             else:
@@ -197,10 +259,12 @@ class VariationalRNN(tf.keras.Model):
 
             prev_hidden_state = hidden_state_flat
             prev_c_state = c_flat
+            pre_lstm_expansion_context = tf.concat([prev_hidden_state, lstm_input], axis=1)
             rnn_state = (hidden_state_flat, c_flat)
             _, candidate_state = self.lstm_cell(lstm_input, states=rnn_state)
             new_h = candidate_state[0] * active_mask + hidden_state_flat * (1.0 - active_mask)
             new_c = candidate_state[1] * active_mask + c_flat * (1.0 - active_mask)
+            lstm_expansion_context = new_h
             state = (new_h, new_c)
             encoder_input = tf.concat(state, axis=-1)
 
@@ -215,8 +279,15 @@ class VariationalRNN(tf.keras.Model):
             hidden_state_flat, c_flat = tf.split(decoder_output, num_or_size_splits=2, axis=-1)
             hidden_state_flat = hidden_state_flat * active_mask + prev_hidden_state * (1.0 - active_mask)
             c_flat = c_flat * active_mask + prev_c_state * (1.0 - active_mask)
-            # auxiliary action loss at timestep t based on observed info so far
-            step_action_logits = self.action_head(hidden_state_flat)
+            if self.expansion_decision_version == "decoder":
+                action_input = hidden_state_flat
+            elif self.expansion_decision_version == "lstm":
+                action_input = lstm_expansion_context
+            else:
+                action_input = pre_lstm_expansion_context
+
+            # action policy at timestep t uses the same representation family as expansion
+            step_action_logits = self.action_head(action_input)
             step_action_output = tf.nn.softmax(step_action_logits, axis=-1)
             all_action_outputs.append(step_action_output)
 
@@ -310,19 +381,31 @@ class VariationalRNN(tf.keras.Model):
             all_category_outputs,
             observed_masks
         )
+        expansion_log_probs = tf.stack(all_expansion_log_probs, axis=1)
         expansion_loss = self.compute_expansion_policy_loss(
             inputs,
-            tf.stack(all_expansion_log_probs, axis=1),
+            expansion_log_probs,
             tf.stack(all_expansion_entropies, axis=1),
             action_outputs_sequence,
             stop_value_preds,
             valid_step_masks,
             stop_decisions,
             kl_d_sequence,
-            current_beta
+            current_beta,
+            old_log_probs=old_expansion_log_probs,
+            use_ppo_loss=use_ppo_loss,
+            ppo_clip=ppo_clip
+        )
+        opportunity_loss = self.compute_opportunity_policy_loss(
+            expansion_log_probs,
+            valid_step_masks,
+            stop_decisions,
+            old_log_probs=old_expansion_log_probs,
+            use_ppo_loss=use_ppo_loss,
+            ppo_clip=ppo_clip
         )
 
-        if training:
+        if training and compute_losses:
             tf.print("action loss:", action_loss)
             tf.print("critic loss:", critic_loss)
             tf.print("category loss:", reconstruction_loss)
@@ -341,7 +424,7 @@ class VariationalRNN(tf.keras.Model):
             first_decoder_loss += (
                 information_loss * current_beta
                 + action_loss * self.lambda_
-              
+                + opportunity_loss * self.opportunity_cost
                 + critic_loss *  self.lambda_* current_critic_coef
                 + reconstruction_loss * self.alpha
             )
@@ -349,6 +432,7 @@ class VariationalRNN(tf.keras.Model):
             action_head_loss += action_loss * self.lambda_
             expansion_head_loss += (
                  expansion_loss * self.lambda_
+                 + critic_loss * self.lambda_ * current_critic_coef
             )
 
         category_outputs = tf.stack(all_category_outputs, axis=1)
@@ -371,7 +455,8 @@ class VariationalRNN(tf.keras.Model):
             observed_masks,
             action_outputs_sequence,
             kl_d_sequence,
-            expansion_head_loss
+            expansion_head_loss,
+            expansion_log_probs
         )
     def compute_time_conditional_prior(self, t, batch_size):
         mu_t = self.prior_mu[t]           
@@ -486,7 +571,10 @@ class VariationalRNN(tf.keras.Model):
         valid_step_masks,
         stop_decisions,
         kl_d_sequence,
-        current_beta
+        current_beta,
+        old_log_probs=None,
+        use_ppo_loss=False,
+        ppo_clip=0.2
     ):
         _, path_rewards = self._prepare_path_rewards(inputs)
         step_expected_reward = tf.reduce_sum(
@@ -495,25 +583,26 @@ class VariationalRNN(tf.keras.Model):
             keepdims=True
         )
 
-        if self.time_steps == 6:
-            reward_norm = 3.58
-        elif self.time_steps == 2:
-            reward_norm = 0.75
-        elif self.time_steps == 12:
-            reward_norm = 5.11
-        else:
-            reward_norm = 8.1574
+        reward_norm = self.reward_norm()
 
         mask = tf.cast(valid_step_masks, tf.float32)
         stop_decisions = tf.cast(stop_decisions, tf.float32)
         non_stop_expansion = mask * (1.0 - stop_decisions)
         opportunity_penalty = self.opportunity_cost * non_stop_expansion
-        kl_penalty = current_beta * kl_d_sequence * mask
+        kl_penalty = current_beta * kl_d_sequence * non_stop_expansion
 
         stop_now_baseline = tf.stop_gradient(stop_value_preds / reward_norm)
         sampled_return = (step_expected_reward / reward_norm) - opportunity_penalty - kl_penalty
         advantages = tf.stop_gradient(sampled_return - stop_now_baseline)
-        policy_loss = -log_probs * advantages * mask
+
+        if use_ppo_loss and old_log_probs is not None:
+            old_log_probs = tf.stop_gradient(tf.cast(old_log_probs, tf.float32))
+            ratios = tf.exp(log_probs - old_log_probs)
+            clipped_ratios = tf.clip_by_value(ratios, 1.0 - ppo_clip, 1.0 + ppo_clip)
+            surrogate = tf.minimum(ratios * advantages, clipped_ratios * advantages)
+            policy_loss = -surrogate * mask
+        else:
+            policy_loss = -log_probs * advantages * mask
 
         entropy_beta = 0.01
         entropy_bonus = entropies * mask
@@ -521,6 +610,35 @@ class VariationalRNN(tf.keras.Model):
             tf.reduce_sum(policy_loss) / (tf.reduce_sum(mask) + 1e-6)
             - entropy_beta * tf.reduce_sum(entropy_bonus) / (tf.reduce_sum(mask) + 1e-6)
         )
+        return tf.where(tf.math.is_finite(loss), loss, tf.constant(0.0, dtype=tf.float32))
+
+    def compute_opportunity_policy_loss(
+        self,
+        log_probs,
+        valid_step_masks,
+        stop_decisions,
+        old_log_probs=None,
+        use_ppo_loss=False,
+        ppo_clip=0.2
+    ):
+        mask = tf.cast(valid_step_masks, tf.float32)
+        stop_decisions = tf.cast(stop_decisions, tf.float32)
+        non_stop_expansion = mask * (1.0 - stop_decisions)
+        opportunity_advantages = tf.stop_gradient(-non_stop_expansion)
+
+        if use_ppo_loss and old_log_probs is not None:
+            old_log_probs = tf.stop_gradient(tf.cast(old_log_probs, tf.float32))
+            ratios = tf.exp(log_probs - old_log_probs)
+            clipped_ratios = tf.clip_by_value(ratios, 1.0 - ppo_clip, 1.0 + ppo_clip)
+            surrogate = tf.minimum(
+                ratios * opportunity_advantages,
+                clipped_ratios * opportunity_advantages
+            )
+            policy_loss = -surrogate * mask
+        else:
+            policy_loss = -log_probs * opportunity_advantages * mask
+
+        loss = tf.reduce_sum(policy_loss) / (tf.reduce_sum(mask) + 1e-6)
         return tf.where(tf.math.is_finite(loss), loss, tf.constant(0.0, dtype=tf.float32))
 
 
@@ -576,18 +694,7 @@ class VariationalRNN(tf.keras.Model):
         else:       
             entropy_beta = 0
 
-        if self.time_steps == 6:
-            mean_expected_reward = mean_expected_reward/3.58
-        elif self.time_steps == 2:
-             mean_expected_reward = mean_expected_reward/0.75
-        elif self.time_steps == 12:
-             mean_expected_reward = mean_expected_reward/5.11
-        else:
-            mean_expected_reward = mean_expected_reward / (8.1574)
-            # if self.tree_type == "deep":
-            #     mean_expected_reward = mean_expected_reward / (8.1574)
-            # else:
-            #     mean_expected_reward = mean_expected_reward  / (6.4726)
+        mean_expected_reward = mean_expected_reward / self.reward_norm()
         action_loss = (1.0 - mean_expected_reward) - entropy_beta * mean_entropy
         action_loss = tf.where(
             active_count > 0.0,
@@ -627,18 +734,7 @@ class VariationalRNN(tf.keras.Model):
         best_partial = tf.reduce_max(actual_path_rewards, axis=1, keepdims=True)  # [batch, 1]
     
         # Normalize by the expected max achievable at this timestep
-        if self.time_steps == 6:
-            norm = 3.58 # scalar
-        elif self.time_steps == 2:
-            norm = 0.75
-        elif self.time_steps == 12:
-            norm = 5.11
-        else:
-            norm=8.1574
-            # if self.tree_type == "deep":
-            #     norm=8.1574
-            # else:
-            #     norm = 6.4726
+        norm = self.reward_norm()
         epsilon = 1e-4
         # normalized = (best_partial + epsilon) / (norm + epsilon)
         normalized =  best_partial  
