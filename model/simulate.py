@@ -64,8 +64,25 @@ def model_name_for(config, lambda_, alpha, beta, opportunity_cost):
     )
 
 
+def sample_categorical_indices(probabilities):
+    probabilities = np.asarray(probabilities, dtype=float)
+    probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
+    probabilities = np.maximum(probabilities, 0.0)
+    total = probabilities.sum()
+    if total <= 0.0:
+        probabilities = np.ones_like(probabilities, dtype=float) / len(probabilities)
+    else:
+        probabilities = probabilities / total
+    return int(np.random.choice(len(probabilities), p=probabilities))
+
+
 def scalar_estimates(category_probs):
-    category_indices = np.argmax(category_probs, axis=-1)
+    flat_probs = np.reshape(category_probs, [-1, category_probs.shape[-1]])
+    sampled_indices = np.array([
+        sample_categorical_indices(probabilities)
+        for probabilities in flat_probs
+    ])
+    category_indices = np.reshape(sampled_indices, category_probs.shape[:-1])
     return CATEGORY_VALUES[category_indices]
 
 
@@ -86,7 +103,7 @@ def trial_rows(config, graph_index, rewards, outputs):
     estimated_rewards = np.where(observed_masks, estimated_rewards, np.nan)
 
     path_rewards = calculate_path_rewards_sim(config.index_path_map, rewards)
-    chosen_path = int(np.argmax(action_policy))
+    chosen_path = sample_categorical_indices(action_policy)
     v = float(path_rewards[chosen_path])
 
     row_template = {
@@ -180,7 +197,12 @@ def run_simulation(config):
                     for graph_index, rewards in enumerate(rewards_list):
                         rewards_tensor = tf.constant(rewards, dtype=tf.float32)
                         rewards_tensor = tf.reshape(rewards_tensor, [1, -1, 1])
-                        outputs = vrnn_model.predict(rewards_tensor, verbose=0)
+                        outputs = vrnn_model(
+                            rewards_tensor,
+                            training=True,
+                            compute_losses=False,
+                            expansion_epsilon=0.0
+                        )
                         sim_data.extend(trial_rows(config, graph_index, rewards, outputs))
 
                     df = pd.DataFrame(sim_data)

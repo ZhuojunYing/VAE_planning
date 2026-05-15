@@ -66,6 +66,14 @@ opportunity_label <- arg_label(opportunity_values)
 beta_label <- arg_label(beta_values)
 expansion_label <- arg_label(expansion_decision_version)
 
+drop_unnamed_index_columns <- function(dat) {
+  unnamed_cols <- names(dat) %in% c("", "...1", "X", "X1")
+  if (any(unnamed_cols)) {
+    dat <- dat[, !unnamed_cols, drop = FALSE]
+  }
+  dat
+}
+
 value_candidates <- function(x) {
   x_chr <- as.character(x)
   x_num <- suppressWarnings(as.numeric(x_chr))
@@ -123,9 +131,11 @@ read_seed_file <- function(beta_value, opportunity_value, seed) {
   }
 
   dat <- read.csv(file_path, stringsAsFactors = FALSE)
+  dat <- drop_unnamed_index_columns(dat)
   dat$beta <- beta_value
   dat$opportunity <- opportunity_value
   dat$seed <- seed
+  dat$file_path <- file_path
   dat$source_file <- file_path
   dat
 }

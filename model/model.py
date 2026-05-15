@@ -162,7 +162,8 @@ class VariationalRNN(tf.keras.Model):
         old_expansion_log_probs=None,
         use_ppo_loss=False,
         compute_losses=True,
-        ppo_clip=0.2
+        ppo_clip=0.2,
+        expansion_epsilon=0.0
     ):
         batch_size = tf.shape(inputs)[0]
 
@@ -223,8 +224,26 @@ class VariationalRNN(tf.keras.Model):
             if forced_node_selections is not None:
                 next_node_indices = tf.cast(forced_node_selections[:, t], tf.int32)
             elif training:
-                sampled_indices = tf.random.categorical(masked_expansion_logits, num_samples=1, dtype=tf.int32)
-                next_node_indices = tf.squeeze(sampled_indices, axis=-1)
+                policy_sampled_indices = tf.squeeze(
+                    tf.random.categorical(masked_expansion_logits, num_samples=1, dtype=tf.int32),
+                    axis=-1
+                )
+                uniform_logits = visited_mask * -1e9
+                uniform_sampled_indices = tf.squeeze(
+                    tf.random.categorical(uniform_logits, num_samples=1, dtype=tf.int32),
+                    axis=-1
+                )
+                expansion_epsilon = tf.clip_by_value(
+                    tf.cast(expansion_epsilon, tf.float32),
+                    0.0,
+                    1.0
+                )
+                explore_mask = tf.random.uniform([batch_size], dtype=tf.float32) < expansion_epsilon
+                next_node_indices = tf.where(
+                    explore_mask,
+                    uniform_sampled_indices,
+                    policy_sampled_indices
+                )
             else:
                 next_node_indices = tf.argmax(masked_expansion_logits, axis=-1, output_type=tf.int32)
 
@@ -404,12 +423,20 @@ class VariationalRNN(tf.keras.Model):
             use_ppo_loss=use_ppo_loss,
             ppo_clip=ppo_clip
         )
+        valid_decision_count = tf.reduce_sum(valid_step_masks) + 1e-6
+        expansion_stop_rate = tf.reduce_sum(stop_decisions) / valid_decision_count
+        expansion_continue_rate = (
+            tf.reduce_sum(valid_step_masks * (1.0 - tf.cast(stop_decisions, tf.float32))) /
+            valid_decision_count
+        )
 
         if training and compute_losses:
             tf.print("action loss:", action_loss)
             tf.print("critic loss:", critic_loss)
             tf.print("category loss:", reconstruction_loss)
             tf.print("expansion loss:", expansion_loss)
+            tf.print("expansion stop rate:", expansion_stop_rate)
+            tf.print("expansion continue rate:", expansion_continue_rate)
             tf.print("kl loss:", information_loss)
             tf.print(">> [CRITIC] Pred:", tf.reduce_mean(value_pred), "| Target:", tf.reduce_mean(value_target))
 
@@ -456,7 +483,10 @@ class VariationalRNN(tf.keras.Model):
             action_outputs_sequence,
             kl_d_sequence,
             expansion_head_loss,
-            expansion_log_probs
+            expansion_log_probs,
+            expansion_loss,
+            expansion_stop_rate,
+            expansion_continue_rate
         )
     def compute_time_conditional_prior(self, t, batch_size):
         mu_t = self.prior_mu[t]           

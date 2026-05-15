@@ -13,7 +13,18 @@ import helper
 import csv
 import config
 @tf.function
-def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef, input_data, input_type_str, clip_value=10.0, ppo_epochs=3):
+def train_step(
+    model,
+    optimizer,
+    current_alpha,
+    current_beta,
+    current_critic_coef,
+    current_expansion_epsilon,
+    input_data,
+    input_type_str,
+    clip_value=10.0,
+    ppo_epochs=3
+):
     """
     Executes one training step: forward pass, loss computation, and backpropagation.
     """
@@ -35,6 +46,7 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
             current_alpha=current_alpha,
             current_beta=current_beta,
             current_critic_coef=current_critic_coef,
+            expansion_epsilon=current_expansion_epsilon,
             compute_losses=False
         )
         old_node_selections = tf.stop_gradient(rollout_outputs[12])
@@ -56,11 +68,15 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
                 current_alpha=current_alpha,
                 current_beta=current_beta,
                 current_critic_coef=current_critic_coef,
+                expansion_epsilon=current_expansion_epsilon,
                 forced_node_selections=old_node_selections,
                 old_expansion_log_probs=old_expansion_log_probs,
                 use_ppo_loss=True
             )
             expansion_head_loss = extra_outputs[5]
+            expansion_policy_loss = extra_outputs[7]
+            expansion_stop_rate = extra_outputs[8]
+            expansion_continue_rate = extra_outputs[9]
              
             # --- THE FIX: Create the weighted tensors INSIDE the tape scope ---
             weighted_kl_for_logging = information_loss * current_beta
@@ -132,6 +148,7 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
                 current_alpha=current_alpha,
                 current_beta=current_beta,
                 current_critic_coef=current_critic_coef,
+                expansion_epsilon=current_expansion_epsilon,
                 forced_node_selections=old_node_selections,
                 old_expansion_log_probs=old_expansion_log_probs,
                 use_ppo_loss=True
@@ -142,10 +159,13 @@ def train_step(model, optimizer, current_alpha, current_beta,current_critic_coef
         optimizer.apply_gradients(zip(ppo_expansion_gradients, expansion_params))
     
     # Return all 13 values
-    return (total_loss, information_loss, action_loss, reconstruction_loss, 
+    return (
+            total_loss, information_loss, action_loss, reconstruction_loss,
+            expansion_policy_loss, expansion_stop_rate, expansion_continue_rate,
             kl_norm_enc, kl_norm_lstm, kl_norm_dec,
             act_norm_enc, act_norm_lstm, act_norm_dec,
-            rec_norm_enc, rec_norm_lstm, rec_norm_dec)
+            rec_norm_enc, rec_norm_lstm, rec_norm_dec
+    )
 
 import os
 import csv
@@ -225,7 +245,9 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
     # TRAINING HISTORY DICTIONARY
     # ------------------------------------------------------------------
     history = {
-        'epoch': [], 'learning_rate': [],'total_loss': [], 'kl_loss': [], 'action_loss': [], 'reconstruction_loss': [], 
+        'epoch': [], 'learning_rate': [], 'expansion_epsilon': [],
+        'total_loss': [], 'kl_loss': [], 'action_loss': [], 'reconstruction_loss': [],
+        'expansion_loss': [], 'expansion_stop_rate': [], 'expansion_continue_rate': [],
         'kl_grad_norm_enc': [], 'kl_grad_norm_lstm': [], 'kl_grad_norm_dec': [],
         'act_grad_norm_enc': [], 'act_grad_norm_lstm': [], 'act_grad_norm_dec': [],
         'rec_grad_norm_enc': [], 'rec_grad_norm_lstm': [], 'rec_grad_norm_dec': []
@@ -243,12 +265,16 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         target_critic_coef =0
     else:
         target_critic_coef =0.1
+    expansion_epsilon_start = 0.5
+    expansion_epsilon_end = 0.0
+    expansion_epsilon_annealing_epochs = 100
     # ------------------------------------------------------------------
     # TRAINING LOOP
     # ------------------------------------------------------------------
     for epoch in range(epochs):
         # Accumulators for this epoch
         ep_total_loss, ep_kl, ep_act, ep_rec = 0.0, 0.0, 0.0, 0.0
+        ep_expansion_loss, ep_stop_rate, ep_continue_rate = 0.0, 0.0, 0.0
         
         # Gradient accumulators
         ep_kl_gn_enc, ep_kl_gn_lstm, ep_kl_gn_dec = 0.0, 0.0, 0.0
@@ -277,11 +303,20 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             progress = (epoch - critic_warmup_epochs) / critic_annealing_epochs
             current_critic_coef = target_critic_coef * (1.0 - progress)
         # current_critic_coef = target_critic_coef
+        if expansion_epsilon_annealing_epochs <= 0:
+            current_expansion_epsilon = expansion_epsilon_end
+        else:
+            epsilon_progress = min(epoch / expansion_epsilon_annealing_epochs, 1.0)
+            current_expansion_epsilon = (
+                expansion_epsilon_start
+                + (expansion_epsilon_end - expansion_epsilon_start) * epsilon_progress
+            )
         for i in range(trials_per_epoch):
             batch_input_data = helper.generate_batch_data(batch_size, time_steps, input_type)
 
-            # Unpack the 13 metrics from train_step
+            # Unpack metrics from train_step
             (loss, kl, act, rec, 
+             exp_loss, stop_rate, continue_rate,
              kl_gn_enc, kl_gn_lstm, kl_gn_dec,
              act_gn_enc, act_gn_lstm, act_gn_dec,
              rec_gn_enc, rec_gn_lstm, rec_gn_dec) = train_step(
@@ -290,6 +325,7 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 current_alpha=tf.constant(current_alpha, dtype=tf.float32),
                 current_beta=tf.constant(current_beta, dtype=tf.float32),
                 current_critic_coef=tf.constant(current_critic_coef, dtype=tf.float32),
+                current_expansion_epsilon=tf.constant(current_expansion_epsilon, dtype=tf.float32),
                 input_data=batch_input_data,
                 input_type_str=input_type,
                 ppo_epochs=ppo_epochs
@@ -300,6 +336,9 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             ep_kl += kl
             ep_act += act
             ep_rec += rec
+            ep_expansion_loss += exp_loss
+            ep_stop_rate += stop_rate
+            ep_continue_rate += continue_rate
             
             ep_kl_gn_enc += kl_gn_enc
             ep_kl_gn_lstm += kl_gn_lstm
@@ -319,10 +358,14 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         # Append to history
         history['epoch'].append(epoch + 1)
         history['learning_rate'].append(current_lr)
+        history['expansion_epsilon'].append(current_expansion_epsilon)
         history['total_loss'].append((ep_total_loss / trials_per_epoch).numpy())
         history['kl_loss'].append((ep_kl / trials_per_epoch).numpy())
         history['action_loss'].append((ep_act / trials_per_epoch).numpy())
         history['reconstruction_loss'].append((ep_rec / trials_per_epoch).numpy())
+        history['expansion_loss'].append((ep_expansion_loss / trials_per_epoch).numpy())
+        history['expansion_stop_rate'].append((ep_stop_rate / trials_per_epoch).numpy())
+        history['expansion_continue_rate'].append((ep_continue_rate / trials_per_epoch).numpy())
         
         history['kl_grad_norm_enc'].append((ep_kl_gn_enc / trials_per_epoch).numpy())
         history['kl_grad_norm_lstm'].append((ep_kl_gn_lstm / trials_per_epoch).numpy())
@@ -336,7 +379,13 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         history['rec_grad_norm_lstm'].append((ep_rec_gn_lstm / trials_per_epoch).numpy())
         history['rec_grad_norm_dec'].append((ep_rec_gn_dec / trials_per_epoch).numpy())
 
-        tf.print(f"Epoch {epoch+1}/{epochs}: Loss = {avg_total_loss:.4f} | KL = {history['kl_loss'][-1]:.4f}")
+        tf.print(
+            f"Epoch {epoch+1}/{epochs}: Loss = {avg_total_loss:.4f} | "
+            f"KL = {history['kl_loss'][-1]:.4f} | "
+            f"Expansion epsilon = {current_expansion_epsilon:.4f} | "
+            f"Stop = {history['expansion_stop_rate'][-1]:.4f} | "
+            f"Continue = {history['expansion_continue_rate'][-1]:.4f}"
+        )
      
         # --- CHECKPOINTING LOGIC ---
         # We check improvement only after warmup to avoid saving "cheating" models
