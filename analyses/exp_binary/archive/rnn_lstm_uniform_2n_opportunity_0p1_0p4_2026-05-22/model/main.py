@@ -13,9 +13,6 @@ from model import VariationalRNN, build_encoder, build_decoder
 from train import train_model
 from simulate import run_simulation
 
-def model_variant_label(variant):
-    return f"variant_{variant}_"
-
 def main():
     # Make sure the target directory exists
     os.makedirs(config.dir_name, exist_ok=True)
@@ -34,7 +31,7 @@ def main():
                             f"expansion_decision_version: {config.expansion_decision_version}, "
                             f"model_variant: {config.model_variant} ---"
                         )
-                        variant_label = model_variant_label(config.model_variant)
+                        variant_label = "" if config.model_variant == "vae" else f"variant_{config.model_variant}_"
                         if config.tree_size == 30:
                             model_name = (
                                 f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'

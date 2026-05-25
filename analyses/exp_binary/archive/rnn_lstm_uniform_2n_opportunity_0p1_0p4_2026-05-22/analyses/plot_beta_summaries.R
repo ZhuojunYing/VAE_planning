@@ -65,24 +65,14 @@ normalize_model_variant <- function(variant) {
 model_variant <- normalize_model_variant(model_variant)
 
 model_variant_file_segment <- function(variant) {
-  sprintf("variant_%s_", variant)
-}
-
-model_variant_file_segments <- function(variant) {
-  segments <- model_variant_file_segment(variant)
-  if (identical(variant, "vae")) {
-    # Backward compatibility for older VAE outputs that predated explicit
-    # variant_vae_ filename segments.
-    segments <- c(segments, "")
-  }
-  unique(segments)
+  if (identical(variant, "vae")) "" else sprintf("variant_%s_", variant)
 }
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 beta_values <- trimws(strsplit(beta_arg, ",")[[1]])
 opportunity_values <- trimws(strsplit(opportunity_arg, ",")[[1]])
-seeds <- 1:1
+seeds <- 1:5
 
 arg_label <- function(values) {
   label <- paste(values, collapse = "_")
@@ -102,8 +92,10 @@ format_plot_values <- function(values) {
 opportunity_label <- arg_label(opportunity_values)
 beta_label <- arg_label(beta_values)
 expansion_label <- arg_label(expansion_decision_version)
-expansion_label <- sprintf("%s_variant_%s", expansion_label, arg_label(model_variant))
-variant_file_segments <- model_variant_file_segments(model_variant)
+if (!identical(model_variant, "vae")) {
+  expansion_label <- sprintf("%s_variant_%s", expansion_label, arg_label(model_variant))
+}
+variant_file_segment <- model_variant_file_segment(model_variant)
 
 drop_unnamed_index_columns <- function(dat) {
   unnamed_cols <- names(dat) %in% c("", "...1", "X", "X1")
@@ -138,19 +130,17 @@ simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_v
     for (alpha_candidate in alpha_candidates) {
       for (beta_candidate in beta_candidates) {
         for (opportunity_candidate in opportunity_candidates) {
-          for (variant_file_segment in variant_file_segments) {
-            file_names <- c(
-              sprintf(
-                "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_%s.csv",
-                lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate,
-                expansion_decision_version, variant_file_segment, seed, tree_size, input_type
-              )
+          file_names <- c(
+            sprintf(
+              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_%s.csv",
+              lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate,
+              expansion_decision_version, variant_file_segment, seed, tree_size, input_type
             )
-            for (file_name in file_names) {
-              file_path <- file.path(input_dir, file_name)
-              if (file.exists(file_path)) {
-                return(file_path)
-              }
+          )
+          for (file_name in file_names) {
+            file_path <- file.path(input_dir, file_name)
+            if (file.exists(file_path)) {
+              return(file_path)
             }
           }
         }

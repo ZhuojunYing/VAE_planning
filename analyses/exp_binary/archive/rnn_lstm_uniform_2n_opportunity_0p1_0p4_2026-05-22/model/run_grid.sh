@@ -70,7 +70,7 @@ if np.isinf(beta_log_min) or np.isinf(beta_log_max):
     beta_exp_values = np.zeros(beta_steps)
 else:
     beta_log_values = np.linspace(beta_log_min, beta_log_max, beta_steps)
-    beta_exp_values=np.array( [  l for l in beta_log_values])
+    beta_exp_values=np.array( [ 10** l for l in beta_log_values])
 
 # Handle alpha values
 if np.isinf(alpha_log_min) or np.isinf(alpha_log_max):

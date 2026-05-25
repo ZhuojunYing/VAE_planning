@@ -1,0 +1,1543 @@
+diff --git a/analyses/exp_binary/diagnose_training_logs.R b/analyses/exp_binary/diagnose_training_logs.R
+index c361ab7..b42da85 100644
+--- a/analyses/exp_binary/diagnose_training_logs.R
++++ b/analyses/exp_binary/diagnose_training_logs.R
+@@ -15,6 +15,7 @@ results_dir <- get_arg(6, "results")
+ tree_size <- as.integer(get_arg(7, "2"))
+ expansion_decision_version <- get_arg(8, "lstm")
+ seed_arg <- get_arg(9, "1:5")
++model_variant <- get_arg(10, "vae")
+ 
+ dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+ 
+@@ -43,6 +44,32 @@ normalize_expansion_decision_version <- function(version) {
+ 
+ expansion_decision_version <- normalize_expansion_decision_version(expansion_decision_version)
+ 
++normalize_model_variant <- function(variant) {
++  variant_key <- tolower(trimws(as.character(variant)))
++  aliases <- c(
++    "vae" = "vae",
++    "autoencoder" = "vae",
++    "rnn" = "rnn",
++    "plain_rnn" = "rnn",
++    "no_autoencoder" = "rnn",
++    "no_ae" = "rnn"
++  )
++  if (!variant_key %in% names(aliases)) {
++    stop(sprintf(
++      "model_variant must be one of: %s. Got %s.",
++      paste(names(aliases), collapse = ", "),
++      variant
++    ))
++  }
++  unname(aliases[[variant_key]])
++}
++
++model_variant <- normalize_model_variant(model_variant)
++
++model_variant_file_segment <- function(variant) {
++  if (identical(variant, "vae")) "" else sprintf("variant_%s_", variant)
++}
++
+ parse_list <- function(x) trimws(strsplit(x, ",")[[1]])
+ 
+ parse_seeds <- function(x) {
+@@ -88,12 +115,13 @@ training_log_path <- function(lambda_value, alpha_value, beta_value, opportunity
+       for (beta_candidate in value_candidates(beta_value)) {
+         for (opportunity_candidate in value_candidates(opportunity_value)) {
+           file_name <- sprintf(
+-            "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_seed_%d_%dn_training_logs.csv",
++            "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_training_logs.csv",
+             lambda_candidate,
+             alpha_candidate,
+             beta_candidate,
+             opportunity_candidate,
+             expansion_decision_version,
++            model_variant_file_segment(model_variant),
+             seed,
+             tree_size
+           )
+@@ -112,10 +140,11 @@ read_training_log <- function(beta_value, opportunity_value, seed) {
+   file_path <- training_log_path(lambda_arg, alpha_arg, beta_value, opportunity_value, seed)
+   if (is.na(file_path)) {
+     warning(sprintf(
+-      "Missing training log for beta=%s opportunity=%s seed=%d",
++      "Missing training log for beta=%s opportunity=%s seed=%d model_variant=%s",
+       beta_value,
+       opportunity_value,
+-      seed
++      seed,
++      model_variant
+     ))
+     return(NULL)
+   }
+@@ -125,6 +154,7 @@ read_training_log <- function(beta_value, opportunity_value, seed) {
+   dat$beta <- beta_value
+   dat$opportunity <- opportunity_value
+   dat$seed <- seed
++  dat$model_variant <- model_variant
+   dat$file_path <- file_path
+   dat$modified_time <- file.info(file_path)$mtime
+   dat
+@@ -162,10 +192,34 @@ to_numeric_column <- function(dat, col) {
+ metric_cols <- intersect(
+   c(
+     "total_loss", "kl_loss", "action_loss", "reconstruction_loss",
+-    "expansion_loss", "expansion_stop_rate", "expansion_continue_rate",
++    "expansion_loss", "critic_loss", "unified_decision_ce_loss",
++    "expansion_stop_rate", "expansion_continue_rate",
++    "action_p_correct_after_neg4_t1", "continue_rate_after_neg4_t1", "n_neg4_t1",
++    "action_p_correct_after_pos4_t1", "continue_rate_after_pos4_t1", "n_pos4_t1",
++    "terminal_prob_after_neg4_t1", "correct_terminal_prob_after_neg4_t1",
++    "expand_unobserved_prob_after_neg4_t1", "expand_observed_prob_after_neg4_t1",
++    "terminal_prob_after_pos4_t1", "correct_terminal_prob_after_pos4_t1",
++    "expand_unobserved_prob_after_pos4_t1", "expand_observed_prob_after_pos4_t1",
++    "sampled_return_stop_after_neg4_t1", "sampled_return_continue_after_neg4_t1",
++    "sampled_return_stop_after_pos4_t1", "sampled_return_continue_after_pos4_t1",
++    "kl_d_stop_after_neg4_t1", "kl_d_continue_after_neg4_t1",
++    "kl_d_stop_after_pos4_t1", "kl_d_continue_after_pos4_t1",
++    "n_stop_after_neg4_t1", "n_continue_after_neg4_t1",
++    "n_stop_after_pos4_t1", "n_continue_after_pos4_t1",
+     "kl_grad_norm_enc", "kl_grad_norm_lstm", "kl_grad_norm_dec",
+     "act_grad_norm_enc", "act_grad_norm_lstm", "act_grad_norm_dec",
+     "rec_grad_norm_enc", "rec_grad_norm_lstm", "rec_grad_norm_dec",
++    "kl_grad_norm_prior", "act_grad_norm_prior", "rec_grad_norm_prior",
++    "exp_grad_norm_enc", "exp_grad_norm_lstm", "exp_grad_norm_dec",
++    "exp_grad_norm_prior", "exp_grad_norm_head", "exp_policy_grad_norm_head",
++    "opp_grad_norm_enc", "opp_grad_norm_lstm", "opp_grad_norm_dec",
++    "opp_grad_norm_prior", "opp_grad_norm_head",
++    "critic_grad_norm_enc", "critic_grad_norm_lstm", "critic_grad_norm_dec",
++    "critic_grad_norm_prior", "critic_grad_norm_head",
++    "act_grad_norm_head", "rec_grad_norm_head",
++    "update_grad_norm_enc", "update_grad_norm_lstm", "update_grad_norm_dec",
++    "update_grad_norm_prior",
++    "critic_pred_after_neg4_t1", "critic_pred_after_pos4_t1",
+     "expansion_epsilon", "expansion_temperature", "expansion_entropy_coef",
+     "learning_rate"
+   ),
+@@ -182,6 +236,28 @@ mean_or_na <- function(x) {
+   if (length(x) == 0) NA_real_ else mean(x)
+ }
+ 
++safe_neg_log <- function(x) {
++  x <- suppressWarnings(as.numeric(x))
++  out <- -log(pmax(x, 1e-7))
++  out[!is.finite(out)] <- NA_real_
++  out
++}
++
++first_present_column <- function(dat, candidates) {
++  present <- candidates[candidates %in% names(dat)]
++  if (length(present) == 0) NULL else present[[1]]
++}
++
++copy_optional_metric <- function(dat, output_col, candidates) {
++  source_col <- first_present_column(dat, candidates)
++  if (is.null(source_col)) {
++    dat[[output_col]] <- NA_real_
++  } else {
++    dat[[output_col]] <- suppressWarnings(as.numeric(dat[[source_col]]))
++  }
++  dat
++}
++
+ aggregate_metric <- function(dat, value_col) {
+   if (!value_col %in% names(dat)) {
+     return(data.frame())
+@@ -205,7 +281,33 @@ palette_for <- function(levels) {
+ 
+ beta_levels <- beta_values[beta_values %in% unique(all_logs$beta)]
+ if (length(beta_levels) == 0) beta_levels <- sort(unique(all_logs$beta))
+-beta_cols <- palette_for(beta_levels)
++opportunity_levels <- opportunity_values[opportunity_values %in% unique(all_logs$opportunity)]
++if (length(opportunity_levels) == 0) opportunity_levels <- sort(unique(all_logs$opportunity))
++
++color_by <- if (length(opportunity_levels) > 1 && length(beta_levels) == 1) {
++  "opportunity"
++} else {
++  "beta"
++}
++if (length(beta_levels) > 1 && length(opportunity_levels) > 1) {
++  warning("Both beta and opportunity have multiple values; using beta for color and opportunity for line style.")
++}
++
++color_levels <- if (identical(color_by, "opportunity")) opportunity_levels else beta_levels
++series_cols <- palette_for(color_levels)
++opportunity_lty_values <- c(1, 2, 3, 4, 5, 6)
++opportunity_lty <- setNames(
++  rep(opportunity_lty_values, length.out = length(opportunity_levels)),
++  opportunity_levels
++)
++
++series_color <- function(beta_value, opportunity_value) {
++  if (identical(color_by, "opportunity")) {
++    series_cols[[as.character(opportunity_value)]]
++  } else {
++    series_cols[[as.character(beta_value)]]
++  }
++}
+ 
+ plot_metric <- function(dat, value_col, ylab, log_y = FALSE) {
+   summary_dat <- aggregate_metric(dat, value_col)
+@@ -255,11 +357,23 @@ plot_metric <- function(dat, value_col, ylab, log_y = FALSE) {
+   )
+   grid()
+ 
+-  for (beta_value in beta_levels) {
+-    series <- summary_dat[summary_dat$beta == beta_value, , drop = FALSE]
+-    series <- series[order(series$epoch), , drop = FALSE]
+-    if (nrow(series) > 0) {
+-      lines(series$epoch, series$value, col = beta_cols[[beta_value]], lwd = 2)
++  for (opportunity_value in opportunity_levels) {
++    for (beta_value in beta_levels) {
++      series <- summary_dat[
++        summary_dat$beta == beta_value & summary_dat$opportunity == opportunity_value,
++        ,
++        drop = FALSE
++      ]
++      series <- series[order(series$epoch), , drop = FALSE]
++      if (nrow(series) > 0) {
++        lines(
++          series$epoch,
++          series$value,
++          col = series_color(beta_value, opportunity_value),
++          lwd = 2,
++          lty = opportunity_lty[[as.character(opportunity_value)]]
++        )
++      }
+     }
+   }
+ }
+@@ -270,11 +384,22 @@ add_beta_legend <- function() {
+   legend(
+     "topright",
+     inset = c(-0.35, 0),
+-    legend = paste("beta", beta_levels),
+-    col = beta_cols[beta_levels],
++    legend = paste(color_by, color_levels),
++    col = series_cols[color_levels],
+     lwd = 2,
+     bty = "n"
+   )
++  if (length(opportunity_levels) > 1 && !identical(color_by, "opportunity")) {
++    legend(
++      "bottomright",
++      inset = c(-0.35, 0),
++      legend = paste("opportunity", opportunity_levels),
++      lty = opportunity_lty[opportunity_levels],
++      col = "black",
++      lwd = 2,
++      bty = "n"
++    )
++  }
+   par(xpd = old_xpd)
+ }
+ 
+@@ -297,19 +422,130 @@ all_logs$act_to_kl_grad_dec <- safe_ratio(
+   to_numeric_column(all_logs, "kl_grad_norm_dec")
+ )
+ 
++# Approximate boundary-specific decision CE from currently logged mean
++# probabilities. This is -log(mean p_correct_terminal), not mean(-log p)
++# over individual trials, so use it as a directionally useful diagnostic only.
++all_logs$approx_decision_ce_after_neg4_t1 <- safe_neg_log(
++  to_numeric_column(all_logs, "correct_terminal_prob_after_neg4_t1")
++)
++all_logs$approx_decision_ce_after_pos4_t1 <- safe_neg_log(
++  to_numeric_column(all_logs, "correct_terminal_prob_after_pos4_t1")
++)
++
++# These columns are populated when newer training logs record exact
++# boundary-specific quantities. Older logs will show blank panels with an
++# explanatory message.
++all_logs <- copy_optional_metric(
++  all_logs,
++  "decision_ce_after_neg4_t1",
++  c("decision_ce_after_neg4_t1", "unified_decision_ce_after_neg4_t1", "ce_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "decision_ce_after_pos4_t1",
++  c("decision_ce_after_pos4_t1", "unified_decision_ce_after_pos4_t1", "ce_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "chosen_path_reward_after_neg4_t1",
++  c("chosen_path_reward_after_neg4_t1", "selected_path_reward_after_neg4_t1", "episode_reward_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "chosen_path_reward_after_pos4_t1",
++  c("chosen_path_reward_after_pos4_t1", "selected_path_reward_after_pos4_t1", "episode_reward_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "kl_d_after_neg4_t1",
++  c("kl_d_after_neg4_t1", "kl_after_neg4_t1", "first_kl_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "kl_d_after_pos4_t1",
++  c("kl_d_after_pos4_t1", "kl_after_pos4_t1", "first_kl_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "critic_pred_after_neg4_t1",
++  c("critic_pred_after_neg4_t1", "critic_value_after_neg4_t1", "value_pred_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "critic_pred_after_pos4_t1",
++  c("critic_pred_after_pos4_t1", "critic_value_after_pos4_t1", "value_pred_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "sampled_return_stop_after_neg4_t1",
++  c("sampled_return_stop_after_neg4_t1", "return_stop_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "sampled_return_continue_after_neg4_t1",
++  c("sampled_return_continue_after_neg4_t1", "return_continue_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "sampled_return_stop_after_pos4_t1",
++  c("sampled_return_stop_after_pos4_t1", "return_stop_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "sampled_return_continue_after_pos4_t1",
++  c("sampled_return_continue_after_pos4_t1", "return_continue_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "kl_d_stop_after_neg4_t1",
++  c("kl_d_stop_after_neg4_t1", "kl_stop_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "kl_d_continue_after_neg4_t1",
++  c("kl_d_continue_after_neg4_t1", "kl_continue_after_neg4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "kl_d_stop_after_pos4_t1",
++  c("kl_d_stop_after_pos4_t1", "kl_stop_after_pos4_t1")
++)
++all_logs <- copy_optional_metric(
++  all_logs,
++  "kl_d_continue_after_pos4_t1",
++  c("kl_d_continue_after_pos4_t1", "kl_continue_after_pos4_t1")
++)
++all_logs$return_stop_minus_continue_after_neg4_t1 <- (
++  to_numeric_column(all_logs, "sampled_return_stop_after_neg4_t1") -
++    to_numeric_column(all_logs, "sampled_return_continue_after_neg4_t1")
++)
++all_logs$return_stop_minus_continue_after_pos4_t1 <- (
++  to_numeric_column(all_logs, "sampled_return_stop_after_pos4_t1") -
++    to_numeric_column(all_logs, "sampled_return_continue_after_pos4_t1")
++)
++all_logs$kl_stop_minus_continue_after_neg4_t1 <- (
++  to_numeric_column(all_logs, "kl_d_stop_after_neg4_t1") -
++    to_numeric_column(all_logs, "kl_d_continue_after_neg4_t1")
++)
++all_logs$kl_stop_minus_continue_after_pos4_t1 <- (
++  to_numeric_column(all_logs, "kl_d_stop_after_pos4_t1") -
++    to_numeric_column(all_logs, "kl_d_continue_after_pos4_t1")
++)
++
+ diagnostic_label <- sprintf(
+-  "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%dn",
++  "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%dn",
+   lambda_arg,
+   alpha_arg,
+   arg_label(beta_values),
+   arg_label(opportunity_values),
+   expansion_decision_version,
++  model_variant_file_segment(model_variant),
+   tree_size
+ )
+ 
+ pdf_path <- file.path(results_dir, sprintf("training_diagnostics_%s.pdf", diagnostic_label))
+-pdf(pdf_path, width = 14, height = 12)
+-old_par <- par(mfrow = c(4, 3), mar = c(4.5, 4.5, 1, 7))
++pdf(pdf_path, width = 21, height = 30)
++old_par <- par(mfrow = c(10, 4), mar = c(4.5, 4.5, 1, 7))
+ 
+ if ("expansion_epsilon" %in% names(all_logs)) {
+   plot_metric(all_logs, "expansion_epsilon", "Expansion epsilon")
+@@ -321,11 +557,48 @@ if ("expansion_epsilon" %in% names(all_logs)) {
+   plot(NA, xlab = "Epoch", ylab = "Exploration schedule", main = "")
+   text(0.5, 0.5, "No exploration schedule column")
+ }
++plot_metric(all_logs, "expansion_entropy_coef", "Expansion entropy coef")
+ 
+ plot_metric(all_logs, "expansion_stop_rate", "Expansion stop rate")
+ plot_metric(all_logs, "expansion_continue_rate", "Expansion continue rate")
++plot_metric(all_logs, "action_p_correct_after_neg4_t1", "P(action correct | first reward -4)")
++plot_metric(all_logs, "continue_rate_after_neg4_t1", "P(continue | first reward -4)")
++plot_metric(all_logs, "action_p_correct_after_pos4_t1", "P(action correct | first reward 4)")
++plot_metric(all_logs, "continue_rate_after_pos4_t1", "P(continue | first reward 4)")
++plot_metric(all_logs, "terminal_prob_after_neg4_t1", "P(terminal mass | first reward -4)")
++plot_metric(all_logs, "correct_terminal_prob_after_neg4_t1", "P(correct terminal | first reward -4)")
++plot_metric(all_logs, "expand_unobserved_prob_after_neg4_t1", "P(expand unobserved | first reward -4)")
++plot_metric(all_logs, "expand_observed_prob_after_neg4_t1", "P(expand observed | first reward -4)")
++plot_metric(all_logs, "terminal_prob_after_pos4_t1", "P(terminal mass | first reward 4)")
++plot_metric(all_logs, "correct_terminal_prob_after_pos4_t1", "P(correct terminal | first reward 4)")
++plot_metric(all_logs, "expand_unobserved_prob_after_pos4_t1", "P(expand unobserved | first reward 4)")
++plot_metric(all_logs, "expand_observed_prob_after_pos4_t1", "P(expand observed | first reward 4)")
++plot_metric(all_logs, "approx_decision_ce_after_neg4_t1", "Approx CE | first reward -4")
++plot_metric(all_logs, "approx_decision_ce_after_pos4_t1", "Approx CE | first reward 4")
++plot_metric(all_logs, "decision_ce_after_neg4_t1", "Exact decision CE | first reward -4")
++plot_metric(all_logs, "decision_ce_after_pos4_t1", "Exact decision CE | first reward 4")
++plot_metric(all_logs, "chosen_path_reward_after_neg4_t1", "Chosen path reward | first reward -4")
++plot_metric(all_logs, "chosen_path_reward_after_pos4_t1", "Chosen path reward | first reward 4")
++plot_metric(all_logs, "kl_d_after_neg4_t1", "KL_d | first reward -4")
++plot_metric(all_logs, "kl_d_after_pos4_t1", "KL_d | first reward 4")
++plot_metric(all_logs, "critic_pred_after_neg4_t1", "Critic pred | first reward -4")
++plot_metric(all_logs, "critic_pred_after_pos4_t1", "Critic pred | first reward 4")
++plot_metric(all_logs, "sampled_return_stop_after_neg4_t1", "Return | stop after -4")
++plot_metric(all_logs, "sampled_return_continue_after_neg4_t1", "Return | continue after -4")
++plot_metric(all_logs, "return_stop_minus_continue_after_neg4_t1", "Return stop - continue | -4")
++plot_metric(all_logs, "kl_d_stop_after_neg4_t1", "KL_d | stop after -4")
++plot_metric(all_logs, "kl_d_continue_after_neg4_t1", "KL_d | continue after -4")
++plot_metric(all_logs, "kl_stop_minus_continue_after_neg4_t1", "KL stop - continue | -4")
++plot_metric(all_logs, "sampled_return_stop_after_pos4_t1", "Return | stop after 4")
++plot_metric(all_logs, "sampled_return_continue_after_pos4_t1", "Return | continue after 4")
++plot_metric(all_logs, "return_stop_minus_continue_after_pos4_t1", "Return stop - continue | 4")
++plot_metric(all_logs, "kl_d_stop_after_pos4_t1", "KL_d | stop after 4")
++plot_metric(all_logs, "kl_d_continue_after_pos4_t1", "KL_d | continue after 4")
++plot_metric(all_logs, "kl_stop_minus_continue_after_pos4_t1", "KL stop - continue | 4")
+ plot_metric(all_logs, "total_loss", "Total loss")
+ plot_metric(all_logs, "expansion_loss", "Expansion loss")
++plot_metric(all_logs, "critic_loss", "Critic loss")
++plot_metric(all_logs, "unified_decision_ce_loss", "Unified decision CE loss")
+ plot_metric(all_logs, "action_loss", "Action loss")
+ plot_metric(all_logs, "kl_loss", "KL loss")
+ plot_metric(all_logs, "reconstruction_loss", "Reconstruction loss")
+@@ -339,14 +612,32 @@ par(old_par)
+ dev.off()
+ 
+ grad_pdf_path <- file.path(results_dir, sprintf("training_gradients_%s.pdf", diagnostic_label))
+-pdf(grad_pdf_path, width = 14, height = 10)
+-old_par <- par(mfrow = c(3, 3), mar = c(4.5, 4.5, 1, 7))
++pdf(grad_pdf_path, width = 18, height = 25)
++old_par <- par(mfrow = c(7, 4), mar = c(4.5, 4.5, 1, 7))
++plot_metric(all_logs, "update_grad_norm_enc", "Update grad encoder", log_y = TRUE)
++plot_metric(all_logs, "update_grad_norm_lstm", "Update grad LSTM", log_y = TRUE)
++plot_metric(all_logs, "update_grad_norm_dec", "Update grad decoder", log_y = TRUE)
++plot_metric(all_logs, "update_grad_norm_prior", "Update grad prior", log_y = TRUE)
++plot_metric(all_logs, "exp_policy_grad_norm_head", "Expansion policy grad head", log_y = TRUE)
++plot_metric(all_logs, "exp_grad_norm_lstm", "Expansion policy grad LSTM", log_y = TRUE)
++plot_metric(all_logs, "exp_grad_norm_enc", "Expansion policy grad encoder", log_y = TRUE)
++plot_metric(all_logs, "exp_grad_norm_dec", "Expansion policy grad decoder", log_y = TRUE)
++plot_metric(all_logs, "opp_grad_norm_head", "Opportunity grad head", log_y = TRUE)
++plot_metric(all_logs, "opp_grad_norm_lstm", "Opportunity grad LSTM", log_y = TRUE)
++plot_metric(all_logs, "opp_grad_norm_enc", "Opportunity grad encoder", log_y = TRUE)
++plot_metric(all_logs, "opp_grad_norm_dec", "Opportunity grad decoder", log_y = TRUE)
++plot_metric(all_logs, "act_grad_norm_head", "Action grad head", log_y = TRUE)
+ plot_metric(all_logs, "act_grad_norm_enc", "Action grad encoder", log_y = TRUE)
+ plot_metric(all_logs, "act_grad_norm_lstm", "Action grad LSTM", log_y = TRUE)
+ plot_metric(all_logs, "act_grad_norm_dec", "Action grad decoder", log_y = TRUE)
++plot_metric(all_logs, "critic_grad_norm_head", "Critic grad head", log_y = TRUE)
++plot_metric(all_logs, "critic_grad_norm_enc", "Critic grad encoder", log_y = TRUE)
++plot_metric(all_logs, "critic_grad_norm_lstm", "Critic grad LSTM", log_y = TRUE)
++plot_metric(all_logs, "critic_grad_norm_dec", "Critic grad decoder", log_y = TRUE)
+ plot_metric(all_logs, "kl_grad_norm_enc", "KL grad encoder", log_y = TRUE)
+ plot_metric(all_logs, "kl_grad_norm_lstm", "KL grad LSTM", log_y = TRUE)
+ plot_metric(all_logs, "kl_grad_norm_dec", "KL grad decoder", log_y = TRUE)
++plot_metric(all_logs, "rec_grad_norm_head", "Recon grad head", log_y = TRUE)
+ plot_metric(all_logs, "rec_grad_norm_enc", "Recon grad encoder", log_y = TRUE)
+ plot_metric(all_logs, "rec_grad_norm_lstm", "Recon grad LSTM", log_y = TRUE)
+ plot_metric(all_logs, "rec_grad_norm_dec", "Recon grad decoder", log_y = TRUE)
+@@ -370,8 +661,48 @@ summary_rows <- do.call(rbind, lapply(split(all_logs, list(all_logs$beta, all_lo
+     final_kl_loss = if ("kl_loss" %in% names(dat)) last_row$kl_loss else NA_real_,
+     final_reconstruction_loss = if ("reconstruction_loss" %in% names(dat)) last_row$reconstruction_loss else NA_real_,
+     final_expansion_loss = if ("expansion_loss" %in% names(dat)) last_row$expansion_loss else NA_real_,
++    final_critic_loss = if ("critic_loss" %in% names(dat)) last_row$critic_loss else NA_real_,
++    final_unified_decision_ce_loss = if ("unified_decision_ce_loss" %in% names(dat)) last_row$unified_decision_ce_loss else NA_real_,
+     final_expansion_stop_rate = if ("expansion_stop_rate" %in% names(dat)) last_row$expansion_stop_rate else NA_real_,
+     final_expansion_continue_rate = if ("expansion_continue_rate" %in% names(dat)) last_row$expansion_continue_rate else NA_real_,
++    final_action_p_correct_after_neg4_t1 = if ("action_p_correct_after_neg4_t1" %in% names(dat)) last_row$action_p_correct_after_neg4_t1 else NA_real_,
++    final_continue_rate_after_neg4_t1 = if ("continue_rate_after_neg4_t1" %in% names(dat)) last_row$continue_rate_after_neg4_t1 else NA_real_,
++    final_terminal_prob_after_neg4_t1 = if ("terminal_prob_after_neg4_t1" %in% names(dat)) last_row$terminal_prob_after_neg4_t1 else NA_real_,
++    final_correct_terminal_prob_after_neg4_t1 = if ("correct_terminal_prob_after_neg4_t1" %in% names(dat)) last_row$correct_terminal_prob_after_neg4_t1 else NA_real_,
++    final_expand_unobserved_prob_after_neg4_t1 = if ("expand_unobserved_prob_after_neg4_t1" %in% names(dat)) last_row$expand_unobserved_prob_after_neg4_t1 else NA_real_,
++    final_expand_observed_prob_after_neg4_t1 = if ("expand_observed_prob_after_neg4_t1" %in% names(dat)) last_row$expand_observed_prob_after_neg4_t1 else NA_real_,
++    final_approx_decision_ce_after_neg4_t1 = if ("approx_decision_ce_after_neg4_t1" %in% names(dat)) last_row$approx_decision_ce_after_neg4_t1 else NA_real_,
++    final_decision_ce_after_neg4_t1 = if ("decision_ce_after_neg4_t1" %in% names(dat)) last_row$decision_ce_after_neg4_t1 else NA_real_,
++    final_chosen_path_reward_after_neg4_t1 = if ("chosen_path_reward_after_neg4_t1" %in% names(dat)) last_row$chosen_path_reward_after_neg4_t1 else NA_real_,
++    final_kl_d_after_neg4_t1 = if ("kl_d_after_neg4_t1" %in% names(dat)) last_row$kl_d_after_neg4_t1 else NA_real_,
++    final_critic_pred_after_neg4_t1 = if ("critic_pred_after_neg4_t1" %in% names(dat)) last_row$critic_pred_after_neg4_t1 else NA_real_,
++    final_sampled_return_stop_after_neg4_t1 = if ("sampled_return_stop_after_neg4_t1" %in% names(dat)) last_row$sampled_return_stop_after_neg4_t1 else NA_real_,
++    final_sampled_return_continue_after_neg4_t1 = if ("sampled_return_continue_after_neg4_t1" %in% names(dat)) last_row$sampled_return_continue_after_neg4_t1 else NA_real_,
++    final_return_stop_minus_continue_after_neg4_t1 = if ("return_stop_minus_continue_after_neg4_t1" %in% names(dat)) last_row$return_stop_minus_continue_after_neg4_t1 else NA_real_,
++    final_kl_d_stop_after_neg4_t1 = if ("kl_d_stop_after_neg4_t1" %in% names(dat)) last_row$kl_d_stop_after_neg4_t1 else NA_real_,
++    final_kl_d_continue_after_neg4_t1 = if ("kl_d_continue_after_neg4_t1" %in% names(dat)) last_row$kl_d_continue_after_neg4_t1 else NA_real_,
++    final_n_stop_after_neg4_t1 = if ("n_stop_after_neg4_t1" %in% names(dat)) last_row$n_stop_after_neg4_t1 else NA_real_,
++    final_n_continue_after_neg4_t1 = if ("n_continue_after_neg4_t1" %in% names(dat)) last_row$n_continue_after_neg4_t1 else NA_real_,
++    final_n_neg4_t1 = if ("n_neg4_t1" %in% names(dat)) last_row$n_neg4_t1 else NA_real_,
++    final_action_p_correct_after_pos4_t1 = if ("action_p_correct_after_pos4_t1" %in% names(dat)) last_row$action_p_correct_after_pos4_t1 else NA_real_,
++    final_continue_rate_after_pos4_t1 = if ("continue_rate_after_pos4_t1" %in% names(dat)) last_row$continue_rate_after_pos4_t1 else NA_real_,
++    final_terminal_prob_after_pos4_t1 = if ("terminal_prob_after_pos4_t1" %in% names(dat)) last_row$terminal_prob_after_pos4_t1 else NA_real_,
++    final_correct_terminal_prob_after_pos4_t1 = if ("correct_terminal_prob_after_pos4_t1" %in% names(dat)) last_row$correct_terminal_prob_after_pos4_t1 else NA_real_,
++    final_expand_unobserved_prob_after_pos4_t1 = if ("expand_unobserved_prob_after_pos4_t1" %in% names(dat)) last_row$expand_unobserved_prob_after_pos4_t1 else NA_real_,
++    final_expand_observed_prob_after_pos4_t1 = if ("expand_observed_prob_after_pos4_t1" %in% names(dat)) last_row$expand_observed_prob_after_pos4_t1 else NA_real_,
++    final_approx_decision_ce_after_pos4_t1 = if ("approx_decision_ce_after_pos4_t1" %in% names(dat)) last_row$approx_decision_ce_after_pos4_t1 else NA_real_,
++    final_decision_ce_after_pos4_t1 = if ("decision_ce_after_pos4_t1" %in% names(dat)) last_row$decision_ce_after_pos4_t1 else NA_real_,
++    final_chosen_path_reward_after_pos4_t1 = if ("chosen_path_reward_after_pos4_t1" %in% names(dat)) last_row$chosen_path_reward_after_pos4_t1 else NA_real_,
++    final_kl_d_after_pos4_t1 = if ("kl_d_after_pos4_t1" %in% names(dat)) last_row$kl_d_after_pos4_t1 else NA_real_,
++    final_critic_pred_after_pos4_t1 = if ("critic_pred_after_pos4_t1" %in% names(dat)) last_row$critic_pred_after_pos4_t1 else NA_real_,
++    final_sampled_return_stop_after_pos4_t1 = if ("sampled_return_stop_after_pos4_t1" %in% names(dat)) last_row$sampled_return_stop_after_pos4_t1 else NA_real_,
++    final_sampled_return_continue_after_pos4_t1 = if ("sampled_return_continue_after_pos4_t1" %in% names(dat)) last_row$sampled_return_continue_after_pos4_t1 else NA_real_,
++    final_return_stop_minus_continue_after_pos4_t1 = if ("return_stop_minus_continue_after_pos4_t1" %in% names(dat)) last_row$return_stop_minus_continue_after_pos4_t1 else NA_real_,
++    final_kl_d_stop_after_pos4_t1 = if ("kl_d_stop_after_pos4_t1" %in% names(dat)) last_row$kl_d_stop_after_pos4_t1 else NA_real_,
++    final_kl_d_continue_after_pos4_t1 = if ("kl_d_continue_after_pos4_t1" %in% names(dat)) last_row$kl_d_continue_after_pos4_t1 else NA_real_,
++    final_n_stop_after_pos4_t1 = if ("n_stop_after_pos4_t1" %in% names(dat)) last_row$n_stop_after_pos4_t1 else NA_real_,
++    final_n_continue_after_pos4_t1 = if ("n_continue_after_pos4_t1" %in% names(dat)) last_row$n_continue_after_pos4_t1 else NA_real_,
++    final_n_pos4_t1 = if ("n_pos4_t1" %in% names(dat)) last_row$n_pos4_t1 else NA_real_,
+     final_act_to_kl_grad_lstm = last_row$act_to_kl_grad_lstm,
+     final_act_to_kl_grad_dec = last_row$act_to_kl_grad_dec,
+     file_path = last_row$file_path,
+@@ -396,6 +727,22 @@ if (!"expansion_epsilon" %in% names(all_logs)) {
+ if (!all(c("expansion_loss", "expansion_stop_rate", "expansion_continue_rate") %in% names(all_logs))) {
+   cat("- These logs do not contain all new expansion diagnostics; rerun training with the updated train.py to populate expansion_loss and stop/continue rates.\n")
+ }
++if (!all(c("terminal_prob_after_neg4_t1", "terminal_prob_after_pos4_t1") %in% names(all_logs))) {
++  cat("- These logs do not contain unified-policy probability mass diagnostics. Add terminal_prob_after_* and expand_*_prob_after_* columns during training to populate those panels.\n")
++}
++cat("- Approx CE panels use -log(mean correct-terminal probability), so they are not exact mean per-trial CE.\n")
++if (all(!is.finite(all_logs$decision_ce_after_neg4_t1)) && all(!is.finite(all_logs$decision_ce_after_pos4_t1))) {
++  cat("- Exact boundary-specific decision CE is not in these logs. Add decision_ce_after_* columns during training to populate those panels.\n")
++}
++if (all(!is.finite(all_logs$chosen_path_reward_after_neg4_t1)) && all(!is.finite(all_logs$chosen_path_reward_after_pos4_t1))) {
++  cat("- Boundary-specific chosen path rewards are not in these logs. Add chosen_path_reward_after_* columns during training to populate those panels.\n")
++}
++if (all(!is.finite(all_logs$kl_d_after_neg4_t1)) && all(!is.finite(all_logs$kl_d_after_pos4_t1))) {
++  cat("- Boundary-specific KL_d is not in these logs. Add kl_d_after_* columns during training to populate those panels.\n")
++}
++if (all(!is.finite(all_logs$critic_pred_after_neg4_t1)) && all(!is.finite(all_logs$critic_pred_after_pos4_t1))) {
++  cat("- Boundary-specific critic predictions are not in these logs. Add critic_pred_after_* columns during training to populate those panels.\n")
++}
+ cat("- Use the action/KL gradient ratio panels to see whether the action signal overwhelms the information signal in the shared encoder/LSTM/decoder.\n")
+ cat("- Use the first panel to confirm that epsilon was present for enough epochs and did not start/end at zero.\n")
+ cat("\nWrote: ", pdf_path, "\n", sep = "")
+diff --git a/analyses/exp_binary/plot_beta_summaries.R b/analyses/exp_binary/plot_beta_summaries.R
+index 11e5035..3aa709a 100644
+--- a/analyses/exp_binary/plot_beta_summaries.R
++++ b/analyses/exp_binary/plot_beta_summaries.R
+@@ -15,6 +15,7 @@ results_dir <- get_arg(6, "results")
+ tree_size <- as.integer(get_arg(7, "2"))
+ input_type <- get_arg(8, "binary")
+ expansion_decision_version <- get_arg(9, "decoder")
++model_variant <- get_arg(10, "vae")
+ 
+ normalize_expansion_decision_version <- function(version) {
+   version_key <- tolower(trimws(as.character(version)))
+@@ -41,6 +42,32 @@ normalize_expansion_decision_version <- function(version) {
+ 
+ expansion_decision_version <- normalize_expansion_decision_version(expansion_decision_version)
+ 
++normalize_model_variant <- function(variant) {
++  variant_key <- tolower(trimws(as.character(variant)))
++  aliases <- c(
++    "vae" = "vae",
++    "autoencoder" = "vae",
++    "rnn" = "rnn",
++    "plain_rnn" = "rnn",
++    "no_autoencoder" = "rnn",
++    "no_ae" = "rnn"
++  )
++  if (!variant_key %in% names(aliases)) {
++    stop(sprintf(
++      "model_variant must be one of: %s. Got %s.",
++      paste(names(aliases), collapse = ", "),
++      variant
++    ))
++  }
++  unname(aliases[[variant_key]])
++}
++
++model_variant <- normalize_model_variant(model_variant)
++
++model_variant_file_segment <- function(variant) {
++  if (identical(variant, "vae")) "" else sprintf("variant_%s_", variant)
++}
++
+ dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+ 
+ beta_values <- trimws(strsplit(beta_arg, ",")[[1]])
+@@ -65,6 +92,10 @@ format_plot_values <- function(values) {
+ opportunity_label <- arg_label(opportunity_values)
+ beta_label <- arg_label(beta_values)
+ expansion_label <- arg_label(expansion_decision_version)
++if (!identical(model_variant, "vae")) {
++  expansion_label <- sprintf("%s_variant_%s", expansion_label, arg_label(model_variant))
++}
++variant_file_segment <- model_variant_file_segment(model_variant)
+ 
+ drop_unnamed_index_columns <- function(dat) {
+   unnamed_cols <- names(dat) %in% c("", "...1", "X", "X1")
+@@ -101,9 +132,9 @@ simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_v
+         for (opportunity_candidate in opportunity_candidates) {
+           file_names <- c(
+             sprintf(
+-              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_seed_%d_%dn_%s.csv",
++              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_%s.csv",
+               lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate,
+-              expansion_decision_version, seed, tree_size, input_type
++              expansion_decision_version, variant_file_segment, seed, tree_size, input_type
+             )
+           )
+           for (file_name in file_names) {
+@@ -124,8 +155,8 @@ read_seed_file <- function(beta_value, opportunity_value, seed) {
+   file_path <- simulation_path(lambda_arg, alpha_arg, beta_value, opportunity_value, seed)
+   if (is.na(file_path)) {
+     warning(sprintf(
+-      "Missing simulation file for beta=%s opportunity=%s seed=%d",
+-      beta_value, opportunity_value, seed
++      "Missing simulation file for beta=%s opportunity=%s seed=%d model_variant=%s",
++      beta_value, opportunity_value, seed, model_variant
+     ))
+     return(NULL)
+   }
+@@ -135,6 +166,7 @@ read_seed_file <- function(beta_value, opportunity_value, seed) {
+   dat$beta <- beta_value
+   dat$opportunity <- opportunity_value
+   dat$seed <- seed
++  dat$model_variant <- model_variant
+   dat$file_path <- file_path
+   dat$source_file <- file_path
+   dat
+@@ -296,6 +328,41 @@ if (nrow(stop_data) > 0) {
+   )
+ }
+ 
++build_initial_stop_summary <- function(dat) {
++  if (!"stop_t1" %in% names(dat)) {
++    warning("No stop_t1 column was found; initial-stop panel will be empty.")
++    return(data.frame(
++      beta = character(),
++      opportunity = character(),
++      p_stop_initial = numeric(),
++      n = integer(),
++      stringsAsFactors = FALSE
++    ))
++  }
++
++  trial_id_cols <- intersect(c("beta", "opportunity", "seed", "graph", "stop_t1"), names(dat))
++  trial_data <- unique(dat[, trial_id_cols, drop = FALSE])
++  trial_data$stop_initial <- as_logical_col(trial_data$stop_t1)
++
++  initial_summary <- aggregate(
++    stop_initial ~ beta + opportunity,
++    data = trial_data,
++    FUN = mean
++  )
++  names(initial_summary)[names(initial_summary) == "stop_initial"] <- "p_stop_initial"
++
++  initial_counts <- aggregate(
++    stop_initial ~ beta + opportunity,
++    data = trial_data,
++    FUN = length
++  )
++  names(initial_counts)[names(initial_counts) == "stop_initial"] <- "n"
++
++  merge(initial_summary, initial_counts, by = c("beta", "opportunity"))
++}
++
++initial_stop_summary <- build_initial_stop_summary(all_data)
++
+ if ("MI" %in% names(all_data)) {
+   all_data$MI_value <- all_data$MI
+ } else if ("MI_cost" %in% names(all_data)) {
+@@ -951,10 +1018,10 @@ plot_reward_timestep_summary <- function(
+   par(old_par)
+ }
+ 
+-continue_pdf <- file.path(
++stop_pdf <- file.path(
+   results_dir,
+   sprintf(
+-    "continue_probability_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%dn.pdf",
++    "stop_probability_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%dn.pdf",
+     input_type, lambda_arg, alpha_arg, beta_label, opportunity_label, expansion_label, tree_size
+   )
+ )
+@@ -980,12 +1047,12 @@ plot_stop_panel <- function(reward_timestep, opportunity_value = NULL) {
+     sprintf("opportunity %s", opportunity_value)
+   }
+   panel_title <- if (reward_timestep == 1) {
+-    sprintf("%s\nContinue at timestep 2 after reward at timestep 1", opportunity_title)
++    sprintf("%s\nStop at timestep 2 after reward at timestep 1", opportunity_title)
+   } else if (reward_timestep == 2) {
+-    sprintf("%s\nContinue at timestep 3 after reward at timestep 2", opportunity_title)
++    sprintf("%s\nStop at timestep 3 after reward at timestep 2", opportunity_title)
+   } else {
+     sprintf(
+-      "%s\nContinue at timestep %d after reward at timestep %d",
++      "%s\nStop at timestep %d after reward at timestep %d",
+       opportunity_title,
+       decision_timestep,
+       reward_timestep
+@@ -998,8 +1065,8 @@ plot_stop_panel <- function(reward_timestep, opportunity_value = NULL) {
+     xlim = c(-0.1, 1.1),
+     ylim = c(0, 1),
+     xlab = "Observed reward",
+-    ylab = "P(continue at current timestep)",
+-      main = "",
++    ylab = "P(stop at current timestep)",
++      main = panel_title,
+       xaxt = "n"
+     )
+     axis(1, at = c(0, 1))
+@@ -1022,8 +1089,8 @@ plot_stop_panel <- function(reward_timestep, opportunity_value = NULL) {
+     xlim = expand_range(panel_data$reward, pad = 0.1),
+     ylim = c(0, 1),
+     xlab = "Observed reward",
+-    ylab = "P(continue at current timestep)",
+-    main = "",
++    ylab = "P(stop at current timestep)",
++    main = panel_title,
+     xaxt = "n"
+   )
+   axis(1, at = sort(unique(panel_data$reward)))
+@@ -1041,7 +1108,7 @@ plot_stop_panel <- function(reward_timestep, opportunity_value = NULL) {
+       if (nrow(beta_dat) > 0) {
+         lines(
+           beta_dat$reward,
+-          beta_dat$p_continue_current,
++          beta_dat$p_stop_current,
+           type = "b",
+           pch = opportunity_pch[[opportunity_value_i]],
+           lwd = 2,
+@@ -1053,17 +1120,91 @@ plot_stop_panel <- function(reward_timestep, opportunity_value = NULL) {
+   }
+ }
+ 
++plot_initial_stop_panel <- function(opportunity_value = NULL) {
++  panel_data <- initial_stop_summary
++  if (!is.null(opportunity_value)) {
++    panel_data <- panel_data[
++      panel_data$opportunity == opportunity_value,
++      ,
++      drop = FALSE
++    ]
++  }
++
++  x_param <- if (is.null(opportunity_value) && identical(color_by, "opportunity")) {
++    "opportunity"
++  } else {
++    "beta"
++  }
++  x_levels <- if (identical(x_param, "opportunity")) opportunity_levels else beta_levels
++  x_labels <- format_plot_values(x_levels)
++  x_positions <- setNames(seq_along(x_levels), x_levels)
++  opportunity_title <- if (is.null(opportunity_value)) {
++    "all opportunities"
++  } else {
++    sprintf("opportunity %s", opportunity_value)
++  }
++  panel_title <- sprintf("%s\nStop at timestep 1 before any reward", opportunity_title)
++
++  plot(
++    NA,
++    xlim = c(0.5, max(1.5, length(x_levels) + 0.5)),
++    ylim = c(0, 1),
++    xlab = if (identical(x_param, "opportunity")) "Opportunity cost" else "Beta",
++    ylab = "P(stop at timestep 1)",
++    main = panel_title,
++    xaxt = "n"
++  )
++  axis(1, at = seq_along(x_levels), labels = x_labels)
++  grid()
++
++  if (nrow(panel_data) == 0) {
++    text(mean(par("usr")[1:2]), 0.5, "No stop_t1 decisions", cex = 0.9)
++    return(invisible(NULL))
++  }
++
++  point_x <- x_positions[as.character(panel_data[[x_param]])]
++  point_col <- mapply(series_color, panel_data$beta, panel_data$opportunity)
++  point_pch <- opportunity_pch[as.character(panel_data$opportunity)]
++  points(
++    point_x,
++    panel_data$p_stop_initial,
++    pch = point_pch,
++    col = point_col,
++    cex = 1.4,
++    lwd = 2
++  )
++}
++
++stop_reward_timesteps <- sort(unique(stop_summary$reward_timestep))
++stop_reward_timesteps <- stop_reward_timesteps[!is.na(stop_reward_timesteps)]
++if (length(stop_reward_timesteps) == 0) {
++  stop_reward_timesteps <- 1
++}
++
++stop_panel_count <- length(stop_reward_timesteps) + 1
++
+ if (identical(color_by, "opportunity")) {
+-  pdf(continue_pdf, width = 14, height = 5)
+-  old_par <- par(mfrow = c(1, 2), mar = c(4.5, 4.5, 1, 8))
+-  plot_stop_panel(1)
+-  plot_stop_panel(2)
++  pdf(stop_pdf, width = max(7, 7 * stop_panel_count), height = 5)
++  old_par <- par(mfrow = c(1, stop_panel_count), mar = c(4.5, 4.5, 1, 8))
++  plot_initial_stop_panel()
++  for (reward_timestep in stop_reward_timesteps) {
++    plot_stop_panel(reward_timestep)
++  }
+ } else {
+-  pdf(continue_pdf, width = 14, height = max(5, 4.5 * length(opportunity_levels)))
+-  old_par <- par(mfrow = c(length(opportunity_levels), 2), mar = c(4.5, 4.5, 1, 8))
++  pdf(
++    stop_pdf,
++    width = max(7, 7 * stop_panel_count),
++    height = max(5, 4.5 * length(opportunity_levels))
++  )
++  old_par <- par(
++    mfrow = c(length(opportunity_levels), stop_panel_count),
++    mar = c(4.5, 4.5, 1, 8)
++  )
+   for (opportunity_value in opportunity_levels) {
+-    plot_stop_panel(1, opportunity_value)
+-    plot_stop_panel(2, opportunity_value)
++    plot_initial_stop_panel(opportunity_value)
++    for (reward_timestep in stop_reward_timesteps) {
++      plot_stop_panel(reward_timestep, opportunity_value)
++    }
+   }
+ }
+ plot_parameter_legend()
+@@ -1360,7 +1501,7 @@ pdf(
+ plot_choice_other_panels(choice_other_summary)
+ dev.off()
+ 
+-message("Wrote: ", continue_pdf)
++message("Wrote: ", stop_pdf)
+ message("Wrote: ", v_mi_pdf)
+ message("Wrote: ", kl_pdf)
+ message("Wrote: ", kl_reward_t1_pdf)
+diff --git a/model/config.py b/model/config.py
+index e8d7344..d78a55e 100644
+--- a/model/config.py
++++ b/model/config.py
+@@ -42,9 +42,10 @@ try:
+     opportunity_cost_string = sys.argv[11] if len(sys.argv) > 11 else "0.0"
+     opportunity_cost_values = [float(x) for x in opportunity_cost_string.split(',')]
+     expansion_decision_version = sys.argv[12] if len(sys.argv) > 12 else "decoder"
++    model_variant = sys.argv[13] if len(sys.argv) > 13 else "vae"
+ except IndexError:
+     print("Error: Missing command-line arguments.")
+-    print("Usage: python main.py <lambda> <alpha> <beta> <dir_name> <epochs> <input_type> <seed> <tree_size> <train/simulate> <tree_type> [opportunity_cost] [expansion_decision_version]")
++    print("Usage: python main.py <lambda> <alpha> <beta> <dir_name> <epochs> <input_type> <seed> <tree_size> <train/simulate> <tree_type> [opportunity_cost] [expansion_decision_version] [model_variant]")
+     sys.exit(1)
+ 
+ def normalize_expansion_decision_version(version):
+@@ -70,6 +71,23 @@ def normalize_expansion_decision_version(version):
+ 
+ expansion_decision_version = normalize_expansion_decision_version(expansion_decision_version)
+ 
++def normalize_model_variant(variant):
++    aliases = {
++        "vae": "vae",
++        "autoencoder": "vae",
++        "rnn": "rnn",
++        "plain_rnn": "rnn",
++        "no_autoencoder": "rnn",
++        "no_ae": "rnn",
++    }
++    variant_key = str(variant).strip().lower()
++    if variant_key not in aliases:
++        valid = ", ".join(sorted(aliases))
++        raise ValueError(f"model_variant must be one of: {valid}. Got {variant!r}.")
++    return aliases[variant_key]
++
++model_variant = normalize_model_variant(model_variant)
++
+ sim_dir_name = dir_name.replace("model", "simulation")
+ 
+ # ---------------------------------------------------------
+diff --git a/model/helper.py b/model/helper.py
+index 70ae4dd..74e728d 100644
+--- a/model/helper.py
++++ b/model/helper.py
+@@ -190,4 +190,4 @@ def policy(estimated_path_rewards):
+     # Ensure the normalized vector sums to 1 to represent a valid policy
+     normalized_vector = normalized_vector / tf.reduce_sum(normalized_vector, axis=1, keepdims=True)  # Shape: [batch_size, num_paths]
+     
+-    return normalized_vector
+\ No newline at end of file
++    return normalized_vector
+diff --git a/model/main.py b/model/main.py
+index f2c77bf..70d811b 100644
+--- a/model/main.py
++++ b/model/main.py
+@@ -28,12 +28,15 @@ def main():
+                         print(
+                             f"\n--- Training -> lambda: {lambda_}, alpha: {alpha}, "
+                             f"beta: {beta}, opportunity_cost: {opportunity_cost}, "
+-                            f"expansion_decision_version: {config.expansion_decision_version} ---"
++                            f"expansion_decision_version: {config.expansion_decision_version}, "
++                            f"model_variant: {config.model_variant} ---"
+                         )
++                        variant_label = "" if config.model_variant == "vae" else f"variant_{config.model_variant}_"
+                         if config.tree_size == 30:
+                             model_name = (
+                                 f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
+                                 f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
++                                f'{variant_label}'
+                                 f'seed_{config.seed}_'
+                                 f'{config.tree_size}n_{config.tree_type}'
+                             )
+@@ -41,6 +44,7 @@ def main():
+                             model_name = (
+                                 f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
+                                 f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
++                                f'{variant_label}'
+                                 f'seed_{config.seed}_{config.tree_size}n'
+                             )
+                         # 1. Initialize Model Architecture
+@@ -64,7 +68,8 @@ def main():
+                                 tree_type = config.tree,
+                                 opportunity_cost=opportunity_cost,
+                                 input_type=config.input_type,
+-                                expansion_decision_version=config.expansion_decision_version
++                                expansion_decision_version=config.expansion_decision_version,
++                                use_autoencoder=(config.model_variant == "vae")
+                             )
+                         else:
+                             
+@@ -83,7 +88,8 @@ def main():
+                                 lambda_=lambda_,
+                                 opportunity_cost=opportunity_cost,
+                                 input_type=config.input_type,
+-                                expansion_decision_version=config.expansion_decision_version
++                                expansion_decision_version=config.expansion_decision_version,
++                                use_autoencoder=(config.model_variant == "vae")
+                             )
+                         # 2. Run the Training Loop
+                         train_model(
+diff --git a/model/model.py b/model/model.py
+index 4f3ff98..b2bc1bb 100644
+--- a/model/model.py
++++ b/model/model.py
+@@ -48,7 +48,8 @@ class VariationalRNN(tf.keras.Model):
+                  index_path_map, path_map, path_cov_mat, 
+                  alpha=0.0, beta=1.0, lambda_=1.0, tree_type = "deep",
+                  opportunity_cost=0.0, input_type="uniform",
+-                 expansion_decision_version="decoder"):
++                 expansion_decision_version="decoder",
++                 use_autoencoder=True):
+         super(VariationalRNN, self).__init__()
+         self.encoder = encoder
+         self.decoder = decoder
+@@ -90,6 +91,7 @@ class VariationalRNN(tf.keras.Model):
+         self.lambda_ = lambda_
+         self.opportunity_cost = opportunity_cost
+         self.input_type = input_type
++        self.use_autoencoder = use_autoencoder
+         self.expansion_decision_version = self.normalize_expansion_decision_version(
+             expansion_decision_version
+         )
+@@ -287,17 +289,26 @@ class VariationalRNN(tf.keras.Model):
+             state = (new_h, new_c)
+             encoder_input = tf.concat(state, axis=-1)
+ 
+-            z_mean, z_log_var, z_sampled = self.encoder(encoder_input)
++            if self.use_autoencoder:
++                z_mean, z_log_var, z_sampled = self.encoder(encoder_input)
+ 
+-            z = z_sampled
+-            all_z_means.append(z_mean)
+-            all_z_log_vars.append(z_log_var)
++                z = z_sampled
++                all_z_means.append(z_mean)
++                all_z_log_vars.append(z_log_var)
+ 
+-            decoder_input = tf.concat([z], axis=1)
+-            decoder_output = self.decoder(decoder_input)
+-            hidden_state_flat, c_flat = tf.split(decoder_output, num_or_size_splits=2, axis=-1)
+-            hidden_state_flat = hidden_state_flat * active_mask + prev_hidden_state * (1.0 - active_mask)
+-            c_flat = c_flat * active_mask + prev_c_state * (1.0 - active_mask)
++                decoder_input = tf.concat([z], axis=1)
++                decoder_output = self.decoder(decoder_input)
++                hidden_state_flat, c_flat = tf.split(decoder_output, num_or_size_splits=2, axis=-1)
++                hidden_state_flat = hidden_state_flat * active_mask + prev_hidden_state * (1.0 - active_mask)
++                c_flat = c_flat * active_mask + prev_c_state * (1.0 - active_mask)
++            else:
++                z_mean = tf.zeros([batch_size, self.latent_dim], dtype=tf.float32)
++                z_log_var = tf.zeros([batch_size, self.latent_dim], dtype=tf.float32)
++                z = z_mean
++                all_z_means.append(z_mean)
++                all_z_log_vars.append(z_log_var)
++                hidden_state_flat = new_h
++                c_flat = new_c
+             if self.expansion_decision_version == "decoder":
+                 action_input = hidden_state_flat
+             elif self.expansion_decision_version == "lstm":
+@@ -316,28 +327,34 @@ class VariationalRNN(tf.keras.Model):
+             observed_inputs = inputs * observed_mask
+             all_observed_masks.append(tf.squeeze(observed_mask, axis=-1))
+ 
+-            rec_decoder_input = tf.concat([hidden_state_flat], axis=1)
++            if self.use_autoencoder:
++                rec_decoder_input = tf.concat([hidden_state_flat], axis=1)
+ 
+-            dist_params = self.reconstruction_head(rec_decoder_input)
+-            dist_params = tf.reshape(dist_params, [batch_size, self.time_steps, 2])
++                dist_params = self.reconstruction_head(rec_decoder_input)
++                dist_params = tf.reshape(dist_params, [batch_size, self.time_steps, 2])
+ 
+-            mu_raw = dist_params[:, :, 0:1]
+-            mu = 5*tf.math.tanh(mu_raw)
+-            scale = tf.exp(dist_params[:, :, 1:2]) + 1e-4
++                mu_raw = dist_params[:, :, 0:1]
++                mu = 5*tf.math.tanh(mu_raw)
++                scale = tf.exp(dist_params[:, :, 1:2]) + 1e-4
+ 
+-            bin_edges = tf.constant(
+-                [-4.5, -3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 4.5],
+-                dtype=tf.float32
+-            )
+-            bin_edges = tf.reshape(bin_edges, [1, 1, 10])
++                bin_edges = tf.constant(
++                    [-4.5, -3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 4.5],
++                    dtype=tf.float32
++                )
++                bin_edges = tf.reshape(bin_edges, [1, 1, 10])
+ 
+-            cdf_at_edges = tf.math.sigmoid((bin_edges - mu) / scale)
+-            category_slice_raw = cdf_at_edges[:, :, 1:10] - cdf_at_edges[:, :, 0:9]
+-            category_slice_raw = tf.reverse(category_slice_raw, axis=[-1])
+-            category_slice_raw = category_slice_raw + 1e-6
+-            category_slice = category_slice_raw / tf.reduce_sum(category_slice_raw, axis=-1, keepdims=True)
++                cdf_at_edges = tf.math.sigmoid((bin_edges - mu) / scale)
++                category_slice_raw = cdf_at_edges[:, :, 1:10] - cdf_at_edges[:, :, 0:9]
++                category_slice_raw = tf.reverse(category_slice_raw, axis=[-1])
++                category_slice_raw = category_slice_raw + 1e-6
++                category_slice = category_slice_raw / tf.reduce_sum(category_slice_raw, axis=-1, keepdims=True)
+ 
+-            category_output = category_slice
++                category_output = category_slice
++            else:
++                category_output = tf.ones(
++                    [batch_size, self.time_steps, self.num_categories],
++                    dtype=tf.float32
++                ) / tf.cast(self.num_categories, tf.float32)
+             all_category_outputs.append(category_output)
+ 
+             # critic at every timestep
+@@ -346,11 +363,15 @@ class VariationalRNN(tf.keras.Model):
+             step_critic_loss = self.compute_critic_loss(step_value_pred, step_value_target)
+             cumulative_critic_loss += step_critic_loss
+ 
+-            prior_mean, prior_var = self.compute_time_conditional_prior(t, batch_size)
+-            kl_per_sample = self.calculate_kl_per_sample(z_mean, z_log_var, prior_mean, prior_var)
+-            kl_mask = tf.squeeze(active_mask, axis=-1)
+-            masked_kl_per_sample = kl_per_sample * kl_mask
+-            kl = tf.reduce_mean(masked_kl_per_sample)
++            if self.use_autoencoder:
++                prior_mean, prior_var = self.compute_time_conditional_prior(t, batch_size)
++                kl_per_sample = self.calculate_kl_per_sample(z_mean, z_log_var, prior_mean, prior_var)
++                kl_mask = tf.squeeze(active_mask, axis=-1)
++                masked_kl_per_sample = kl_per_sample * kl_mask
++                kl = tf.reduce_mean(masked_kl_per_sample)
++            else:
++                kl_per_sample = tf.zeros([batch_size], dtype=tf.float32)
++                kl = tf.constant(0.0, dtype=tf.float32)
+             all_kl_d.append(tf.expand_dims(kl_per_sample, axis=-1))
+             information_cost += kl
+ 
+@@ -395,11 +416,14 @@ class VariationalRNN(tf.keras.Model):
+         kl_scaler = 1
+         information_loss = information_cost / self.time_steps / kl_scaler
+ 
+-        reconstruction_loss = self.compute_categorical_cross_entropy_loss(
+-            categories_onehot,
+-            all_category_outputs,
+-            observed_masks
+-        )
++        if self.use_autoencoder:
++            reconstruction_loss = self.compute_categorical_cross_entropy_loss(
++                categories_onehot,
++                all_category_outputs,
++                observed_masks
++            )
++        else:
++            reconstruction_loss = tf.constant(0.0, dtype=tf.float32)
+         expansion_log_probs = tf.stack(all_expansion_log_probs, axis=1)
+         expansion_loss = self.compute_expansion_policy_loss(
+             inputs,
+@@ -451,6 +475,7 @@ class VariationalRNN(tf.keras.Model):
+             first_decoder_loss += (
+                 information_loss * current_beta
+                 + action_loss * self.lambda_
++                + (0.0 if self.use_autoencoder else expansion_loss * self.lambda_)
+                 + opportunity_loss * self.opportunity_cost
+                 + critic_loss *  self.lambda_* current_critic_coef
+                 + reconstruction_loss * self.alpha
+@@ -486,7 +511,8 @@ class VariationalRNN(tf.keras.Model):
+             expansion_log_probs,
+             expansion_loss,
+             expansion_stop_rate,
+-            expansion_continue_rate
++            expansion_continue_rate,
++            opportunity_loss
+         )
+     def compute_time_conditional_prior(self, t, batch_size):
+         mu_t = self.prior_mu[t]           
+diff --git a/model/run_grid.sh b/model/run_grid.sh
+index 0a987ce..40c6a15 100755
+--- a/model/run_grid.sh
++++ b/model/run_grid.sh
+@@ -1,10 +1,12 @@
+ #!/bin/bash
+ 
+ # Check if all required arguments are provided
+-if [ "$#" -ne 16 ]; then
+-    echo "Usage: $0 beta_log10_min beta_log10_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_str seed_min seed_max train input_type tree_size expansion_decision_version"
+-    echo "Example: $0 -2 2 5 0 0 1 0 0.2 5 1.0 1 5 train uniform 2 decoder"
++if [ "$#" -lt 16 ] || [ "$#" -gt 17 ]; then
++    echo "Usage: $0 beta_log10_min beta_log10_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_str seed_min seed_max train input_type tree_size expansion_decision_version [model_variant]"
++    echo "Example VAE: $0 3 3 1 1 1 1 -2 -2 1 1.0 1 5 train uniform 2 lstm vae"
++    echo "Example RNN: $0 0 0 1 0 0 1 -2 -2 1 1.0 1 5 train uniform 2 lstm rnn"
+     echo "Expansion versions: decoder/1, lstm/2, pre_lstm/3"
++    echo "Model variants: vae, rnn"
+     exit 1
+ fi
+ 
+@@ -26,6 +28,7 @@ echo "13: '${13}'"
+ echo "14: '${14}'"
+ echo "15: '${15}'"
+ echo "16: '${16}'"
++echo "17: '${17}'"
+ echo "================================="
+ 
+ # Assign arguments to variables
+@@ -45,6 +48,7 @@ train=${13}
+ input_type=${14}
+ tree_size=${15}
+ expansion_decision_version=${16}
++model_variant=${17:-"vae"}
+ # Create a Python script to generate the commands
+ cat > generate_commands.py << 'EOL'
+ import numpy as np
+@@ -61,6 +65,7 @@ train = sys.argv[13]
+ input_type = sys.argv[14]
+ tree_size = sys.argv[15]
+ expansion_decision_version = sys.argv[16]
++model_variant = sys.argv[17]
+ if np.isinf(beta_log_min) or np.isinf(beta_log_max):
+     beta_exp_values = np.zeros(beta_steps)
+ else:
+@@ -79,7 +84,7 @@ if np.isinf(opportunity_min) or np.isinf(opportunity_max):
+     opportunity_values = np.zeros(opportunity_steps)
+ else:
+     opportunity_log_values = np.linspace(opportunity_min, opportunity_max, opportunity_steps)
+-    opportunity_values =np.array( [10**  l for l in opportunity_log_values])
++    opportunity_values =np.array( [  l for l in opportunity_log_values])
+ 
+ # Split into lists of length 5
+ def split_list(lst, n):
+@@ -100,7 +105,7 @@ for seed_list in seed_values_split:
+                 seed_str = ", ".join([f"{x}" for x in seed_list])
+                 opportunity_str = ", ".join([f"{x}" for x in opportunity_list])
+                 # NOTE: We removed the extra double quotes inside the python print to make parsing easier in bash
+-                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}"'
++                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}"'
+                 print(command)
+ EOL
+ 
+@@ -108,7 +113,7 @@ EOL
+ JID_FILE=$(mktemp)
+ 
+ # Run the Python script and execute each command
+-python generate_commands.py "$beta_log_min" "$beta_log_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_min" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version"| while read -r cmd; do
++python generate_commands.py "$beta_log_min" "$beta_log_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_min" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version" "$model_variant"| while read -r cmd; do
+     echo "Executing: $cmd"
+     
+     # 1. Execute the command and capture the output (e.g., "Submitted batch job 12345")
+diff --git a/model/run_model.sh b/model/run_model.sh
+index 9402afa..b61dbb8 100755
+--- a/model/run_model.sh
++++ b/model/run_model.sh
+@@ -1,6 +1,14 @@
+ #!/bin/bash
+ 
+-# This script activates the virtual environment and runs the model_vae.py script.
++if [ "$#" -lt 11 ] || [ "$#" -gt 13 ]; then
++    echo "Usage: $0 lambda alpha beta model_dir sim_dir trial_n input_type seed train opportunity_cost tree_size [expansion_decision_version] [model_variant]"
++    echo "Example: $0 1.0 0 1000 outputs/models/ outputs/simulations/ 2000 uniform 1 train 0.05 2 lstm rnn"
++    echo "Expansion versions: decoder/1, lstm/2, pre_lstm/3"
++    echo "Model variants: vae, rnn"
++    exit 1
++fi
++
++# This script activates the virtual environment and runs model/main.py.
+ echo "=== DEBUG: Arguments received ==="
+ echo "Total args: $#"
+ echo "1: '$1'"
+@@ -15,6 +23,7 @@ echo "9: '$9'"
+ echo "10: '${10}'"
+ echo "11: '${11}'"
+ echo "12: '${12}'"
++echo "13: '${13}'"
+ echo "================================="
+ lambda_string=$1
+ alpha_string=$2
+@@ -28,6 +37,7 @@ train=$9
+ opportunity_cost_string=${10:-"0.0"}
+ tree_size=${11}
+ expansion_decision_version=${12:-"decoder"}
++model_variant=${13:-"vae"}
+ # Navigate to the directory containing the virtual environment if it's not in the current directory
+ # Uncomment and modify the next line if needed
+ # cd /path/to/your/project
+@@ -35,7 +45,7 @@ module unload cuda/11.0
+ module load cuda/11.2
+ # Activate the virtual environment
+ source vae_env/bin/activate
+-python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "120" "$input_type" "$seed" "$tree_size" "$train" "" "$opportunity_cost_string" "$expansion_decision_version"
++python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "60" "$input_type" "$seed" "$tree_size" "$train" "" "$opportunity_cost_string" "$expansion_decision_version" "$model_variant"
+ 
+ 
+ # Deactivate the virtual environment when done
+diff --git a/model/simulate.py b/model/simulate.py
+index 5f3393f..617cfbb 100644
+--- a/model/simulate.py
++++ b/model/simulate.py
+@@ -47,19 +47,23 @@ def build_model(config, alpha, beta, lambda_, opportunity_cost):
+         opportunity_cost=opportunity_cost,
+         input_type=config.input_type,
+         expansion_decision_version=config.expansion_decision_version,
++        use_autoencoder=(config.model_variant == "vae"),
+     )
+ 
+ 
+ def model_name_for(config, lambda_, alpha, beta, opportunity_cost):
++    variant_label = "" if config.model_variant == "vae" else f"variant_{config.model_variant}_"
+     if config.tree_size == 30:
+         return (
+             f"lambda_{lambda_}_alpha_{alpha}_beta_{beta}_opportunity_{opportunity_cost}_"
+             f"expansion_{config.expansion_decision_version}_"
++            f"{variant_label}"
+             f"seed_{config.seed}_{config.tree_size}n_{config.tree_type}"
+         )
+     return (
+         f"lambda_{lambda_}_alpha_{alpha}_beta_{beta}_opportunity_{opportunity_cost}_"
+         f"expansion_{config.expansion_decision_version}_"
++        f"{variant_label}"
+         f"seed_{config.seed}_{config.tree_size}n"
+     )
+ 
+@@ -169,7 +173,8 @@ def run_simulation(config):
+                     print(
+                         f"\nEvaluating -> lambda: {lambda_}, alpha: {alpha}, "
+                         f"beta: {beta}, opportunity_cost: {opportunity_cost}, "
+-                        f"expansion_decision_version: {config.expansion_decision_version}"
++                        f"expansion_decision_version: {config.expansion_decision_version}, "
++                        f"model_variant: {config.model_variant}"
+                     )
+ 
+                     model_name = model_name_for(config, lambda_, alpha, beta, opportunity_cost)
+diff --git a/model/train.py b/model/train.py
+index 78053eb..fd885e6 100644
+--- a/model/train.py
++++ b/model/train.py
+@@ -28,14 +28,18 @@ def train_step(
+     """
+     Executes one training step: forward pass, loss computation, and backpropagation.
+     """
+-    first_decoder_params = (
+-        model.decoder.trainable_variables + 
+-        model.lstm_cell.trainable_variables +
+-        model.encoder.trainable_variables + 
+-        [model.prior_mu] + 
+-        [model.prior_logvar]
+-    )
+-    second_decoder_params = model.reconstruction_head.trainable_variables
++    if model.use_autoencoder:
++        first_decoder_params = (
++            model.decoder.trainable_variables + 
++            model.lstm_cell.trainable_variables +
++            model.encoder.trainable_variables + 
++            [model.prior_mu] + 
++            [model.prior_logvar]
++        )
++        second_decoder_params = model.reconstruction_head.trainable_variables
++    else:
++        first_decoder_params = model.lstm_cell.trainable_variables
++        second_decoder_params = []
+     action_head_params = model.action_head.trainable_variables
+     expansion_params = model.expansion_head.trainable_variables
+     critic_params = model.critic_head.trainable_variables
+@@ -77,10 +81,16 @@ def train_step(
+             expansion_policy_loss = extra_outputs[7]
+             expansion_stop_rate = extra_outputs[8]
+             expansion_continue_rate = extra_outputs[9]
++            opportunity_policy_loss = extra_outputs[10]
+              
+             # --- THE FIX: Create the weighted tensors INSIDE the tape scope ---
+             weighted_kl_for_logging = information_loss * current_beta
+             weighted_rec_for_logging = reconstruction_loss * model.alpha
++            weighted_exp_for_logging = expansion_policy_loss * model.lambda_
++            weighted_opp_for_logging = opportunity_policy_loss * model.opportunity_cost
++            weighted_critic_for_logging = (
++                critic_loss * model.lambda_ * current_critic_coef
++            )
+             # ------------------------------------------------------------------
+     
+     # 1. Calculate Combined Gradients (for the actual optimizer update)
+@@ -94,31 +104,66 @@ def train_step(
+     kl_grads = tape.gradient(weighted_kl_for_logging, first_decoder_params)
+     act_grads = tape.gradient(action_loss, first_decoder_params)
+     rec_grads = tape.gradient(weighted_rec_for_logging, first_decoder_params)
++    exp_grads = tape.gradient(weighted_exp_for_logging, first_decoder_params)
++    opp_grads = tape.gradient(weighted_opp_for_logging, first_decoder_params)
++    critic_backbone_grads = tape.gradient(weighted_critic_for_logging, first_decoder_params)
++    exp_head_isolated_grads = tape.gradient(weighted_exp_for_logging, expansion_params)
++    opp_head_isolated_grads = tape.gradient(weighted_opp_for_logging, expansion_params)
+ 
+     # --- Helper to slice and calculate global norms ---
+     num_dec = len(model.decoder.trainable_variables)
+     num_lstm = len(model.lstm_cell.trainable_variables)
+     num_enc = len(model.encoder.trainable_variables)
+ 
++    def global_norm_or_zero(grad_list):
++        if grad_list is None:
++            return tf.constant(0.0, dtype=tf.float32)
++        filtered = [g for g in grad_list if g is not None]
++        if not filtered:
++            return tf.constant(0.0, dtype=tf.float32)
++        return tf.linalg.global_norm(filtered)
++
+     def extract_norms(grad_list):
+         if grad_list is None:
+             # Fallback if a loss is totally disconnected
+-            return tf.constant(0.0), tf.constant(0.0), tf.constant(0.0)
++            return (
++                tf.constant(0.0), tf.constant(0.0),
++                tf.constant(0.0), tf.constant(0.0)
++            )
++        if not model.use_autoencoder:
++            norm_lstm = global_norm_or_zero(grad_list)
++            return tf.constant(0.0), norm_lstm, tf.constant(0.0), tf.constant(0.0)
+             
+         dec_g = grad_list[:num_dec]
+         lstm_g = grad_list[num_dec : num_dec + num_lstm]
+         enc_g = grad_list[num_dec + num_lstm : num_dec + num_lstm + num_enc]
++        prior_g = grad_list[num_dec + num_lstm + num_enc :]
+ 
+-        norm_dec = tf.linalg.global_norm([g for g in dec_g if g is not None])
+-        norm_lstm = tf.linalg.global_norm([g for g in lstm_g if g is not None])
+-        norm_enc = tf.linalg.global_norm([g for g in enc_g if g is not None])
++        norm_dec = global_norm_or_zero(dec_g)
++        norm_lstm = global_norm_or_zero(lstm_g)
++        norm_enc = global_norm_or_zero(enc_g)
++        norm_prior = global_norm_or_zero(prior_g)
+         
+-        return norm_enc, norm_lstm, norm_dec
++        return norm_enc, norm_lstm, norm_dec, norm_prior
+ 
+     # Extract the 9 specific norms
+-    kl_norm_enc, kl_norm_lstm, kl_norm_dec = extract_norms(kl_grads)
+-    act_norm_enc, act_norm_lstm, act_norm_dec = extract_norms(act_grads)
+-    rec_norm_enc, rec_norm_lstm, rec_norm_dec = extract_norms(rec_grads)
++    kl_norm_enc, kl_norm_lstm, kl_norm_dec, kl_norm_prior = extract_norms(kl_grads)
++    act_norm_enc, act_norm_lstm, act_norm_dec, act_norm_prior = extract_norms(act_grads)
++    rec_norm_enc, rec_norm_lstm, rec_norm_dec, rec_norm_prior = extract_norms(rec_grads)
++    exp_norm_enc, exp_norm_lstm, exp_norm_dec, exp_norm_prior = extract_norms(exp_grads)
++    opp_norm_enc, opp_norm_lstm, opp_norm_dec, opp_norm_prior = extract_norms(opp_grads)
++    critic_norm_enc, critic_norm_lstm, critic_norm_dec, critic_norm_prior = extract_norms(
++        critic_backbone_grads
++    )
++    update_norm_enc, update_norm_lstm, update_norm_dec, update_norm_prior = extract_norms(
++        first_decoder_gradients
++    )
++    rec_head_norm = global_norm_or_zero(second_decoder_gradients)
++    action_head_norm = global_norm_or_zero(action_head_gradients)
++    expansion_head_norm = global_norm_or_zero(expansion_gradients)
++    critic_head_norm = global_norm_or_zero(critic_gradients)
++    exp_head_isolated_norm = global_norm_or_zero(exp_head_isolated_grads)
++    opp_head_isolated_norm = global_norm_or_zero(opp_head_isolated_grads)
+     # -----------------------------------------------------------------
+ 
+ 
+@@ -131,8 +176,12 @@ def train_step(
+         critic_gradients
+     )
+     all_params = first_decoder_params + second_decoder_params + action_head_params + expansion_params + critic_params
+-    
+-    optimizer.apply_gradients(zip(all_gradients, all_params))
++    grads_and_vars = [
++        (grad, var)
++        for grad, var in zip(all_gradients, all_params)
++        if grad is not None
++    ]
++    optimizer.apply_gradients(grads_and_vars)
+     
+     # Must explicitly delete a persistent tape when done
+     del tape
+@@ -156,7 +205,12 @@ def train_step(
+             ppo_expansion_loss = extra_outputs[5]
+ 
+         ppo_expansion_gradients = ppo_tape.gradient(ppo_expansion_loss, expansion_params)
+-        optimizer.apply_gradients(zip(ppo_expansion_gradients, expansion_params))
++        ppo_grads_and_vars = [
++            (grad, var)
++            for grad, var in zip(ppo_expansion_gradients, expansion_params)
++            if grad is not None
++        ]
++        optimizer.apply_gradients(ppo_grads_and_vars)
+     
+     # Return all 13 values
+     return (
+@@ -164,7 +218,14 @@ def train_step(
+             expansion_policy_loss, expansion_stop_rate, expansion_continue_rate,
+             kl_norm_enc, kl_norm_lstm, kl_norm_dec,
+             act_norm_enc, act_norm_lstm, act_norm_dec,
+-            rec_norm_enc, rec_norm_lstm, rec_norm_dec
++            rec_norm_enc, rec_norm_lstm, rec_norm_dec,
++            kl_norm_prior, act_norm_prior, rec_norm_prior,
++            exp_norm_enc, exp_norm_lstm, exp_norm_dec, exp_norm_prior,
++            opp_norm_enc, opp_norm_lstm, opp_norm_dec, opp_norm_prior,
++            critic_norm_enc, critic_norm_lstm, critic_norm_dec, critic_norm_prior,
++            rec_head_norm, action_head_norm, expansion_head_norm, critic_head_norm,
++            exp_head_isolated_norm, opp_head_isolated_norm,
++            update_norm_enc, update_norm_lstm, update_norm_dec, update_norm_prior
+     )
+ 
+ import os
+@@ -250,7 +311,19 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
+         'expansion_loss': [], 'expansion_stop_rate': [], 'expansion_continue_rate': [],
+         'kl_grad_norm_enc': [], 'kl_grad_norm_lstm': [], 'kl_grad_norm_dec': [],
+         'act_grad_norm_enc': [], 'act_grad_norm_lstm': [], 'act_grad_norm_dec': [],
+-        'rec_grad_norm_enc': [], 'rec_grad_norm_lstm': [], 'rec_grad_norm_dec': []
++        'rec_grad_norm_enc': [], 'rec_grad_norm_lstm': [], 'rec_grad_norm_dec': [],
++        'kl_grad_norm_prior': [], 'act_grad_norm_prior': [], 'rec_grad_norm_prior': [],
++        'exp_grad_norm_enc': [], 'exp_grad_norm_lstm': [], 'exp_grad_norm_dec': [],
++        'exp_grad_norm_prior': [],
++        'opp_grad_norm_enc': [], 'opp_grad_norm_lstm': [], 'opp_grad_norm_dec': [],
++        'opp_grad_norm_prior': [],
++        'critic_grad_norm_enc': [], 'critic_grad_norm_lstm': [], 'critic_grad_norm_dec': [],
++        'critic_grad_norm_prior': [],
++        'rec_grad_norm_head': [], 'act_grad_norm_head': [],
++        'exp_grad_norm_head': [], 'critic_grad_norm_head': [],
++        'exp_policy_grad_norm_head': [], 'opp_grad_norm_head': [],
++        'update_grad_norm_enc': [], 'update_grad_norm_lstm': [],
++        'update_grad_norm_dec': [], 'update_grad_norm_prior': []
+     }
+     kl_warmup_epochs = 0   # Keep beta at 0.0 while learning rate warms up
+     kl_annealing_epochs = 0 # How many epochs it takes to go from 0.0 to target_beta
+@@ -280,6 +353,14 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
+         ep_kl_gn_enc, ep_kl_gn_lstm, ep_kl_gn_dec = 0.0, 0.0, 0.0
+         ep_act_gn_enc, ep_act_gn_lstm, ep_act_gn_dec = 0.0, 0.0, 0.0
+         ep_rec_gn_enc, ep_rec_gn_lstm, ep_rec_gn_dec = 0.0, 0.0, 0.0
++        ep_kl_gn_prior, ep_act_gn_prior, ep_rec_gn_prior = 0.0, 0.0, 0.0
++        ep_exp_gn_enc, ep_exp_gn_lstm, ep_exp_gn_dec, ep_exp_gn_prior = 0.0, 0.0, 0.0, 0.0
++        ep_opp_gn_enc, ep_opp_gn_lstm, ep_opp_gn_dec, ep_opp_gn_prior = 0.0, 0.0, 0.0, 0.0
++        ep_critic_gn_enc, ep_critic_gn_lstm, ep_critic_gn_dec, ep_critic_gn_prior = 0.0, 0.0, 0.0, 0.0
++        ep_rec_gn_head, ep_act_gn_head = 0.0, 0.0
++        ep_exp_gn_head, ep_critic_gn_head = 0.0, 0.0
++        ep_exp_policy_gn_head, ep_opp_gn_head = 0.0, 0.0
++        ep_update_gn_enc, ep_update_gn_lstm, ep_update_gn_dec, ep_update_gn_prior = 0.0, 0.0, 0.0, 0.0
+         
+         epochs_count += 1 
+         current_alpha = 1.0 
+@@ -319,7 +400,14 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
+              exp_loss, stop_rate, continue_rate,
+              kl_gn_enc, kl_gn_lstm, kl_gn_dec,
+              act_gn_enc, act_gn_lstm, act_gn_dec,
+-             rec_gn_enc, rec_gn_lstm, rec_gn_dec) = train_step(
++             rec_gn_enc, rec_gn_lstm, rec_gn_dec,
++             kl_gn_prior, act_gn_prior, rec_gn_prior,
++             exp_gn_enc, exp_gn_lstm, exp_gn_dec, exp_gn_prior,
++             opp_gn_enc, opp_gn_lstm, opp_gn_dec, opp_gn_prior,
++             critic_gn_enc, critic_gn_lstm, critic_gn_dec, critic_gn_prior,
++             rec_gn_head, act_gn_head, exp_gn_head, critic_gn_head,
++             exp_policy_gn_head, opp_gn_head,
++             update_gn_enc, update_gn_lstm, update_gn_dec, update_gn_prior) = train_step(
+                 model=model, 
+                 optimizer=optimizer,
+                 current_alpha=tf.constant(current_alpha, dtype=tf.float32),
+@@ -351,6 +439,37 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
+             ep_rec_gn_enc += rec_gn_enc
+             ep_rec_gn_lstm += rec_gn_lstm
+             ep_rec_gn_dec += rec_gn_dec
++
++            ep_kl_gn_prior += kl_gn_prior
++            ep_act_gn_prior += act_gn_prior
++            ep_rec_gn_prior += rec_gn_prior
++
++            ep_exp_gn_enc += exp_gn_enc
++            ep_exp_gn_lstm += exp_gn_lstm
++            ep_exp_gn_dec += exp_gn_dec
++            ep_exp_gn_prior += exp_gn_prior
++
++            ep_opp_gn_enc += opp_gn_enc
++            ep_opp_gn_lstm += opp_gn_lstm
++            ep_opp_gn_dec += opp_gn_dec
++            ep_opp_gn_prior += opp_gn_prior
++
++            ep_critic_gn_enc += critic_gn_enc
++            ep_critic_gn_lstm += critic_gn_lstm
++            ep_critic_gn_dec += critic_gn_dec
++            ep_critic_gn_prior += critic_gn_prior
++
++            ep_rec_gn_head += rec_gn_head
++            ep_act_gn_head += act_gn_head
++            ep_exp_gn_head += exp_gn_head
++            ep_critic_gn_head += critic_gn_head
++            ep_exp_policy_gn_head += exp_policy_gn_head
++            ep_opp_gn_head += opp_gn_head
++
++            ep_update_gn_enc += update_gn_enc
++            ep_update_gn_lstm += update_gn_lstm
++            ep_update_gn_dec += update_gn_dec
++            ep_update_gn_prior += update_gn_prior
+         
+         # Calculate averages for the epoch
+         avg_total_loss = ep_total_loss / trials_per_epoch
+@@ -379,6 +498,37 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
+         history['rec_grad_norm_lstm'].append((ep_rec_gn_lstm / trials_per_epoch).numpy())
+         history['rec_grad_norm_dec'].append((ep_rec_gn_dec / trials_per_epoch).numpy())
+ 
++        history['kl_grad_norm_prior'].append((ep_kl_gn_prior / trials_per_epoch).numpy())
++        history['act_grad_norm_prior'].append((ep_act_gn_prior / trials_per_epoch).numpy())
++        history['rec_grad_norm_prior'].append((ep_rec_gn_prior / trials_per_epoch).numpy())
++
++        history['exp_grad_norm_enc'].append((ep_exp_gn_enc / trials_per_epoch).numpy())
++        history['exp_grad_norm_lstm'].append((ep_exp_gn_lstm / trials_per_epoch).numpy())
++        history['exp_grad_norm_dec'].append((ep_exp_gn_dec / trials_per_epoch).numpy())
++        history['exp_grad_norm_prior'].append((ep_exp_gn_prior / trials_per_epoch).numpy())
++
++        history['opp_grad_norm_enc'].append((ep_opp_gn_enc / trials_per_epoch).numpy())
++        history['opp_grad_norm_lstm'].append((ep_opp_gn_lstm / trials_per_epoch).numpy())
++        history['opp_grad_norm_dec'].append((ep_opp_gn_dec / trials_per_epoch).numpy())
++        history['opp_grad_norm_prior'].append((ep_opp_gn_prior / trials_per_epoch).numpy())
++
++        history['critic_grad_norm_enc'].append((ep_critic_gn_enc / trials_per_epoch).numpy())
++        history['critic_grad_norm_lstm'].append((ep_critic_gn_lstm / trials_per_epoch).numpy())
++        history['critic_grad_norm_dec'].append((ep_critic_gn_dec / trials_per_epoch).numpy())
++        history['critic_grad_norm_prior'].append((ep_critic_gn_prior / trials_per_epoch).numpy())
++
++        history['rec_grad_norm_head'].append((ep_rec_gn_head / trials_per_epoch).numpy())
++        history['act_grad_norm_head'].append((ep_act_gn_head / trials_per_epoch).numpy())
++        history['exp_grad_norm_head'].append((ep_exp_gn_head / trials_per_epoch).numpy())
++        history['critic_grad_norm_head'].append((ep_critic_gn_head / trials_per_epoch).numpy())
++        history['exp_policy_grad_norm_head'].append((ep_exp_policy_gn_head / trials_per_epoch).numpy())
++        history['opp_grad_norm_head'].append((ep_opp_gn_head / trials_per_epoch).numpy())
++
++        history['update_grad_norm_enc'].append((ep_update_gn_enc / trials_per_epoch).numpy())
++        history['update_grad_norm_lstm'].append((ep_update_gn_lstm / trials_per_epoch).numpy())
++        history['update_grad_norm_dec'].append((ep_update_gn_dec / trials_per_epoch).numpy())
++        history['update_grad_norm_prior'].append((ep_update_gn_prior / trials_per_epoch).numpy())
++
+         tf.print(
+             f"Epoch {epoch+1}/{epochs}: Loss = {avg_total_loss:.4f} | "
+             f"KL = {history['kl_loss'][-1]:.4f} | "

@@ -14,7 +14,7 @@ model_dir <- get_arg(5, "outputs/models")
 results_dir <- get_arg(6, "results")
 tree_size <- as.integer(get_arg(7, "2"))
 expansion_decision_version <- get_arg(8, "lstm")
-seed_arg <- get_arg(9, "1:1")
+seed_arg <- get_arg(9, "1:5")
 model_variant <- get_arg(10, "vae")
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
@@ -67,17 +67,7 @@ normalize_model_variant <- function(variant) {
 model_variant <- normalize_model_variant(model_variant)
 
 model_variant_file_segment <- function(variant) {
-  sprintf("variant_%s_", variant)
-}
-
-model_variant_file_segments <- function(variant) {
-  segments <- model_variant_file_segment(variant)
-  if (identical(variant, "vae")) {
-    # Backward compatibility for older VAE logs that predated explicit
-    # variant_vae_ filename segments.
-    segments <- c(segments, "")
-  }
-  unique(segments)
+  if (identical(variant, "vae")) "" else sprintf("variant_%s_", variant)
 }
 
 parse_list <- function(x) trimws(strsplit(x, ",")[[1]])
@@ -124,22 +114,20 @@ training_log_path <- function(lambda_value, alpha_value, beta_value, opportunity
     for (alpha_candidate in value_candidates(alpha_value)) {
       for (beta_candidate in value_candidates(beta_value)) {
         for (opportunity_candidate in value_candidates(opportunity_value)) {
-          for (variant_file_segment in model_variant_file_segments(model_variant)) {
-            file_name <- sprintf(
-              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_training_logs.csv",
-              lambda_candidate,
-              alpha_candidate,
-              beta_candidate,
-              opportunity_candidate,
-              expansion_decision_version,
-              variant_file_segment,
-              seed,
-              tree_size
-            )
-            file_path <- file.path(model_dir, file_name)
-            if (file.exists(file_path)) {
-              return(file_path)
-            }
+          file_name <- sprintf(
+            "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_training_logs.csv",
+            lambda_candidate,
+            alpha_candidate,
+            beta_candidate,
+            opportunity_candidate,
+            expansion_decision_version,
+            model_variant_file_segment(model_variant),
+            seed,
+            tree_size
+          )
+          file_path <- file.path(model_dir, file_name)
+          if (file.exists(file_path)) {
+            return(file_path)
           }
         }
       }
@@ -237,7 +225,6 @@ metric_cols <- intersect(
   ),
   names(all_logs)
 )
-metric_cols <- unique(c(metric_cols, grep("^lstm_probe_", names(all_logs), value = TRUE)))
 
 for (col in metric_cols) {
   all_logs[[col]] <- suppressWarnings(as.numeric(all_logs[[col]]))
@@ -545,13 +532,6 @@ all_logs$kl_stop_minus_continue_after_pos4_t1 <- (
     to_numeric_column(all_logs, "kl_d_continue_after_pos4_t1")
 )
 
-probe_reward_values <- c(-4, -3, -2, -1, 0, 1, 2, 3, 4)
-probe_reward_label <- function(value) {
-  if (value > 0) return(sprintf("p%d", value))
-  if (value < 0) return(sprintf("m%d", abs(value)))
-  "z0"
-}
-
 diagnostic_label <- sprintf(
   "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%dn",
   lambda_arg,
@@ -622,8 +602,6 @@ plot_metric(all_logs, "unified_decision_ce_loss", "Unified decision CE loss")
 plot_metric(all_logs, "action_loss", "Action loss")
 plot_metric(all_logs, "kl_loss", "KL loss")
 plot_metric(all_logs, "reconstruction_loss", "Reconstruction loss")
-plot_metric(all_logs, "lstm_probe_accuracy", "LSTM reward probe accuracy")
-plot_metric(all_logs, "lstm_probe_loss", "LSTM reward probe loss")
 plot_metric(all_logs, "learning_rate", "Learning rate", log_y = TRUE)
 plot_metric(all_logs, "act_to_kl_grad_enc", "Action/KL grad ratio encoder", log_y = TRUE)
 plot_metric(all_logs, "act_to_kl_grad_lstm", "Action/KL grad ratio LSTM", log_y = TRUE)
@@ -660,44 +638,9 @@ plot_metric(all_logs, "kl_grad_norm_enc", "KL grad encoder", log_y = TRUE)
 plot_metric(all_logs, "kl_grad_norm_lstm", "KL grad LSTM", log_y = TRUE)
 plot_metric(all_logs, "kl_grad_norm_dec", "KL grad decoder", log_y = TRUE)
 plot_metric(all_logs, "rec_grad_norm_head", "Recon grad head", log_y = TRUE)
-plot_metric(all_logs, "lstm_probe_grad_norm_head", "LSTM probe grad head", log_y = TRUE)
 plot_metric(all_logs, "rec_grad_norm_enc", "Recon grad encoder", log_y = TRUE)
 plot_metric(all_logs, "rec_grad_norm_lstm", "Recon grad LSTM", log_y = TRUE)
 plot_metric(all_logs, "rec_grad_norm_dec", "Recon grad decoder", log_y = TRUE)
-add_beta_legend()
-par(old_par)
-dev.off()
-
-probe_pdf_path <- file.path(results_dir, sprintf("training_lstm_reward_probe_%s.pdf", diagnostic_label))
-pdf(probe_pdf_path, width = 18, height = 14)
-old_par <- par(mfrow = c(3, 3), mar = c(4.5, 4.5, 1, 7))
-for (reward_value in probe_reward_values) {
-  label <- probe_reward_label(reward_value)
-  plot_metric(
-    all_logs,
-    sprintf("lstm_probe_acc_reward_%s", label),
-    sprintf("Probe accuracy | reward %s", reward_value)
-  )
-}
-add_beta_legend()
-for (reward_value in probe_reward_values) {
-  label <- probe_reward_label(reward_value)
-  plot_metric(
-    all_logs,
-    sprintf("lstm_probe_loss_reward_%s", label),
-    sprintf("Probe loss | reward %s", reward_value),
-    log_y = TRUE
-  )
-}
-add_beta_legend()
-for (reward_value in probe_reward_values) {
-  label <- probe_reward_label(reward_value)
-  plot_metric(
-    all_logs,
-    sprintf("lstm_probe_n_reward_%s", label),
-    sprintf("Probe n | reward %s", reward_value)
-  )
-}
 add_beta_legend()
 par(old_par)
 dev.off()
@@ -719,10 +662,6 @@ summary_rows <- do.call(rbind, lapply(split(all_logs, list(all_logs$beta, all_lo
     final_reconstruction_loss = if ("reconstruction_loss" %in% names(dat)) last_row$reconstruction_loss else NA_real_,
     final_expansion_loss = if ("expansion_loss" %in% names(dat)) last_row$expansion_loss else NA_real_,
     final_critic_loss = if ("critic_loss" %in% names(dat)) last_row$critic_loss else NA_real_,
-    final_lstm_probe_loss = if ("lstm_probe_loss" %in% names(dat)) last_row$lstm_probe_loss else NA_real_,
-    final_lstm_probe_accuracy = if ("lstm_probe_accuracy" %in% names(dat)) last_row$lstm_probe_accuracy else NA_real_,
-    final_lstm_probe_acc_reward_m4 = if ("lstm_probe_acc_reward_m4" %in% names(dat)) last_row$lstm_probe_acc_reward_m4 else NA_real_,
-    final_lstm_probe_acc_reward_p4 = if ("lstm_probe_acc_reward_p4" %in% names(dat)) last_row$lstm_probe_acc_reward_p4 else NA_real_,
     final_unified_decision_ce_loss = if ("unified_decision_ce_loss" %in% names(dat)) last_row$unified_decision_ce_loss else NA_real_,
     final_expansion_stop_rate = if ("expansion_stop_rate" %in% names(dat)) last_row$expansion_stop_rate else NA_real_,
     final_expansion_continue_rate = if ("expansion_continue_rate" %in% names(dat)) last_row$expansion_continue_rate else NA_real_,
@@ -788,9 +727,6 @@ if (!"expansion_epsilon" %in% names(all_logs)) {
 if (!all(c("expansion_loss", "expansion_stop_rate", "expansion_continue_rate") %in% names(all_logs))) {
   cat("- These logs do not contain all new expansion diagnostics; rerun training with the updated train.py to populate expansion_loss and stop/continue rates.\n")
 }
-if (!all(c("lstm_probe_accuracy", "lstm_probe_acc_reward_m4", "lstm_probe_acc_reward_p4") %in% names(all_logs))) {
-  cat("- These logs do not contain LSTM reward probe diagnostics. Rerun training with the updated train.py to populate the probe panels.\n")
-}
 if (!all(c("terminal_prob_after_neg4_t1", "terminal_prob_after_pos4_t1") %in% names(all_logs))) {
   cat("- These logs do not contain unified-policy probability mass diagnostics. Add terminal_prob_after_* and expand_*_prob_after_* columns during training to populate those panels.\n")
 }
@@ -811,5 +747,4 @@ cat("- Use the action/KL gradient ratio panels to see whether the action signal 
 cat("- Use the first panel to confirm that epsilon was present for enough epochs and did not start/end at zero.\n")
 cat("\nWrote: ", pdf_path, "\n", sep = "")
 cat("Wrote: ", grad_pdf_path, "\n", sep = "")
-cat("Wrote: ", probe_pdf_path, "\n", sep = "")
 cat("Wrote: ", summary_path, "\n", sep = "")

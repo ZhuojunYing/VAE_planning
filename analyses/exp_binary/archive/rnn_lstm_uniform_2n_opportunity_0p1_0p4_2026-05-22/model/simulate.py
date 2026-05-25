@@ -51,12 +51,8 @@ def build_model(config, alpha, beta, lambda_, opportunity_cost):
     )
 
 
-def model_variant_label(variant):
-    return f"variant_{variant}_"
-
-
 def model_name_for(config, lambda_, alpha, beta, opportunity_cost):
-    variant_label = model_variant_label(config.model_variant)
+    variant_label = "" if config.model_variant == "vae" else f"variant_{config.model_variant}_"
     if config.tree_size == 30:
         return (
             f"lambda_{lambda_}_alpha_{alpha}_beta_{beta}_opportunity_{opportunity_cost}_"
@@ -102,7 +98,6 @@ def trial_rows(config, graph_index, rewards, outputs):
     stop_decisions = np.asarray(outputs[13][0, :, 0], dtype=bool)
     observed_masks = np.asarray(outputs[14][0], dtype=bool)
     kl_d_sequence = np.asarray(outputs[16][0, :, 0], dtype=float)
-    terminal_path = int(np.asarray(outputs[-1][0])) if len(outputs) > 28 else -1
 
     time_steps = config.time_steps
     stop_seen = np.maximum.accumulate(stop_decisions)
@@ -112,10 +107,7 @@ def trial_rows(config, graph_index, rewards, outputs):
     estimated_rewards = np.where(observed_masks, estimated_rewards, np.nan)
 
     path_rewards = calculate_path_rewards_sim(config.index_path_map, rewards)
-    if terminal_path >= 0:
-        chosen_path = terminal_path
-    else:
-        chosen_path = sample_categorical_indices(action_policy)
+    chosen_path = sample_categorical_indices(action_policy)
     v = float(path_rewards[chosen_path])
 
     row_template = {
