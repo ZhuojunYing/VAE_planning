@@ -1,14 +1,12 @@
 #!/bin/bash
 
 # Check if all required arguments are provided
-if [ "$#" -lt 16 ] || [ "$#" -gt 18 ]; then
-    echo "Usage: $0 beta_log10_min beta_log10_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_str seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config]"
+if [ "$#" -lt 16 ] || [ "$#" -gt 17 ]; then
+    echo "Usage: $0 beta_log10_min beta_log10_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_str seed_min seed_max train input_type tree_size expansion_decision_version [model_variant]"
     echo "Example VAE: $0 3 3 1 1 1 1 -2 -2 1 1.0 1 5 train uniform 2 lstm vae"
     echo "Example RNN: $0 0 0 1 0 0 1 -2 -2 1 1.0 1 5 train uniform 2 lstm rnn"
-    echo "Example disjoint 2x2: $0 1 1 1 0 0 1 0 0 1 10.0 1 1 train uniform 4 lstm vae disjoint2x2"
     echo "Expansion versions: decoder/1, lstm/2, pre_lstm/3"
     echo "Model variants: vae, rnn"
-    echo "Tree configs: bandit3, bandit4, disjoint2x2, disjoint3x2"
     exit 1
 fi
 
@@ -31,7 +29,6 @@ echo "14: '${14}'"
 echo "15: '${15}'"
 echo "16: '${16}'"
 echo "17: '${17}'"
-echo "18: '${18}'"
 echo "================================="
 
 # Assign arguments to variables
@@ -52,7 +49,6 @@ input_type=${14}
 tree_size=${15}
 expansion_decision_version=${16}
 model_variant=${17:-"vae"}
-tree_config=${18:-""}
 # Create a Python script to generate the commands
 cat > generate_commands.py << 'EOL'
 import numpy as np
@@ -70,7 +66,6 @@ input_type = sys.argv[14]
 tree_size = sys.argv[15]
 expansion_decision_version = sys.argv[16]
 model_variant = sys.argv[17]
-tree_config = sys.argv[18]
 if np.isinf(beta_log_min) or np.isinf(beta_log_max):
     beta_exp_values = np.zeros(beta_steps)
 else:
@@ -110,7 +105,7 @@ for seed_list in seed_values_split:
                 seed_str = ", ".join([f"{x}" for x in seed_list])
                 opportunity_str = ", ".join([f"{x}" for x in opportunity_list])
                 # NOTE: We removed the extra double quotes inside the python print to make parsing easier in bash
-                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}" "{tree_config}"'
+                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}"'
                 print(command)
 EOL
 
@@ -118,7 +113,7 @@ EOL
 JID_FILE=$(mktemp)
 
 # Run the Python script and execute each command
-python generate_commands.py "$beta_log_min" "$beta_log_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_min" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version" "$model_variant" "$tree_config"| while read -r cmd; do
+python generate_commands.py "$beta_log_min" "$beta_log_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_min" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version" "$model_variant"| while read -r cmd; do
     echo "Executing: $cmd"
     
     # 1. Execute the command and capture the output (e.g., "Submitted batch job 12345")

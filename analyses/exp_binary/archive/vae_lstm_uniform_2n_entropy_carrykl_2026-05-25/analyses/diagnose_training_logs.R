@@ -16,7 +16,6 @@ tree_size <- as.integer(get_arg(7, "2"))
 expansion_decision_version <- get_arg(8, "lstm")
 seed_arg <- get_arg(9, "1:1")
 model_variant <- get_arg(10, "vae")
-tree_config <- get_arg(11, "")
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -66,59 +65,6 @@ normalize_model_variant <- function(variant) {
 }
 
 model_variant <- normalize_model_variant(model_variant)
-
-normalize_tree_config <- function(config) {
-  key <- tolower(trimws(as.character(config)))
-  if (!nzchar(key)) {
-    return("")
-  }
-  aliases <- c(
-    "auto" = "",
-    "default" = "",
-    "legacy" = "",
-    "3armed" = "bandit3",
-    "3_arm" = "bandit3",
-    "3_armed" = "bandit3",
-    "3-armed" = "bandit3",
-    "3_arm_bandit" = "bandit3",
-    "3-armed-bandit" = "bandit3",
-    "three_arm_bandit" = "bandit3",
-    "bandit3" = "bandit3",
-    "4armed" = "bandit4",
-    "4_arm" = "bandit4",
-    "4_armed" = "bandit4",
-    "4-armed" = "bandit4",
-    "4_arm_bandit" = "bandit4",
-    "4-armed-bandit" = "bandit4",
-    "four_arm_bandit" = "bandit4",
-    "bandit4" = "bandit4",
-    "2x2" = "disjoint2x2",
-    "2x2_disjoint" = "disjoint2x2",
-    "disjoint2x2" = "disjoint2x2",
-    "disjoint_2x2" = "disjoint2x2",
-    "2path2node" = "disjoint2x2",
-    "2_path_2_node" = "disjoint2x2",
-    "2paths_2nodes" = "disjoint2x2",
-    "2paths_2nodes_disjoint" = "disjoint2x2",
-    "two_paths_two_nodes" = "disjoint2x2",
-    "3x2" = "disjoint3x2",
-    "3x2_disjoint" = "disjoint3x2",
-    "disjoint3x2" = "disjoint3x2",
-    "disjoint_3x2" = "disjoint3x2",
-    "3path2node" = "disjoint3x2",
-    "3_path_2_node" = "disjoint3x2",
-    "3paths_2nodes" = "disjoint3x2",
-    "3paths_2nodes_disjoint" = "disjoint3x2",
-    "three_paths_two_nodes" = "disjoint3x2"
-  )
-  if (!key %in% names(aliases)) {
-    stop(sprintf("Unknown tree_config=%s.", config))
-  }
-  unname(aliases[[key]])
-}
-
-tree_config <- normalize_tree_config(tree_config)
-tree_file_label <- paste0(tree_size, "n", if (nzchar(tree_config)) paste0("_", tree_config) else "")
 
 model_variant_file_segment <- function(variant) {
   sprintf("variant_%s_", variant)
@@ -180,7 +126,7 @@ training_log_path <- function(lambda_value, alpha_value, beta_value, opportunity
         for (opportunity_candidate in value_candidates(opportunity_value)) {
           for (variant_file_segment in model_variant_file_segments(model_variant)) {
             file_name <- sprintf(
-              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%s_training_logs.csv",
+              "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%dn_training_logs.csv",
               lambda_candidate,
               alpha_candidate,
               beta_candidate,
@@ -188,7 +134,7 @@ training_log_path <- function(lambda_value, alpha_value, beta_value, opportunity
               expansion_decision_version,
               variant_file_segment,
               seed,
-              tree_file_label
+              tree_size
             )
             file_path <- file.path(model_dir, file_name)
             if (file.exists(file_path)) {
@@ -291,11 +237,7 @@ metric_cols <- intersect(
   ),
   names(all_logs)
 )
-metric_cols <- unique(c(
-  metric_cols,
-  grep("^lstm_probe_", names(all_logs), value = TRUE),
-  grep("^exp_continue_", names(all_logs), value = TRUE)
-))
+metric_cols <- unique(c(metric_cols, grep("^lstm_probe_", names(all_logs), value = TRUE)))
 
 for (col in metric_cols) {
   all_logs[[col]] <- suppressWarnings(as.numeric(all_logs[[col]]))
@@ -611,14 +553,14 @@ probe_reward_label <- function(value) {
 }
 
 diagnostic_label <- sprintf(
-  "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s",
+  "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%dn",
   lambda_arg,
   alpha_arg,
   arg_label(beta_values),
   arg_label(opportunity_values),
   expansion_decision_version,
   model_variant_file_segment(model_variant),
-  tree_file_label
+  tree_size
 )
 
 pdf_path <- file.path(results_dir, sprintf("training_diagnostics_%s.pdf", diagnostic_label))
@@ -639,10 +581,6 @@ plot_metric(all_logs, "expansion_entropy_coef", "Expansion entropy coef")
 
 plot_metric(all_logs, "expansion_stop_rate", "Expansion stop rate")
 plot_metric(all_logs, "expansion_continue_rate", "Expansion continue rate")
-plot_metric(all_logs, "exp_continue_t2_after_reward_p3", "P(continue t2 | reward 3)")
-plot_metric(all_logs, "exp_continue_t3_after_reward_p3", "P(continue t3 | reward 3)")
-plot_metric(all_logs, "exp_continue_n_t2_after_reward_p3", "N decisions t2 | reward 3")
-plot_metric(all_logs, "exp_continue_n_t3_after_reward_p3", "N decisions t3 | reward 3")
 plot_metric(all_logs, "action_p_correct_after_neg4_t1", "P(action correct | first reward -4)")
 plot_metric(all_logs, "continue_rate_after_neg4_t1", "P(continue | first reward -4)")
 plot_metric(all_logs, "action_p_correct_after_pos4_t1", "P(action correct | first reward 4)")

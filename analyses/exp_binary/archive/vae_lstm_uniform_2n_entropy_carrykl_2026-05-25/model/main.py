@@ -16,9 +16,6 @@ from simulate import run_simulation
 def model_variant_label(variant):
     return f"variant_{variant}_"
 
-def tree_file_label():
-    return f"{config.tree_size}n{getattr(config, 'tree_name_suffix', '')}"
-
 def main():
     # Make sure the target directory exists
     os.makedirs(config.dir_name, exist_ok=True)
@@ -38,12 +35,21 @@ def main():
                             f"model_variant: {config.model_variant} ---"
                         )
                         variant_label = model_variant_label(config.model_variant)
-                        model_name = (
-                            f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
-                            f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
-                            f'{variant_label}'
-                            f'seed_{config.seed}_{tree_file_label()}'
-                        )
+                        if config.tree_size == 30:
+                            model_name = (
+                                f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
+                                f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
+                                f'{variant_label}'
+                                f'seed_{config.seed}_'
+                                f'{config.tree_size}n_{config.tree_type}'
+                            )
+                        else:
+                            model_name = (
+                                f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
+                                f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
+                                f'{variant_label}'
+                                f'seed_{config.seed}_{config.tree_size}n'
+                            )
                         # 1. Initialize Model Architecture
                         encoder = build_encoder(config.rnn_units * 2, config.latent_dim, config.rnn_units)
                         decoder = build_decoder(config.latent_dim, 2 * config.rnn_units, config.rnn_units)
@@ -66,8 +72,7 @@ def main():
                                 opportunity_cost=opportunity_cost,
                                 input_type=config.input_type,
                                 expansion_decision_version=config.expansion_decision_version,
-                                use_autoencoder=(config.model_variant == "vae"),
-                                reward_norm_value=config.reward_norm_value
+                                use_autoencoder=(config.model_variant == "vae")
                             )
                         else:
                             
@@ -87,8 +92,7 @@ def main():
                                 opportunity_cost=opportunity_cost,
                                 input_type=config.input_type,
                                 expansion_decision_version=config.expansion_decision_version,
-                                use_autoencoder=(config.model_variant == "vae"),
-                                reward_norm_value=config.reward_norm_value
+                                use_autoencoder=(config.model_variant == "vae")
                             )
                         # 2. Run the Training Loop
                         train_model(

@@ -21,7 +21,6 @@ def train_step(
     current_critic_coef,
     current_expansion_epsilon,
     current_expansion_entropy_coef,
-    current_forced_continue_epsilon,
     input_data,
     input_type_str,
     clip_value=10.0,
@@ -55,7 +54,6 @@ def train_step(
             current_critic_coef=current_critic_coef,
             expansion_epsilon=current_expansion_epsilon,
             expansion_entropy_coef=current_expansion_entropy_coef,
-            forced_continue_epsilon=current_forced_continue_epsilon,
             compute_losses=False
         )
         old_node_selections = tf.stop_gradient(rollout_outputs[12])
@@ -79,7 +77,6 @@ def train_step(
                 current_critic_coef=current_critic_coef,
                 expansion_epsilon=current_expansion_epsilon,
                 expansion_entropy_coef=current_expansion_entropy_coef,
-                forced_continue_epsilon=current_forced_continue_epsilon,
                 forced_node_selections=old_node_selections,
                 old_expansion_log_probs=old_expansion_log_probs,
                 use_ppo_loss=True
@@ -94,8 +91,6 @@ def train_step(
             lstm_probe_acc_by_category = extra_outputs[13]
             lstm_probe_loss_by_category = extra_outputs[14]
             lstm_probe_count_by_category = extra_outputs[15]
-            continue_after_reward_sums = extra_outputs[20]
-            continue_after_reward_counts = extra_outputs[21]
              
             # --- THE FIX: Create the weighted tensors INSIDE the tape scope ---
             weighted_kl_for_logging = information_loss * current_beta
@@ -183,6 +178,7 @@ def train_step(
     opp_head_isolated_norm = global_norm_or_zero(opp_head_isolated_grads)
     # -----------------------------------------------------------------
 
+
     # --- COMBINED OPTIMIZER UPDATE: Ensures iterations match total_steps ---
     all_gradients = (
         first_decoder_gradients +
@@ -196,32 +192,11 @@ def train_step(
         first_decoder_params + second_decoder_params + action_head_params +
         expansion_params + critic_params + probe_params
     )
-
-    def sanitize_gradient(grad):
-        if grad is None:
-            return None
-        if isinstance(grad, tf.IndexedSlices):
-            safe_values = tf.where(
-                tf.math.is_finite(grad.values),
-                grad.values,
-                tf.zeros_like(grad.values)
-            )
-            return tf.IndexedSlices(safe_values, grad.indices, grad.dense_shape)
-        return tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad))
-
-    def prepare_grads_and_vars(gradients, params):
-        pairs = [
-            (sanitize_gradient(grad), var)
-            for grad, var in zip(gradients, params)
-            if grad is not None
-        ]
-        if not pairs:
-            return []
-        safe_grads, safe_vars = zip(*pairs)
-        clipped_grads, _ = tf.clip_by_global_norm(list(safe_grads), clip_value)
-        return list(zip(clipped_grads, safe_vars))
-
-    grads_and_vars = prepare_grads_and_vars(all_gradients, all_params)
+    grads_and_vars = [
+        (grad, var)
+        for grad, var in zip(all_gradients, all_params)
+        if grad is not None
+    ]
     optimizer.apply_gradients(grads_and_vars)
     
     # Must explicitly delete a persistent tape when done
@@ -240,7 +215,6 @@ def train_step(
                 current_critic_coef=current_critic_coef,
                 expansion_epsilon=current_expansion_epsilon,
                 expansion_entropy_coef=current_expansion_entropy_coef,
-                forced_continue_epsilon=current_forced_continue_epsilon,
                 forced_node_selections=old_node_selections,
                 old_expansion_log_probs=old_expansion_log_probs,
                 use_ppo_loss=True
@@ -248,10 +222,11 @@ def train_step(
             ppo_expansion_loss = extra_outputs[5]
 
         ppo_expansion_gradients = ppo_tape.gradient(ppo_expansion_loss, expansion_params)
-        ppo_grads_and_vars = prepare_grads_and_vars(
-            ppo_expansion_gradients,
-            expansion_params
-        )
+        ppo_grads_and_vars = [
+            (grad, var)
+            for grad, var in zip(ppo_expansion_gradients, expansion_params)
+            if grad is not None
+        ]
         optimizer.apply_gradients(ppo_grads_and_vars)
     
     # Return all 13 values
@@ -270,8 +245,7 @@ def train_step(
             exp_head_isolated_norm, opp_head_isolated_norm,
             update_norm_enc, update_norm_lstm, update_norm_dec, update_norm_prior,
             lstm_probe_loss, lstm_probe_accuracy, lstm_probe_acc_by_category,
-            lstm_probe_loss_by_category, lstm_probe_count_by_category,
-            continue_after_reward_sums, continue_after_reward_counts
+            lstm_probe_loss_by_category, lstm_probe_count_by_category
     )
 
 import os
@@ -362,7 +336,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
 
     history = {
         'epoch': [], 'learning_rate': [], 'expansion_epsilon': [],
-        'forced_continue_epsilon': [],
         'expansion_entropy_coef': [],
         'total_loss': [], 'kl_loss': [], 'action_loss': [], 'reconstruction_loss': [],
         'expansion_loss': [], 'expansion_stop_rate': [], 'expansion_continue_rate': [],
@@ -389,11 +362,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         history[f'lstm_probe_acc_reward_{label}'] = []
         history[f'lstm_probe_loss_reward_{label}'] = []
         history[f'lstm_probe_n_reward_{label}'] = []
-    for decision_step in range(2, time_steps + 1):
-        for reward_value in probe_reward_values:
-            label = probe_reward_label(reward_value)
-            history[f'exp_continue_t{decision_step}_after_reward_{label}'] = []
-            history[f'exp_continue_n_t{decision_step}_after_reward_{label}'] = []
     kl_warmup_epochs = 0   # Keep beta at 0.0 while learning rate warms up
     kl_annealing_epochs = 0 # How many epochs it takes to go from 0.0 to target_beta
     target_beta =1/model.beta
@@ -407,26 +375,12 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         target_critic_coef =0
     else:
         target_critic_coef =0.1
-    if model.time_steps > 2:
-        expansion_epsilon_start = 0.7
-        expansion_epsilon_end = 0.05
-        expansion_epsilon_annealing_epochs = 40
-        expansion_entropy_start = 0.3
-        expansion_entropy_end = 0.05
-        expansion_entropy_annealing_epochs = 40
-        forced_continue_start = 0.5
-        forced_continue_end = 0.0
-        forced_continue_annealing_epochs = 40
-    else:
-        expansion_epsilon_start = 0.5
-        expansion_epsilon_end = 0.0
-        expansion_epsilon_annealing_epochs = 40
-        expansion_entropy_start = 0.2
-        expansion_entropy_end = 0.01
-        expansion_entropy_annealing_epochs = 40
-        forced_continue_start = 0.0
-        forced_continue_end = 0.0
-        forced_continue_annealing_epochs = 0
+    expansion_epsilon_start = 0.5
+    expansion_epsilon_end = 0.0
+    expansion_epsilon_annealing_epochs = 100
+    expansion_entropy_start = 0.2
+    expansion_entropy_end = 0.01
+    expansion_entropy_annealing_epochs = 100
     # ------------------------------------------------------------------
     # TRAINING LOOP
     # ------------------------------------------------------------------
@@ -438,14 +392,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         ep_lstm_probe_acc_weighted = tf.zeros([model.num_categories], dtype=tf.float32)
         ep_lstm_probe_loss_weighted = tf.zeros([model.num_categories], dtype=tf.float32)
         ep_lstm_probe_counts = tf.zeros([model.num_categories], dtype=tf.float32)
-        ep_continue_after_reward_sums = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_continue_after_reward_counts = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
         
         # Gradient accumulators
         ep_kl_gn_enc, ep_kl_gn_lstm, ep_kl_gn_dec = 0.0, 0.0, 0.0
@@ -498,14 +444,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 expansion_entropy_start
                 + (expansion_entropy_end - expansion_entropy_start) * entropy_progress
             )
-        if forced_continue_annealing_epochs <= 0:
-            current_forced_continue_epsilon = forced_continue_end
-        else:
-            forced_continue_progress = min(epoch / forced_continue_annealing_epochs, 1.0)
-            current_forced_continue_epsilon = (
-                forced_continue_start
-                + (forced_continue_end - forced_continue_start) * forced_continue_progress
-            )
         for i in range(trials_per_epoch):
             batch_input_data = helper.generate_batch_data(batch_size, time_steps, input_type)
 
@@ -524,8 +462,7 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
              exp_policy_gn_head, opp_gn_head,
              update_gn_enc, update_gn_lstm, update_gn_dec, update_gn_prior,
              lstm_probe_loss, lstm_probe_acc, lstm_probe_acc_by_category,
-             lstm_probe_loss_by_category, lstm_probe_count_by_category,
-             continue_after_reward_sums, continue_after_reward_counts) = train_step(
+             lstm_probe_loss_by_category, lstm_probe_count_by_category) = train_step(
                 model=model, 
                 optimizer=optimizer,
                 current_alpha=tf.constant(current_alpha, dtype=tf.float32),
@@ -533,7 +470,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 current_critic_coef=tf.constant(current_critic_coef, dtype=tf.float32),
                 current_expansion_epsilon=tf.constant(current_expansion_epsilon, dtype=tf.float32),
                 current_expansion_entropy_coef=tf.constant(current_expansion_entropy_coef, dtype=tf.float32),
-                current_forced_continue_epsilon=tf.constant(current_forced_continue_epsilon, dtype=tf.float32),
                 input_data=batch_input_data,
                 input_type_str=input_type,
                 ppo_epochs=ppo_epochs
@@ -562,8 +498,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             ep_lstm_probe_acc_weighted += finite_probe_acc * lstm_probe_count_by_category
             ep_lstm_probe_loss_weighted += finite_probe_loss * lstm_probe_count_by_category
             ep_lstm_probe_counts += lstm_probe_count_by_category
-            ep_continue_after_reward_sums += continue_after_reward_sums
-            ep_continue_after_reward_counts += continue_after_reward_counts
             
             ep_kl_gn_enc += kl_gn_enc
             ep_kl_gn_lstm += kl_gn_lstm
@@ -616,7 +550,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         history['epoch'].append(epoch + 1)
         history['learning_rate'].append(current_lr)
         history['expansion_epsilon'].append(current_expansion_epsilon)
-        history['forced_continue_epsilon'].append(current_forced_continue_epsilon)
         history['expansion_entropy_coef'].append(current_expansion_entropy_coef)
         history['total_loss'].append((ep_total_loss / trials_per_epoch).numpy())
         history['kl_loss'].append((ep_kl / trials_per_epoch).numpy())
@@ -688,41 +621,14 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             history[f'lstm_probe_loss_reward_{label}'].append(probe_loss_epoch[idx].numpy())
             history[f'lstm_probe_n_reward_{label}'].append(ep_lstm_probe_counts[idx].numpy())
 
-        continue_after_reward_epoch = tf.where(
-            ep_continue_after_reward_counts > 0.0,
-            ep_continue_after_reward_sums / (ep_continue_after_reward_counts + 1e-6),
-            tf.fill(
-                [model.time_steps, model.num_categories],
-                tf.constant(float("nan"), dtype=tf.float32)
-            )
-        )
-        for decision_step in range(2, time_steps + 1):
-            step_idx = decision_step - 1
-            for idx, reward_value in enumerate(probe_reward_values):
-                label = probe_reward_label(reward_value)
-                history[f'exp_continue_t{decision_step}_after_reward_{label}'].append(
-                    continue_after_reward_epoch[step_idx, idx].numpy()
-                )
-                history[f'exp_continue_n_t{decision_step}_after_reward_{label}'].append(
-                    ep_continue_after_reward_counts[step_idx, idx].numpy()
-                )
-
-        t3_reward3_msg = ""
-        if time_steps >= 3:
-            t3_p3 = history['exp_continue_t3_after_reward_p3'][-1]
-            t3_p3_n = history['exp_continue_n_t3_after_reward_p3'][-1]
-            t3_reward3_msg = f" | Continue t3 after +3 = {t3_p3:.4f} (n={t3_p3_n:.0f})"
-
         tf.print(
             f"Epoch {epoch+1}/{epochs}: Loss = {avg_total_loss:.4f} | "
             f"KL = {history['kl_loss'][-1]:.4f} | "
             f"LSTM probe = {history['lstm_probe_accuracy'][-1]:.4f} | "
             f"Expansion epsilon = {current_expansion_epsilon:.4f} | "
-            f"Forced continue = {current_forced_continue_epsilon:.4f} | "
             f"Entropy coef = {current_expansion_entropy_coef:.4f} | "
             f"Stop = {history['expansion_stop_rate'][-1]:.4f} | "
             f"Continue = {history['expansion_continue_rate'][-1]:.4f}"
-            f"{t3_reward3_msg}"
         )
      
         # --- CHECKPOINTING LOGIC ---

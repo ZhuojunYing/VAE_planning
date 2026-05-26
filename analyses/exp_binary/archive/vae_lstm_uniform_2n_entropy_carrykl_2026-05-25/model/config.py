@@ -7,7 +7,6 @@ and builds the decision tree matrices used across the project.
 import os
 import sys
 import random
-import itertools
 import numpy as np
 import tensorflow as tf
 
@@ -89,73 +88,6 @@ def normalize_model_variant(variant):
 
 model_variant = normalize_model_variant(model_variant)
 
-def normalize_tree_type(raw_tree_type, tree_size):
-    key = str(raw_tree_type).strip().lower()
-    aliases = {
-        "": "legacy",
-        "auto": "legacy",
-        "default": "legacy",
-        "legacy": "legacy",
-        "3armed": "bandit3",
-        "3_arm": "bandit3",
-        "3_armed": "bandit3",
-        "3-armed": "bandit3",
-        "3armedbandit": "bandit3",
-        "3_arm_bandit": "bandit3",
-        "3-armed-bandit": "bandit3",
-        "three_arm_bandit": "bandit3",
-        "bandit3": "bandit3",
-        "3bandit": "bandit3",
-        "4armed": "bandit4",
-        "4_arm": "bandit4",
-        "4_armed": "bandit4",
-        "4-armed": "bandit4",
-        "4armedbandit": "bandit4",
-        "4_arm_bandit": "bandit4",
-        "4-armed-bandit": "bandit4",
-        "four_arm_bandit": "bandit4",
-        "bandit4": "bandit4",
-        "4bandit": "bandit4",
-        "2x2": "disjoint2x2",
-        "2x2_disjoint": "disjoint2x2",
-        "disjoint2x2": "disjoint2x2",
-        "disjoint_2x2": "disjoint2x2",
-        "2path2node": "disjoint2x2",
-        "2_path_2_node": "disjoint2x2",
-        "2paths_2nodes": "disjoint2x2",
-        "2paths_2nodes_disjoint": "disjoint2x2",
-        "two_paths_two_nodes": "disjoint2x2",
-        "3x2": "disjoint3x2",
-        "3x2_disjoint": "disjoint3x2",
-        "disjoint3x2": "disjoint3x2",
-        "disjoint_3x2": "disjoint3x2",
-        "3path2node": "disjoint3x2",
-        "3_path_2_node": "disjoint3x2",
-        "3paths_2nodes": "disjoint3x2",
-        "3paths_2nodes_disjoint": "disjoint3x2",
-        "three_paths_two_nodes": "disjoint3x2",
-        "deep_breadth": "deep_breadth",
-        "deep_depth": "deep_depth",
-        "wide_breadth": "wide_breadth",
-        "wide_depth": "wide_depth",
-    }
-    if key == "bandit":
-        if tree_size in (3, 4):
-            return f"bandit{tree_size}"
-        raise ValueError("tree_type='bandit' requires tree_size 3 or 4.")
-    if key not in aliases:
-        valid = ", ".join(sorted(k for k in aliases if k))
-        raise ValueError(f"tree_type must be one of: {valid}, bandit. Got {raw_tree_type!r}.")
-    normalized = aliases[key]
-    if normalized == "legacy" and tree_size == 3:
-        return "bandit3"
-    if normalized == "legacy" and tree_size == 30:
-        return "wide_depth"
-    return normalized
-
-tree_type = normalize_tree_type(tree_type, tree_size)
-tree_name_suffix = "" if tree_type == "legacy" else f"_{tree_type}"
-
 sim_dir_name = dir_name.replace("model", "simulation")
 
 # ---------------------------------------------------------
@@ -203,63 +135,14 @@ kl_scaler = 5
 # ---------------------------------------------------------
 # 5. DECISION TREE SETUP
 # ---------------------------------------------------------
-def build_bandit_tree(num_arms):
-    tree = {'0': {}}
-    for node in range(1, num_arms + 1):
-        tree['0'][f'arm{node}'] = [-1, str(node)]
-        tree[str(node)] = {}
-    return tree
-
-def build_disjoint_path_tree(num_paths, nodes_per_path):
-    tree = {'0': {}}
-    node = 1
-    for path_idx in range(1, num_paths + 1):
-        first_node = str(node)
-        tree['0'][f'path{path_idx}'] = [-1, first_node]
-        for depth in range(nodes_per_path):
-            current_node = str(node)
-            if depth == nodes_per_path - 1:
-                tree[current_node] = {}
-            else:
-                next_node = str(node + 1)
-                tree[current_node] = {f'path{path_idx}_next{depth + 1}': [-1, next_node]}
-            node += 1
-    return tree
-
-if tree_type == "bandit3":
-    if tree_size != 3:
-        raise ValueError("tree_type='bandit3' requires tree_size=3.")
-    tree = "bandit"
-    decision_tree = build_bandit_tree(3)
-
-elif tree_type == "bandit4":
-    if tree_size != 4:
-        raise ValueError("tree_type='bandit4' requires tree_size=4.")
-    tree = "bandit"
-    decision_tree = build_bandit_tree(4)
-
-elif tree_type == "disjoint2x2":
-    if tree_size != 4:
-        raise ValueError("tree_type='disjoint2x2' requires tree_size=4.")
-    tree = "disjoint"
-    decision_tree = build_disjoint_path_tree(num_paths=2, nodes_per_path=2)
-
-elif tree_type == "disjoint3x2":
-    if tree_size != 6:
-        raise ValueError("tree_type='disjoint3x2' requires tree_size=6.")
-    tree = "disjoint"
-    decision_tree = build_disjoint_path_tree(num_paths=3, nodes_per_path=2)
-
-elif tree_type == "legacy" and tree_size == 2:
-    tree = "legacy"
+if tree_size == 2:
     decision_tree = {
         '0': {'right': [-1, '1'], 'up': [-1, '2']},
         '1': {},
         '2': {}
     }
 
-elif tree_type == "legacy" and tree_size == 6:
-    tree = "legacy"
+elif tree_size == 6:
     decision_tree = {
         '0': {'right': [-1, '1'], 'up': [-1, '4']},
         '1': {'right': [-1, '2'], 'up': [-1, '3']},
@@ -270,8 +153,7 @@ elif tree_type == "legacy" and tree_size == 6:
         '6': {}
     }
     
-elif tree_type == "legacy" and tree_size == 12:
-    tree = "legacy"
+elif tree_size == 12:
     decision_tree = {
         '0': {'right': [-1, '1'], 'up': [-1, '5'], 'left': [-1, "9"]},
         '1': {'right': [-1, '2'], 'up': [-1, '3'], 'left': [-1, "4"]},
@@ -403,7 +285,7 @@ else:
         }
     
 
-    elif (tree_type == "wide_depth"):
+    else:
 
         
         tree = "wide"
@@ -441,12 +323,6 @@ else:
             '29': {},
             '30': {}
         }
-    else:
-        raise ValueError(
-            f"Unsupported tree configuration tree_size={tree_size}, tree_type={tree_type!r}. "
-            "Use legacy 2/6/12-node trees, bandit3, bandit4, disjoint2x2, "
-            "disjoint3x2, or one of the 30-node tree types."
-        )
         
 
 
@@ -477,32 +353,3 @@ path_cov_mat = tf.convert_to_tensor(path_cov_mat_np, dtype=tf.float32)
 
 # Create index path map
 index_path_map = {path_indices[i]: node_indices[i] for i in range(len(path_indices))}
-
-def compute_reward_norm(path_map_np, input_type, time_steps):
-    if input_type == "binary":
-        reward_values = [0, 1]
-    else:
-        reward_values = [-4, -3, -2, -1, 1, 2, 3, 4]
-
-    exact_case_count = len(reward_values) ** time_steps
-    if exact_case_count <= 1_000_000:
-        total = 0.0
-        for rewards in itertools.product(reward_values, repeat=time_steps):
-            path_rewards = path_map_np @ np.asarray(rewards, dtype=float)
-            total += float(np.max(path_rewards))
-        return total / exact_case_count
-
-    if time_steps == 6:
-        return 3.58
-    if time_steps == 2:
-        return 0.75 if input_type == "binary" else 1.5625
-    if time_steps == 12:
-        return 5.11
-    return 8.1574
-
-reward_norm_value = compute_reward_norm(path_map_np, input_type, time_steps)
-
-print(
-    f"Tree config: {tree_type} | nodes: {tree_size} | paths: {num_paths} | "
-    f"reward_norm: {reward_norm_value:.6f}"
-)
