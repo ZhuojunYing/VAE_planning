@@ -119,12 +119,25 @@ class VariationalRNN(tf.keras.Model):
             initializer="zeros", 
             trainable=True  
         )
-        self.critic_head = tf.keras.layers.Dense(
-            1,
-            activation=None,
-            kernel_initializer='glorot_uniform',
-            name='critic_head'
-        )
+        self.critic_head = tf.keras.Sequential([
+            tf.keras.layers.Dense(
+                self.rnn_units,
+                activation=None,
+                kernel_initializer='glorot_uniform'
+            ),
+            tf.keras.layers.LayerNormalization(),
+            tf.keras.layers.Activation('relu'),
+            tf.keras.layers.Dense(
+                max(self.rnn_units // 2, 16),
+                activation='relu',
+                kernel_initializer='glorot_uniform'
+            ),
+            tf.keras.layers.Dense(
+                1,
+                activation=None,
+                kernel_initializer='glorot_uniform'
+            )
+        ], name='critic_head')
         self.lstm_reward_probe_head = tf.keras.layers.Dense(
             self.num_categories,
             activation=None,
@@ -188,6 +201,16 @@ class VariationalRNN(tf.keras.Model):
         value_target = None
 
         categories_onehot = helper.scalar_to_categorical(inputs, self.num_categories)
+        _, diagnostic_path_rewards = self._prepare_path_rewards(inputs)
+        diagnostic_best_path_reward = tf.reduce_max(
+            diagnostic_path_rewards,
+            axis=1,
+            keepdims=True
+        )
+        diagnostic_best_path_mask = tf.cast(
+            tf.equal(diagnostic_path_rewards, diagnostic_best_path_reward),
+            tf.float32
+        )
 
         all_z_means = []
         all_z_log_vars = []
@@ -210,6 +233,9 @@ class VariationalRNN(tf.keras.Model):
         all_lstm_probe_masks = []
         all_continue_after_reward_sums = []
         all_continue_after_reward_counts = []
+        all_previous_reward_masks = []
+        all_terminal_best_prob_pre = []
+        all_terminal_best_prob_post = []
         valid_step_masks = []
 
         total_loss = tf.constant(0.0, dtype=tf.float32)
@@ -238,13 +264,13 @@ class VariationalRNN(tf.keras.Model):
 
         for t in range(self.time_steps):
             valid_step_masks.append(active_mask)
-            all_stop_value_preds.append(self.critic_head(hidden_state_flat))
             if self.expansion_decision_version == "decoder":
                 expansion_input = hidden_state_flat
             elif self.expansion_decision_version == "lstm":
                 expansion_input = lstm_expansion_context
             else:
                 expansion_input = pre_lstm_expansion_context
+            all_stop_value_preds.append(self.critic_head(expansion_input))
 
             expansion_logits = self.expansion_head(expansion_input)
             # Joint action order: observe nodes first, then terminal path choices.
@@ -385,12 +411,18 @@ class VariationalRNN(tf.keras.Model):
             active_decision_mask = tf.squeeze(active_mask, axis=-1)
             continue_decision = tf.squeeze(observe_active_mask, axis=-1)
             previous_reward_mask = last_reward_onehot * tf.expand_dims(active_decision_mask, axis=-1)
+            all_previous_reward_masks.append(previous_reward_mask)
             all_continue_after_reward_sums.append(
                 tf.reduce_sum(previous_reward_mask * tf.expand_dims(continue_decision, axis=-1), axis=0)
             )
             all_continue_after_reward_counts.append(
                 tf.reduce_sum(previous_reward_mask, axis=0)
             )
+            terminal_best_pre = tf.reduce_sum(
+                terminal_probs_pre * diagnostic_best_path_mask,
+                axis=1
+            )
+            all_terminal_best_prob_pre.append(terminal_best_pre)
 
             safe_node_indices = tf.minimum(next_node_indices, self.time_steps - 1)
             chosen_rewards = tf.gather(
@@ -464,6 +496,11 @@ class VariationalRNN(tf.keras.Model):
                 tf.expand_dims(is_stop_chosen, axis=-1) * terminal_probs_pre
                 + tf.expand_dims(is_observe_chosen, axis=-1) * terminal_probs_post
             )
+            terminal_best_post = tf.reduce_sum(
+                step_action_output * diagnostic_best_path_mask,
+                axis=1
+            )
+            all_terminal_best_prob_post.append(terminal_best_post)
             all_action_outputs.append(step_action_output)
 
             node_observation = tf.one_hot(safe_node_indices, self.time_steps, dtype=tf.float32)
@@ -546,6 +583,9 @@ class VariationalRNN(tf.keras.Model):
         lstm_probe_masks = tf.stack(all_lstm_probe_masks, axis=1)
         continue_after_reward_sums = tf.stack(all_continue_after_reward_sums, axis=0)
         continue_after_reward_counts = tf.stack(all_continue_after_reward_counts, axis=0)
+        previous_reward_masks = tf.stack(all_previous_reward_masks, axis=0)
+        terminal_best_prob_pre = tf.stack(all_terminal_best_prob_pre, axis=0)
+        terminal_best_prob_post = tf.stack(all_terminal_best_prob_post, axis=0)
         valid_step_masks = tf.stack(valid_step_masks, axis=1)
 
         stop_flags = tf.squeeze(stop_decisions > 0, axis=-1)
@@ -602,6 +642,36 @@ class VariationalRNN(tf.keras.Model):
         )
         value_pred = stop_value_preds
         value_target = expansion_return_targets
+        diagnostic_reward_counts = tf.reduce_sum(previous_reward_masks, axis=1)
+        stop_value_preds_t = tf.transpose(
+            tf.squeeze(stop_value_preds, axis=-1),
+            perm=[1, 0]
+        )
+        return_targets_t = tf.transpose(
+            tf.squeeze(expansion_return_targets, axis=-1),
+            perm=[1, 0]
+        )
+        advantages_t = return_targets_t - stop_value_preds_t
+        critic_after_reward_sums = tf.reduce_sum(
+            previous_reward_masks * stop_value_preds_t[:, :, None],
+            axis=1
+        )
+        terminal_best_prob_pre_after_reward_sums = tf.reduce_sum(
+            previous_reward_masks * terminal_best_prob_pre[:, :, None],
+            axis=1
+        )
+        terminal_best_prob_post_after_reward_sums = tf.reduce_sum(
+            previous_reward_masks * terminal_best_prob_post[:, :, None],
+            axis=1
+        )
+        return_target_after_reward_sums = tf.reduce_sum(
+            previous_reward_masks * return_targets_t[:, :, None],
+            axis=1
+        )
+        advantage_after_reward_sums = tf.reduce_sum(
+            previous_reward_masks * advantages_t[:, :, None],
+            axis=1
+        )
         expansion_loss = self.compute_expansion_policy_loss(
             expansion_log_probs,
             tf.stack(all_expansion_entropies, axis=1),
@@ -701,7 +771,13 @@ class VariationalRNN(tf.keras.Model):
             lstm_state_sequence,
             decoder_state_sequence,
             continue_after_reward_sums,
-            continue_after_reward_counts
+            continue_after_reward_counts,
+            critic_after_reward_sums,
+            diagnostic_reward_counts,
+            terminal_best_prob_pre_after_reward_sums,
+            terminal_best_prob_post_after_reward_sums,
+            return_target_after_reward_sums,
+            advantage_after_reward_sums
         )
     def compute_time_conditional_prior(self, t, batch_size):
         mu_t = self.prior_mu[t]           

@@ -49,7 +49,7 @@ module unload cuda/11.0
 module load cuda/11.2
 # Activate the virtual environment
 source vae_env/bin/activate
-python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "60" "$input_type" "$seed" "$tree_size" "$train" "$tree_config" "$opportunity_cost_string" "$expansion_decision_version" "$model_variant"
+python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "120" "$input_type" "$seed" "$tree_size" "$train" "$tree_config" "$opportunity_cost_string" "$expansion_decision_version" "$model_variant"
 
 
 # Deactivate the virtual environment when done

@@ -136,7 +136,7 @@ dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 beta_values <- trimws(strsplit(beta_arg, ",")[[1]])
 opportunity_values <- trimws(strsplit(opportunity_arg, ",")[[1]])
-seeds <-7:7
+seeds <-6:6
 
 arg_label <- function(values) {
   label <- paste(values, collapse = "_")
