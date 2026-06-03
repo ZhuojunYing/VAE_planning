@@ -587,39 +587,6 @@ class VariationalRNN(tf.keras.Model):
         terminal_best_prob_pre = tf.stack(all_terminal_best_prob_pre, axis=0)
         terminal_best_prob_post = tf.stack(all_terminal_best_prob_post, axis=0)
         valid_step_masks = tf.stack(valid_step_masks, axis=1)
-        observed_reward_masks_t = tf.transpose(
-            lstm_probe_targets * lstm_probe_masks,
-            perm=[1, 0, 2]
-        )
-        observation_kl_t = tf.transpose(
-            tf.squeeze(observation_kl_d_sequence, axis=-1),
-            perm=[1, 0]
-        )
-        paid_kl_t = tf.transpose(
-            tf.squeeze(kl_d_sequence, axis=-1),
-            perm=[1, 0]
-        )
-        observation_kl_after_reward_sums = tf.reduce_sum(
-            observed_reward_masks_t * observation_kl_t[:, :, None],
-            axis=1
-        )
-        observation_kl_after_reward_counts = tf.reduce_sum(
-            observed_reward_masks_t,
-            axis=1
-        )
-        paid_kl_after_observed_reward_sums = tf.reduce_sum(
-            observed_reward_masks_t * paid_kl_t[:, :, None],
-            axis=1
-        )
-        paid_kl_after_observed_reward_counts = observation_kl_after_reward_counts
-        paid_kl_after_reward_sums = tf.reduce_sum(
-            previous_reward_masks * paid_kl_t[:, :, None],
-            axis=1
-        )
-        paid_kl_after_reward_counts = tf.reduce_sum(
-            previous_reward_masks,
-            axis=1
-        )
 
         stop_flags = tf.squeeze(stop_decisions > 0, axis=-1)
         has_stop = tf.reduce_any(stop_flags, axis=1)
@@ -810,13 +777,7 @@ class VariationalRNN(tf.keras.Model):
             terminal_best_prob_pre_after_reward_sums,
             terminal_best_prob_post_after_reward_sums,
             return_target_after_reward_sums,
-            advantage_after_reward_sums,
-            observation_kl_after_reward_sums,
-            observation_kl_after_reward_counts,
-            paid_kl_after_observed_reward_sums,
-            paid_kl_after_observed_reward_counts,
-            paid_kl_after_reward_sums,
-            paid_kl_after_reward_counts
+            advantage_after_reward_sums
         )
     def compute_time_conditional_prior(self, t, batch_size):
         mu_t = self.prior_mu[t]           

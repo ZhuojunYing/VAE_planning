@@ -189,7 +189,7 @@ if gpus:
 # ---------------------------------------------------------
 # 4. MODEL HYPERPARAMETERS
 # ---------------------------------------------------------
-latent_dim = 32
+latent_dim = 16
 output_dim = 64
 reward_output_dim = tree_size
 rnn_units = output_dim

@@ -110,7 +110,7 @@ for seed_list in seed_values_split:
                 seed_str = ", ".join([f"{x}" for x in seed_list])
                 opportunity_str = ", ".join([f"{x}" for x in opportunity_list])
                 # NOTE: We removed the extra double quotes inside the python print to make parsing easier in bash
-                command = f'sbatch -p general --time=10:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}" "{tree_config}"'
+                command = f'sbatch -p general --time=07:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}" "{tree_config}"'
                 print(command)
 EOL
 

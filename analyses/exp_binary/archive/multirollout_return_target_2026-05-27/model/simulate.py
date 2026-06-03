@@ -114,20 +114,6 @@ def build_probe_model(feature_dim, time_steps, num_categories):
     return model
 
 
-def build_single_output_probe_model(feature_dim, output_dim):
-    inputs = tf.keras.layers.Input(shape=(feature_dim,))
-    x = tf.keras.layers.Dense(128, activation="relu")(inputs)
-    x = tf.keras.layers.LayerNormalization()(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    logits = tf.keras.layers.Dense(output_dim)(x)
-    model = tf.keras.Model(inputs, logits)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
-    )
-    return model
-
-
 def make_probe_split(num_trials, seed):
     rng = np.random.default_rng(seed)
     trial_indices = np.arange(num_trials)
@@ -156,46 +142,14 @@ def train_single_deep_probe(features, observed_masks, rewards, seed, split):
     num_categories = len(CATEGORY_VALUES)
     reward_indices = reward_category_indices(rewards)
     reward_onehot = np.eye(num_categories, dtype=np.float32)[reward_indices]
-    y_all = reward_onehot
-    pred_indices = np.full((num_trials, time_steps, time_steps), -1, dtype=int)
+    targets = np.repeat(reward_onehot[:, None, :, :], time_steps, axis=1)
 
-    # Train a separate frozen diagnostic probe for each state timestep. This
-    # avoids letting easy early states dominate a single shared post-hoc probe.
-    for state_t in range(time_steps):
-        x_step = features[:, state_t, :]
-        w_step = observed_masks[:, state_t, :]
-        valid_samples = np.sum(w_step, axis=1) > 0
+    x_all = features.reshape(num_trials * time_steps, feature_dim)
+    y_all = targets.reshape(num_trials * time_steps, time_steps, num_categories)
+    w_all = observed_masks.reshape(num_trials * time_steps, time_steps)
+    valid_samples = np.sum(w_all, axis=1) > 0
 
-        if not np.any(valid_samples):
-            continue
-
-        train_samples = valid_samples & (split == "train")
-        if not np.any(train_samples):
-            train_samples = valid_samples
-
-        tf.random.set_seed(seed + state_t)
-        model = build_probe_model(feature_dim, time_steps, num_categories)
-        model.fit(
-            x_step[train_samples],
-            y_all[train_samples],
-            sample_weight=w_step[train_samples],
-            epochs=80,
-            batch_size=128,
-            verbose=0,
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="loss",
-                    patience=8,
-                    min_delta=1e-4,
-                    restore_best_weights=True,
-                )
-            ],
-        )
-
-        logits = model.predict(x_step, batch_size=256, verbose=0)
-        pred_indices[:, state_t, :] = np.argmax(logits, axis=-1)
-
-    if np.all(pred_indices < 0):
+    if not np.any(valid_samples):
         nan_pred = np.full((num_trials, time_steps, time_steps), np.nan, dtype=float)
         return {
             "pred_rewards": nan_pred,
@@ -203,7 +157,32 @@ def train_single_deep_probe(features, observed_masks, rewards, seed, split):
             "split": np.full(num_trials, "test", dtype=object),
         }
 
-    pred_indices = np.where(pred_indices < 0, 0, pred_indices)
+    sample_trials = np.repeat(np.arange(num_trials), time_steps)
+    train_samples = valid_samples & (split[sample_trials] == "train")
+    if not np.any(train_samples):
+        train_samples = valid_samples
+
+    tf.random.set_seed(seed)
+    model = build_probe_model(feature_dim, time_steps, num_categories)
+    model.fit(
+        x_all[train_samples],
+        y_all[train_samples],
+        sample_weight=w_all[train_samples],
+        epochs=80,
+        batch_size=128,
+        verbose=0,
+        callbacks=[
+            tf.keras.callbacks.EarlyStopping(
+                monitor="loss",
+                patience=8,
+                min_delta=1e-4,
+                restore_best_weights=True,
+            )
+        ],
+    )
+
+    logits = model.predict(x_all, batch_size=256, verbose=0)
+    pred_indices = np.argmax(logits, axis=-1).reshape(num_trials, time_steps, time_steps)
     pred_rewards = CATEGORY_VALUES[pred_indices]
     target_indices = np.repeat(reward_indices[:, None, :], time_steps, axis=1)
     correct = (pred_indices == target_indices).astype(float)
@@ -217,219 +196,24 @@ def train_single_deep_probe(features, observed_masks, rewards, seed, split):
     }
 
 
-def path_map_array_from_config(config):
-    if hasattr(config, "path_map_np"):
-        return np.asarray(config.path_map_np, dtype=np.float32)
-
-    path_rows = []
-    for node_indices in config.index_path_map.values():
-        path_row = np.zeros(config.time_steps, dtype=np.float32)
-        for node in node_indices:
-            node_idx = int(node) - 1
-            if 0 <= node_idx < config.time_steps:
-                path_row[node_idx] = 1.0
-        path_rows.append(path_row)
-    return np.stack(path_rows, axis=0)
-
-
-def compute_observed_path_targets(observed_masks, rewards, path_map):
-    observed_masks = np.asarray(observed_masks, dtype=np.float32)
-    rewards = np.asarray(rewards, dtype=np.float32)
-    path_map = np.asarray(path_map, dtype=np.float32)
-
-    observed_rewards = observed_masks * rewards[:, None, :]
-    path_values = np.einsum("pt,nst->nsp", path_map, observed_rewards)
-    best_path_values = np.max(path_values, axis=-1)
-    best_path_mask = np.isclose(path_values, best_path_values[:, :, None])
-    best_path_targets = best_path_mask.astype(np.float32)
-    best_path_targets /= np.maximum(
-        np.sum(best_path_targets, axis=-1, keepdims=True),
-        1.0,
-    )
-    first_best_paths = np.argmax(path_values, axis=-1)
-    return best_path_values, first_best_paths, best_path_targets
-
-
-def train_single_best_value_probe(features, target_values, seed, split):
-    features = np.asarray(features, dtype=np.float32)
-    target_values = np.asarray(target_values, dtype=np.float32)
-
-    num_trials, time_steps, feature_dim = features.shape
-    finite_values = target_values[np.isfinite(target_values)]
-    if finite_values.size == 0:
-        nan_pred = np.full((num_trials, time_steps), np.nan, dtype=float)
-        return {
-            "pred_best_path_value": nan_pred,
-            "correct_best_path_value": nan_pred.copy(),
-            "target_best_path_value": target_values,
-        }
-
-    class_values = np.array(sorted(np.unique(finite_values)), dtype=np.float32)
-    value_to_index = {float(value): idx for idx, value in enumerate(class_values)}
-    target_indices = np.full(target_values.shape, -1, dtype=int)
-    for value, idx in value_to_index.items():
-        target_indices[np.isclose(target_values, value)] = idx
-
-    num_classes = len(class_values)
-    pred_indices = np.full((num_trials, time_steps), -1, dtype=int)
-
-    for state_t in range(time_steps):
-        valid_samples = target_indices[:, state_t] >= 0
-        if not np.any(valid_samples):
-            continue
-
-        train_samples = valid_samples & (split == "train")
-        if not np.any(train_samples):
-            train_samples = valid_samples
-
-        y_step = np.eye(num_classes, dtype=np.float32)[target_indices[:, state_t]]
-        tf.random.set_seed(seed + state_t)
-        model = build_single_output_probe_model(feature_dim, num_classes)
-        model.fit(
-            features[train_samples, state_t, :],
-            y_step[train_samples],
-            epochs=80,
-            batch_size=128,
-            verbose=0,
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="loss",
-                    patience=8,
-                    min_delta=1e-4,
-                    restore_best_weights=True,
-                )
-            ],
-        )
-
-        logits = model.predict(features[:, state_t, :], batch_size=256, verbose=0)
-        pred_indices[:, state_t] = np.argmax(logits, axis=-1)
-
-    pred_values = np.full((num_trials, time_steps), np.nan, dtype=float)
-    valid_predictions = pred_indices >= 0
-    pred_values[valid_predictions] = class_values[pred_indices[valid_predictions]]
-    correct = np.where(
-        valid_predictions & (target_indices >= 0),
-        (pred_indices == target_indices).astype(float),
-        np.nan,
-    )
-    return {
-        "pred_best_path_value": pred_values,
-        "correct_best_path_value": correct,
-        "target_best_path_value": target_values,
-    }
-
-
-def train_single_best_path_probe(features, target_probs, first_best_paths, seed, split):
-    features = np.asarray(features, dtype=np.float32)
-    target_probs = np.asarray(target_probs, dtype=np.float32)
-    first_best_paths = np.asarray(first_best_paths, dtype=int)
-
-    num_trials, time_steps, feature_dim = features.shape
-    num_paths = target_probs.shape[-1]
-    pred_paths = np.full((num_trials, time_steps), -1, dtype=int)
-
-    for state_t in range(time_steps):
-        valid_samples = np.sum(target_probs[:, state_t, :], axis=1) > 0.0
-        if not np.any(valid_samples):
-            continue
-
-        train_samples = valid_samples & (split == "train")
-        if not np.any(train_samples):
-            train_samples = valid_samples
-
-        tf.random.set_seed(seed + state_t)
-        model = build_single_output_probe_model(feature_dim, num_paths)
-        model.fit(
-            features[train_samples, state_t, :],
-            target_probs[train_samples, state_t, :],
-            epochs=80,
-            batch_size=128,
-            verbose=0,
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="loss",
-                    patience=8,
-                    min_delta=1e-4,
-                    restore_best_weights=True,
-                )
-            ],
-        )
-
-        logits = model.predict(features[:, state_t, :], batch_size=256, verbose=0)
-        pred_paths[:, state_t] = np.argmax(logits, axis=-1)
-
-    correct = np.full((num_trials, time_steps), np.nan, dtype=float)
-    for state_t in range(time_steps):
-        valid_predictions = pred_paths[:, state_t] >= 0
-        if not np.any(valid_predictions):
-            continue
-        correct[valid_predictions, state_t] = target_probs[
-            np.where(valid_predictions)[0],
-            state_t,
-            pred_paths[valid_predictions, state_t],
-        ] > 0.0
-
-    return {
-        "pred_best_path": pred_paths.astype(float),
-        "correct_best_path": correct,
-        "target_best_path": first_best_paths.astype(float),
-    }
-
-
-def train_single_path_diagnostic_probes(features, best_path_values, best_path_targets, first_best_paths, seed, split):
-    best_value_results = train_single_best_value_probe(
-        features,
-        best_path_values,
-        seed=seed + 1_000,
-        split=split,
-    )
-    best_path_results = train_single_best_path_probe(
-        features,
-        best_path_targets,
-        first_best_paths,
-        seed=seed + 2_000,
-        split=split,
-    )
-    return {
-        **best_value_results,
-        **best_path_results,
-    }
-
-
-def train_deep_reward_probes(lstm_features, decoder_features, observed_masks, rewards, path_map, seed):
+def train_deep_reward_probes(lstm_features, decoder_features, observed_masks, rewards, seed):
     shared_split = make_probe_split(np.asarray(rewards).shape[0], seed + 17)
-    best_path_values, first_best_paths, best_path_targets = compute_observed_path_targets(
-        observed_masks,
-        rewards,
-        path_map,
-    )
-
-    probe_inputs = {
-        "lstm": (lstm_features, seed + 101),
-        "decoder": (decoder_features, seed + 202),
-    }
-    results = {}
-    for source_name, (source_features, source_seed) in probe_inputs.items():
-        reward_results = train_single_deep_probe(
-            source_features,
+    return {
+        "lstm": train_single_deep_probe(
+            lstm_features,
             observed_masks,
             rewards,
-            seed=source_seed,
+            seed=seed + 101,
             split=shared_split,
-        )
-        path_results = train_single_path_diagnostic_probes(
-            source_features,
-            best_path_values,
-            best_path_targets,
-            first_best_paths,
-            seed=source_seed,
+        ),
+        "decoder": train_single_deep_probe(
+            decoder_features,
+            observed_masks,
+            rewards,
+            seed=seed + 202,
             split=shared_split,
-        )
-        results[source_name] = {
-            **reward_results,
-            **path_results,
-        }
-    return results
+        ),
+    }
 
 
 def trial_rows(config, graph_index, rewards, outputs, probe_predictions=None, probe_split=None):
@@ -511,26 +295,6 @@ def trial_rows(config, graph_index, rewards, outputs, probe_predictions=None, pr
                     correct = source_predictions["correct"][t, node_index]
                     row[f"{source_name}_deep_probe_pred_reward_t{t + 1}"] = pred_reward
                     row[f"{source_name}_deep_probe_correct_t{t + 1}"] = correct
-                    if "pred_best_path_value" in source_predictions:
-                        row[f"{source_name}_deep_probe_target_best_path_value_t{t + 1}"] = (
-                            source_predictions["target_best_path_value"][t]
-                        )
-                        row[f"{source_name}_deep_probe_pred_best_path_value_t{t + 1}"] = (
-                            source_predictions["pred_best_path_value"][t]
-                        )
-                        row[f"{source_name}_deep_probe_correct_best_path_value_t{t + 1}"] = (
-                            source_predictions["correct_best_path_value"][t]
-                        )
-                    if "pred_best_path" in source_predictions:
-                        row[f"{source_name}_deep_probe_target_best_path_t{t + 1}"] = (
-                            source_predictions["target_best_path"][t]
-                        )
-                        row[f"{source_name}_deep_probe_pred_best_path_t{t + 1}"] = (
-                            source_predictions["pred_best_path"][t]
-                        )
-                        row[f"{source_name}_deep_probe_correct_best_path_t{t + 1}"] = (
-                            source_predictions["correct_best_path"][t]
-                        )
 
         rows.append(row)
 
@@ -619,17 +383,16 @@ def run_simulation(config):
                             decoder_features.append(np.asarray(outputs_np[DECODER_STATE_OUTPUT_INDEX][0], dtype=np.float32))
 
                     if len(lstm_features) == num_trials and len(decoder_features) == num_trials:
-                        print("Training frozen deep reward/path probes for LSTM and decoder states...")
+                        print("Training frozen deep reward probes for LSTM and decoder states...")
                         deep_probe_predictions = train_deep_reward_probes(
                             np.stack(lstm_features, axis=0),
                             np.stack(decoder_features, axis=0),
                             np.stack(probe_observed_masks, axis=0),
                             np.stack(trial_rewards, axis=0),
-                            path_map=path_map_array_from_config(config),
                             seed=config.seed,
                         )
                     else:
-                        print("⚠️ Deep probe features were unavailable; skipping probe columns.")
+                        print("⚠️ Deep reward probe features were unavailable; skipping probe columns.")
                         deep_probe_predictions = None
 
                     sim_data = []
@@ -642,18 +405,6 @@ def run_simulation(config):
                                 source_name: {
                                     "pred_rewards": source_predictions["pred_rewards"][graph_index],
                                     "correct": source_predictions["correct"][graph_index],
-                                    "target_best_path_value": (
-                                        source_predictions["target_best_path_value"][graph_index]
-                                    ),
-                                    "pred_best_path_value": (
-                                        source_predictions["pred_best_path_value"][graph_index]
-                                    ),
-                                    "correct_best_path_value": (
-                                        source_predictions["correct_best_path_value"][graph_index]
-                                    ),
-                                    "target_best_path": source_predictions["target_best_path"][graph_index],
-                                    "pred_best_path": source_predictions["pred_best_path"][graph_index],
-                                    "correct_best_path": source_predictions["correct_best_path"][graph_index],
                                 }
                                 for source_name, source_predictions in deep_probe_predictions.items()
                             }

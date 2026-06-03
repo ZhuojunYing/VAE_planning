@@ -143,12 +143,6 @@ def train_step(
                     terminal_best_prob_post_after_reward_sums = extra_outputs[25]
                     return_target_after_reward_sums = extra_outputs[26]
                     advantage_after_reward_sums = extra_outputs[27]
-                    kl_obs_after_reward_sums = extra_outputs[28]
-                    kl_obs_after_reward_counts = extra_outputs[29]
-                    kl_d_after_observed_reward_sums = extra_outputs[30]
-                    kl_d_after_observed_reward_counts = extra_outputs[31]
-                    kl_d_after_previous_reward_sums = extra_outputs[32]
-                    kl_d_after_previous_reward_counts = extra_outputs[33]
              
             # --- THE FIX: Create the weighted tensors INSIDE the tape scope ---
             weighted_kl_for_logging = information_loss * current_beta
@@ -332,13 +326,7 @@ def train_step(
             terminal_best_prob_pre_after_reward_sums,
             terminal_best_prob_post_after_reward_sums,
             return_target_after_reward_sums,
-            advantage_after_reward_sums,
-            kl_obs_after_reward_sums,
-            kl_obs_after_reward_counts,
-            kl_d_after_observed_reward_sums,
-            kl_d_after_observed_reward_counts,
-            kl_d_after_previous_reward_sums,
-            kl_d_after_previous_reward_counts
+            advantage_after_reward_sums
     )
 
 import os
@@ -355,7 +343,7 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
     
     ppo_epochs = 3
     return_target_rollouts = max(
-        int(os.environ.get("RETURN_TARGET_ROLLOUTS", "8")),
+        int(os.environ.get("RETURN_TARGET_ROLLOUTS", "4")),
         1
     )
 
@@ -471,15 +459,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             history[f'exp_terminal_best_post_t{decision_step}_after_reward_{label}'] = []
             history[f'exp_return_target_t{decision_step}_after_reward_{label}'] = []
             history[f'exp_advantage_t{decision_step}_after_reward_{label}'] = []
-    for observation_step in range(1, time_steps + 1):
-        for reward_value in probe_reward_values:
-            label = probe_reward_label(reward_value)
-            history[f'kl_d_obs_t{observation_step}_after_reward_{label}'] = []
-            history[f'kl_d_obs_n_t{observation_step}_after_reward_{label}'] = []
-            history[f'kl_d_t{observation_step}_after_observed_reward_{label}'] = []
-            history[f'kl_d_n_t{observation_step}_after_observed_reward_{label}'] = []
-            history[f'kl_d_t{observation_step}_after_previous_reward_{label}'] = []
-            history[f'kl_d_n_t{observation_step}_after_previous_reward_{label}'] = []
     kl_warmup_epochs = 0   # Keep beta at 0.0 while learning rate warms up
     kl_annealing_epochs = 0 # How many epochs it takes to go from 0.0 to target_beta
     target_beta =1/model.beta
@@ -497,10 +476,9 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         expansion_epsilon_start = 0.0
         expansion_epsilon_end = 0.0
         expansion_epsilon_annealing_epochs = 0
-        expansion_entropy_start = 1.0
+        expansion_entropy_start = 2.0
         expansion_entropy_end = 0.0
-        expansion_entropy_annealing_epochs = 70
-        expansion_entropy_hold_epochs = 90
+        expansion_entropy_annealing_epochs = 50
         forced_continue_start = 0.0
         forced_continue_end = 0.0
         forced_continue_annealing_epochs = 0
@@ -509,9 +487,8 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         expansion_epsilon_end = 0.0
         expansion_epsilon_annealing_epochs = 0
         expansion_entropy_start = 1.0
-        expansion_entropy_end = 0.0 
+        expansion_entropy_end = 0.0
         expansion_entropy_annealing_epochs = 50
-        expansion_entropy_hold_epochs = 100
         forced_continue_start = 0.0
         forced_continue_end = 0.0
         forced_continue_annealing_epochs = 0
@@ -555,30 +532,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             dtype=tf.float32
         )
         ep_advantage_after_reward_sums = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_kl_obs_after_reward_sums = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_kl_obs_after_reward_counts = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_kl_d_after_observed_reward_sums = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_kl_d_after_observed_reward_counts = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_kl_d_after_previous_reward_sums = tf.zeros(
-            [model.time_steps, model.num_categories],
-            dtype=tf.float32
-        )
-        ep_kl_d_after_previous_reward_counts = tf.zeros(
             [model.time_steps, model.num_categories],
             dtype=tf.float32
         )
@@ -628,12 +581,8 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             )
         if expansion_entropy_annealing_epochs <= 0:
             current_expansion_entropy_coef = expansion_entropy_end
-        elif epoch >= expansion_entropy_hold_epochs:
-            current_expansion_entropy_coef = 0.0
-        elif epoch >= expansion_entropy_annealing_epochs:
-            current_expansion_entropy_coef = expansion_entropy_end
         else:
-            entropy_progress = epoch / max(expansion_entropy_annealing_epochs - 1, 1)
+            entropy_progress = min(epoch / expansion_entropy_annealing_epochs, 1.0)
             current_expansion_entropy_coef = (
                 expansion_entropy_start
                 + (expansion_entropy_end - expansion_entropy_start) * entropy_progress
@@ -670,13 +619,7 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
              terminal_best_prob_pre_after_reward_sums,
              terminal_best_prob_post_after_reward_sums,
              return_target_after_reward_sums,
-             advantage_after_reward_sums,
-             kl_obs_after_reward_sums,
-             kl_obs_after_reward_counts,
-             kl_d_after_observed_reward_sums,
-             kl_d_after_observed_reward_counts,
-             kl_d_after_previous_reward_sums,
-             kl_d_after_previous_reward_counts) = train_step(
+             advantage_after_reward_sums) = train_step(
                 model=model, 
                 optimizer=optimizer,
                 current_alpha=tf.constant(current_alpha, dtype=tf.float32),
@@ -722,12 +665,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             ep_terminal_best_post_after_reward_sums += terminal_best_prob_post_after_reward_sums
             ep_return_target_after_reward_sums += return_target_after_reward_sums
             ep_advantage_after_reward_sums += advantage_after_reward_sums
-            ep_kl_obs_after_reward_sums += kl_obs_after_reward_sums
-            ep_kl_obs_after_reward_counts += kl_obs_after_reward_counts
-            ep_kl_d_after_observed_reward_sums += kl_d_after_observed_reward_sums
-            ep_kl_d_after_observed_reward_counts += kl_d_after_observed_reward_counts
-            ep_kl_d_after_previous_reward_sums += kl_d_after_previous_reward_sums
-            ep_kl_d_after_previous_reward_counts += kl_d_after_previous_reward_counts
             
             ep_kl_gn_enc += kl_gn_enc
             ep_kl_gn_lstm += kl_gn_lstm
@@ -901,30 +838,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 tf.constant(float("nan"), dtype=tf.float32)
             )
         )
-        kl_obs_after_reward_epoch = tf.where(
-            ep_kl_obs_after_reward_counts > 0.0,
-            ep_kl_obs_after_reward_sums / (ep_kl_obs_after_reward_counts + 1e-6),
-            tf.fill(
-                [model.time_steps, model.num_categories],
-                tf.constant(float("nan"), dtype=tf.float32)
-            )
-        )
-        kl_d_after_observed_reward_epoch = tf.where(
-            ep_kl_d_after_observed_reward_counts > 0.0,
-            ep_kl_d_after_observed_reward_sums / (ep_kl_d_after_observed_reward_counts + 1e-6),
-            tf.fill(
-                [model.time_steps, model.num_categories],
-                tf.constant(float("nan"), dtype=tf.float32)
-            )
-        )
-        kl_d_after_previous_reward_epoch = tf.where(
-            ep_kl_d_after_previous_reward_counts > 0.0,
-            ep_kl_d_after_previous_reward_sums / (ep_kl_d_after_previous_reward_counts + 1e-6),
-            tf.fill(
-                [model.time_steps, model.num_categories],
-                tf.constant(float("nan"), dtype=tf.float32)
-            )
-        )
         for decision_step in range(2, time_steps + 1):
             step_idx = decision_step - 1
             for idx, reward_value in enumerate(probe_reward_values):
@@ -950,28 +863,6 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 history[f'exp_advantage_t{decision_step}_after_reward_{label}'].append(
                     advantage_after_reward_epoch[step_idx, idx].numpy()
                 )
-        for observation_step in range(1, time_steps + 1):
-            step_idx = observation_step - 1
-            for idx, reward_value in enumerate(probe_reward_values):
-                label = probe_reward_label(reward_value)
-                history[f'kl_d_obs_t{observation_step}_after_reward_{label}'].append(
-                    kl_obs_after_reward_epoch[step_idx, idx].numpy()
-                )
-                history[f'kl_d_obs_n_t{observation_step}_after_reward_{label}'].append(
-                    ep_kl_obs_after_reward_counts[step_idx, idx].numpy()
-                )
-                history[f'kl_d_t{observation_step}_after_observed_reward_{label}'].append(
-                    kl_d_after_observed_reward_epoch[step_idx, idx].numpy()
-                )
-                history[f'kl_d_n_t{observation_step}_after_observed_reward_{label}'].append(
-                    ep_kl_d_after_observed_reward_counts[step_idx, idx].numpy()
-                )
-                history[f'kl_d_t{observation_step}_after_previous_reward_{label}'].append(
-                    kl_d_after_previous_reward_epoch[step_idx, idx].numpy()
-                )
-                history[f'kl_d_n_t{observation_step}_after_previous_reward_{label}'].append(
-                    ep_kl_d_after_previous_reward_counts[step_idx, idx].numpy()
-                )
 
         t3_reward3_msg = ""
         if time_steps >= 3:
@@ -993,30 +884,30 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
      
         # --- CHECKPOINTING LOGIC ---
         # We check improvement only after warmup to avoid saving "cheating" models
-        # if epoch >= warmup_epochs:
-        #     if avg_total_loss < (best_loss - min_delta):
-        #         best_loss = avg_total_loss
-        #         wait = 0
+        if epoch >= warmup_epochs:
+            if avg_total_loss < (best_loss - min_delta):
+                best_loss = avg_total_loss
+                wait = 0
                 
-        #         # SAVE THE BEST WEIGHTS IMMEDIATELY
-        #         if os.path.exists(best_checkpoint_path):
-        #             os.remove(best_checkpoint_path)
-        #         model.save_weights(best_checkpoint_path)
-        #         print(f"   >>> New Best Loss: {best_loss:.4f}. Saved checkpoint.")
+                # SAVE THE BEST WEIGHTS IMMEDIATELY
+                if os.path.exists(best_checkpoint_path):
+                    os.remove(best_checkpoint_path)
+                model.save_weights(best_checkpoint_path)
+                print(f"   >>> New Best Loss: {best_loss:.4f}. Saved checkpoint.")
                 
-        #     else:
-        #         wait += 1
-        #         if wait >= patience:
-        #             print(f"\n🛑 CONVERGENCE REACHED: Loss stopped improving for {patience} epochs.")
-        #             print(f"   Best Loss was: {best_loss:.4f} (Reloading these weights now...)")
+            else:
+                wait += 1
+                if wait >= patience:
+                    print(f"\n🛑 CONVERGENCE REACHED: Loss stopped improving for {patience} epochs.")
+                    print(f"   Best Loss was: {best_loss:.4f} (Reloading these weights now...)")
                     
-        #             # RESTORE BEST WEIGHTS
-        #             try:
-        #                 model.load_weights(best_checkpoint_path)
-        #                 print("   ✅ Successfully reloaded best weights.")
-        #             except:
-        #                 print("   ⚠️ Warning: Could not reload best weights. Using final weights.")
-        #             break
+                    # RESTORE BEST WEIGHTS
+                    try:
+                        model.load_weights(best_checkpoint_path)
+                        print("   ✅ Successfully reloaded best weights.")
+                    except:
+                        print("   ⚠️ Warning: Could not reload best weights. Using final weights.")
+                    break
 
     log_file_path = os.path.join(dir_name, f"{model_name}_training_logs.csv")
     with open(log_file_path, mode='w', newline='') as f:
