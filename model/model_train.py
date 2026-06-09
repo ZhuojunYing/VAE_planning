@@ -767,6 +767,8 @@ def train_model(model, epochs, trials_per_epoch):
         
     dummy_input = tf.zeros((1, time_steps, 1), dtype=tf.float32)
     _ = model(dummy_input, training=False)
+    if hasattr(model, "build_target_critic"):
+        model.build_target_critic()
     
     all_trainables = (
         model.encoder.trainable_variables +
@@ -940,6 +942,8 @@ for beta in beta_values:
                         if os.path.exists(weights_path):
                             dummy_input = tf.zeros((1, time_steps, 1), dtype=tf.float32)
                             _ = vrnn_model(dummy_input, training=False)
+                            if hasattr(vrnn_model, "build_target_critic"):
+                                vrnn_model.build_target_critic()
                             
                             vrnn_model.load_weights(weights_path)
                             print("Weights loaded successfully.")

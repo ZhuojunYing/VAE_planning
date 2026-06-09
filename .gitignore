@@ -23,3 +23,11 @@ logs/
 # System files
 .DS_Store
 papers/
+
+./agents
+./codex
+./codex_backup
+
+analyses/exp_binary/results
+analysis/__pycache__
+analysis_outputs

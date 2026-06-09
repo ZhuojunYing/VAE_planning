@@ -1,12 +1,13 @@
 #!/bin/bash
 
-if [ "$#" -lt 11 ] || [ "$#" -gt 14 ]; then
-    echo "Usage: $0 lambda alpha beta model_dir sim_dir trial_n input_type seed train opportunity_cost tree_size [expansion_decision_version] [model_variant] [tree_config]"
-    echo "Example: $0 1.0 0 1000 outputs/models/ outputs/simulations/ 2000 uniform 1 train 0.05 2 lstm rnn"
-    echo "Example topology: $0 10.0 0.0 1.0 outputs/models/ outputs/simulations/ 2000 uniform 1 train 0.0 4 lstm vae disjoint2x2"
+if [ "$#" -lt 11 ] || [ "$#" -gt 16 ]; then
+    echo "Usage: $0 lambda alpha beta model_dir sim_dir trial_n input_type seed train opportunity_cost tree_size [expansion_decision_version] [model_variant] [tree_config] [rnn_units] [latent_dim]"
+    echo "Example: $0 1.0 0 1000 outputs/models/ outputs/simulations/ 2000 uniform 1 train 0.05 2 lstm rnn '' 64 32"
+    echo "Example topology: $0 10.0 0.0 1.0 outputs/models/ outputs/simulations/ 2000 uniform 1 train 0.0 4 lstm vae disjoint2x2 64 32"
     echo "Expansion versions: decoder/1, lstm/2, pre_lstm/3"
     echo "Model variants: vae, rnn"
     echo "Tree configs: bandit3, bandit4, disjoint2x2, disjoint3x2"
+    echo "Defaults: rnn_units=64, latent_dim=32"
     exit 1
 fi
 
@@ -27,6 +28,8 @@ echo "11: '${11}'"
 echo "12: '${12}'"
 echo "13: '${13}'"
 echo "14: '${14}'"
+echo "15: '${15}'"
+echo "16: '${16}'"
 echo "================================="
 lambda_string=$1
 alpha_string=$2
@@ -42,6 +45,8 @@ tree_size=${11}
 expansion_decision_version=${12:-"decoder"}
 model_variant=${13:-"vae"}
 tree_config=${14:-""}
+rnn_units=${15:-"64"}
+latent_dim=${16:-"32"}
 # Navigate to the directory containing the virtual environment if it's not in the current directory
 # Uncomment and modify the next line if needed
 # cd /path/to/your/project
@@ -49,7 +54,7 @@ module unload cuda/11.0
 module load cuda/11.2
 # Activate the virtual environment
 source vae_env/bin/activate
-python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "120" "$input_type" "$seed" "$tree_size" "$train" "$tree_config" "$opportunity_cost_string" "$expansion_decision_version" "$model_variant"
+python model/main.py "$lambda_string" "$alpha_string" "$beta_string" "$model_dir_name" "120" "$input_type" "$seed" "$tree_size" "$train" "$tree_config" "$opportunity_cost_string" "$expansion_decision_version" "$model_variant" "$rnn_units" "$latent_dim"
 
 
 # Deactivate the virtual environment when done

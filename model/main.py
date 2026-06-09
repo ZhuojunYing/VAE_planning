@@ -19,6 +19,9 @@ def model_variant_label(variant):
 def tree_file_label():
     return f"{config.tree_size}n{getattr(config, 'tree_name_suffix', '')}"
 
+def architecture_file_label():
+    return f"rnn_{config.rnn_units}_latent_{config.latent_dim}"
+
 def main():
     # Make sure the target directory exists
     os.makedirs(config.dir_name, exist_ok=True)
@@ -42,7 +45,7 @@ def main():
                             f'lambda_{lambda_}_alpha_{alpha}_beta_{beta}_'
                             f'opportunity_{opportunity_cost}_expansion_{config.expansion_decision_version}_'
                             f'{variant_label}'
-                            f'seed_{config.seed}_{tree_file_label()}'
+                            f'seed_{config.seed}_{tree_file_label()}_{architecture_file_label()}'
                         )
                         # 1. Initialize Model Architecture
                         encoder = build_encoder(config.rnn_units * 2, config.latent_dim, config.rnn_units)
@@ -97,6 +100,8 @@ def main():
                             trials_per_epoch=config.trials_per_epoch, 
                             batch_size=config.batch_size, 
                             time_steps=config.time_steps, 
+                            steps_per_epoch=config.steps_per_epoch,
+                            rollout_steps=config.rollout_steps,
                             input_type=config.input_type, 
                             dir_name=config.dir_name, 
                             model_name=model_name

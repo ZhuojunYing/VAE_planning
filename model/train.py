@@ -6,6 +6,7 @@ gradient calculation, backpropagation, and checkpointing.
 """
 
 import os
+import math
 import random
 import numpy as np
 import tensorflow as tf
@@ -26,7 +27,9 @@ def train_step(
     input_type_str,
     clip_value=10.0,
     ppo_epochs=3,
-    return_target_rollouts=1
+    return_target_rollouts=1,
+    use_lambda_return=True,
+    lambda_return=0.95
 ):
     """
     Executes one training step: forward pass, loss computation, and backpropagation.
@@ -61,7 +64,9 @@ def train_step(
                 expansion_epsilon=current_expansion_epsilon,
                 expansion_entropy_coef=current_expansion_entropy_coef,
                 forced_continue_epsilon=current_forced_continue_epsilon,
-                compute_losses=False
+                compute_losses=False,
+                use_lambda_return=use_lambda_return,
+                lambda_return=lambda_return
             )
             rollout_node_selections.append(tf.stop_gradient(rollout_outputs[12]))
             rollout_expansion_log_probs.append(tf.stop_gradient(rollout_outputs[18]))
@@ -89,6 +94,10 @@ def train_step(
             opportunity_policy_loss = tf.constant(0.0, dtype=tf.float32)
             lstm_probe_loss = tf.constant(0.0, dtype=tf.float32)
             lstm_probe_accuracy = tf.constant(0.0, dtype=tf.float32)
+            observed_masks_for_best_path_loss = tf.zeros(
+                [tf.shape(input_data)[0], model.time_steps, model.time_steps],
+                dtype=tf.float32
+            )
 
             for rollout_idx in range(return_target_rollouts):
                 # Unpack the forward pass exactly as defined in your model.
@@ -108,7 +117,9 @@ def train_step(
                     forced_continue_epsilon=current_forced_continue_epsilon,
                     forced_node_selections=rollout_node_selections[rollout_idx],
                     old_expansion_log_probs=rollout_expansion_log_probs[rollout_idx],
-                    use_ppo_loss=True
+                    use_ppo_loss=True,
+                    use_lambda_return=use_lambda_return,
+                    lambda_return=lambda_return
                 )
 
                 total_loss += rollout_total_loss * rollout_weight
@@ -149,6 +160,22 @@ def train_step(
                     kl_d_after_observed_reward_counts = extra_outputs[31]
                     kl_d_after_previous_reward_sums = extra_outputs[32]
                     kl_d_after_previous_reward_counts = extra_outputs[33]
+                    continue_after_best_path_value_sums = extra_outputs[34]
+                    continue_after_best_path_value_counts = extra_outputs[35]
+                    critic_after_best_path_value_sums = extra_outputs[36]
+                    terminal_best_prob_pre_after_best_path_value_sums = extra_outputs[37]
+                    terminal_best_prob_post_after_best_path_value_sums = extra_outputs[38]
+                    return_target_after_best_path_value_sums = extra_outputs[39]
+                    advantage_after_best_path_value_sums = extra_outputs[40]
+                    kl_d_after_best_path_value_sums = extra_outputs[41]
+                    q_stop_max_after_best_path_value_sums = extra_outputs[42]
+                    q_observe_max_after_best_path_value_sums = extra_outputs[43]
+                    q_stop_minus_observe_after_best_path_value_sums = extra_outputs[44]
+                    policy_stop_prob_after_best_path_value_sums = extra_outputs[45]
+                    policy_observe_prob_after_best_path_value_sums = extra_outputs[46]
+                    q_argmax_stop_after_best_path_value_sums = extra_outputs[47]
+                    policy_argmax_stop_after_best_path_value_sums = extra_outputs[48]
+                    observed_masks_for_best_path_loss = extra_outputs[2]
              
             # --- THE FIX: Create the weighted tensors INSIDE the tape scope ---
             weighted_kl_for_logging = information_loss * current_beta
@@ -299,7 +326,9 @@ def train_step(
                     forced_continue_epsilon=current_forced_continue_epsilon,
                     forced_node_selections=rollout_node_selections[rollout_idx],
                     old_expansion_log_probs=rollout_expansion_log_probs[rollout_idx],
-                    use_ppo_loss=True
+                    use_ppo_loss=True,
+                    use_lambda_return=use_lambda_return,
+                    lambda_return=lambda_return
                 )
                 ppo_expansion_loss += extra_outputs[5] * rollout_weight
 
@@ -309,6 +338,59 @@ def train_step(
             expansion_params
         )
         optimizer.apply_gradients(ppo_grads_and_vars)
+
+    rewards_for_best_path_loss = tf.squeeze(input_data, axis=-1)
+    observed_rewards_for_best_path_loss = (
+        rewards_for_best_path_loss[:, None, :]
+        * tf.cast(observed_masks_for_best_path_loss, tf.float32)
+    )
+    current_path_values_for_best_path_loss = tf.einsum(
+        "btn,pn->btp",
+        observed_rewards_for_best_path_loss,
+        tf.cast(model.path_map, tf.float32)
+    )
+    path_observed_counts_for_best_path_loss = tf.einsum(
+        "btn,pn->btp",
+        tf.cast(observed_masks_for_best_path_loss, tf.float32),
+        tf.cast(model.path_map, tf.float32)
+    )
+    any_observed_path_for_best_path_loss = tf.reduce_any(
+        path_observed_counts_for_best_path_loss > 0.0,
+        axis=-1
+    )
+    current_path_values_for_best_path_loss = tf.where(
+        path_observed_counts_for_best_path_loss > 0.0,
+        current_path_values_for_best_path_loss,
+        tf.fill(tf.shape(current_path_values_for_best_path_loss), -1e9)
+    )
+    current_best_path_values_for_best_path_loss = tf.reduce_max(
+        current_path_values_for_best_path_loss,
+        axis=-1
+    )
+    current_best_path_values_for_best_path_loss = tf.where(
+        any_observed_path_for_best_path_loss,
+        current_best_path_values_for_best_path_loss,
+        tf.zeros_like(current_best_path_values_for_best_path_loss)
+    )
+    observed_counts_for_best_path_loss = tf.reduce_sum(
+        tf.cast(observed_masks_for_best_path_loss, tf.float32),
+        axis=-1
+    )
+    valid_best_path_loss_states = observed_counts_for_best_path_loss > 0.0
+    best_path_so_far_m4_count = tf.reduce_sum(tf.cast(
+        tf.logical_and(
+            valid_best_path_loss_states,
+            tf.abs(current_best_path_values_for_best_path_loss + 4.0) < 1e-5
+        ),
+        tf.float32
+    ))
+    best_path_so_far_p4_count = tf.reduce_sum(tf.cast(
+        tf.logical_and(
+            valid_best_path_loss_states,
+            tf.abs(current_best_path_values_for_best_path_loss - 4.0) < 1e-5
+        ),
+        tf.float32
+    ))
     
     # Return all 13 values
     return (
@@ -338,7 +420,24 @@ def train_step(
             kl_d_after_observed_reward_sums,
             kl_d_after_observed_reward_counts,
             kl_d_after_previous_reward_sums,
-            kl_d_after_previous_reward_counts
+            kl_d_after_previous_reward_counts,
+            continue_after_best_path_value_sums,
+            continue_after_best_path_value_counts,
+            critic_after_best_path_value_sums,
+            terminal_best_prob_pre_after_best_path_value_sums,
+            terminal_best_prob_post_after_best_path_value_sums,
+            return_target_after_best_path_value_sums,
+            advantage_after_best_path_value_sums,
+            kl_d_after_best_path_value_sums,
+            q_stop_max_after_best_path_value_sums,
+            q_observe_max_after_best_path_value_sums,
+            q_stop_minus_observe_after_best_path_value_sums,
+            policy_stop_prob_after_best_path_value_sums,
+            policy_observe_prob_after_best_path_value_sums,
+            q_argmax_stop_after_best_path_value_sums,
+            policy_argmax_stop_after_best_path_value_sums,
+            best_path_so_far_m4_count,
+            best_path_so_far_p4_count
     )
 
 import os
@@ -346,11 +445,31 @@ import csv
 import tensorflow as tf
 import helper
 
-def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_type, dir_name, model_name):
+def train_model(
+    model,
+    epochs,
+    trials_per_epoch,
+    batch_size,
+    time_steps,
+    input_type,
+    dir_name,
+    model_name,
+    steps_per_epoch=None,
+    rollout_steps=None,
+):
     """
     The main training loop with early stopping, warmup scheduling, and checkpointing.
     """
-   
+    if steps_per_epoch is None:
+        steps_per_epoch = int(trials_per_epoch) * int(batch_size) * int(time_steps)
+    if steps_per_epoch <= 0:
+        raise ValueError(f"steps_per_epoch must be positive. Got {steps_per_epoch}.")
+    steps_per_batch = int(batch_size) * int(time_steps)
+    updates_per_epoch = max(1, math.ceil(int(steps_per_epoch) / steps_per_batch))
+    # The TensorFlow model currently consumes complete trial tensors. This keeps
+    # the legacy data path intact while making the epoch budget step-based.
+    trials_per_epoch = updates_per_epoch
+    rollout_steps = int(rollout_steps or time_steps)
 
     
     ppo_epochs = 3
@@ -358,6 +477,14 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         int(os.environ.get("RETURN_TARGET_ROLLOUTS", "8")),
         1
     )
+    return_target_mode = os.environ.get("EXPANSION_RETURN_TARGET", "lambda").strip().lower()
+    use_lambda_return = return_target_mode not in ("mc", "monte_carlo", "montecarlo", "sampled")
+    lambda_return = float(os.environ.get("EXPANSION_LAMBDA_RETURN", "0.95"))
+    target_critic_update_interval = max(
+        int(os.environ.get("TARGET_CRITIC_UPDATE_INTERVAL", "100")),
+        0
+    )
+    target_critic_tau = float(os.environ.get("TARGET_CRITIC_TAU", "1.0"))
 
     # --- REVERTED: Standard Cosine Decay with Warmup ---
     total_steps = epochs * trials_per_epoch * ppo_epochs
@@ -393,6 +520,8 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
     # We pass a dummy input to build the model's graph and variables
     dummy_input = tf.zeros((1, time_steps, 1), dtype=tf.float32)
     _ = model(dummy_input, training=False)
+    if use_lambda_return:
+        model.sync_target_critic()
     
     all_trainables = (
         model.encoder.trainable_variables +
@@ -431,9 +560,27 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             return f"m{abs(value)}"
         return "z0"
 
+    best_path_loss_values = [-4, 4]
+    best_path_loss_names = [
+        'total_loss',
+        'kl_loss',
+        'action_loss',
+        'reconstruction_loss',
+        'expansion_loss',
+        'lstm_probe_loss',
+    ]
+
     history = {
         'epoch': [], 'learning_rate': [], 'expansion_epsilon': [],
         'return_target_rollouts': [],
+        'steps_per_epoch': [],
+        'steps_per_batch': [],
+        'updates_per_epoch': [],
+        'rollout_steps': [],
+        'expansion_return_target_mode': [],
+        'expansion_lambda_return': [],
+        'target_critic_update_interval': [],
+        'target_critic_tau': [],
         'forced_continue_epsilon': [],
         'expansion_entropy_coef': [],
         'total_loss': [], 'kl_loss': [], 'action_loss': [], 'reconstruction_loss': [],
@@ -461,6 +608,11 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         history[f'lstm_probe_acc_reward_{label}'] = []
         history[f'lstm_probe_loss_reward_{label}'] = []
         history[f'lstm_probe_n_reward_{label}'] = []
+    for reward_value in best_path_loss_values:
+        label = probe_reward_label(reward_value)
+        history[f'best_path_so_far_n_{label}'] = []
+        for loss_name in best_path_loss_names:
+            history[f'{loss_name}_when_best_path_so_far_{label}'] = []
     for decision_step in range(2, time_steps + 1):
         for reward_value in probe_reward_values:
             label = probe_reward_label(reward_value)
@@ -471,6 +623,22 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             history[f'exp_terminal_best_post_t{decision_step}_after_reward_{label}'] = []
             history[f'exp_return_target_t{decision_step}_after_reward_{label}'] = []
             history[f'exp_advantage_t{decision_step}_after_reward_{label}'] = []
+            history[f'exp_continue_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_continue_n_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_critic_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_terminal_best_pre_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_terminal_best_post_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_return_target_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_advantage_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_kl_d_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_kl_d_n_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_q_stop_max_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_q_observe_max_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_q_stop_minus_observe_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_policy_stop_prob_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_policy_observe_prob_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_q_argmax_stop_t{decision_step}_after_best_path_value_{label}'] = []
+            history[f'exp_policy_argmax_stop_t{decision_step}_after_best_path_value_{label}'] = []
     for observation_step in range(1, time_steps + 1):
         for reward_value in probe_reward_values:
             label = probe_reward_label(reward_value)
@@ -497,9 +665,9 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         expansion_epsilon_start = 0.0
         expansion_epsilon_end = 0.0
         expansion_epsilon_annealing_epochs = 0
-        expansion_entropy_start = 1.0
-        expansion_entropy_end = 0.0
-        expansion_entropy_annealing_epochs = 70
+        expansion_entropy_start = 1.5
+        expansion_entropy_end = 0.01
+        expansion_entropy_annealing_epochs = 80
         expansion_entropy_hold_epochs = 90
         forced_continue_start = 0.0
         forced_continue_end = 0.0
@@ -515,6 +683,7 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         forced_continue_start = 0.0
         forced_continue_end = 0.0
         forced_continue_annealing_epochs = 0
+    next_target_critic_update = target_critic_update_interval
     # ------------------------------------------------------------------
     # TRAINING LOOP
     # ------------------------------------------------------------------
@@ -526,6 +695,17 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         ep_lstm_probe_acc_weighted = tf.zeros([model.num_categories], dtype=tf.float32)
         ep_lstm_probe_loss_weighted = tf.zeros([model.num_categories], dtype=tf.float32)
         ep_lstm_probe_counts = tf.zeros([model.num_categories], dtype=tf.float32)
+        ep_best_path_loss_counts = {
+            reward_value: tf.constant(0.0, dtype=tf.float32)
+            for reward_value in best_path_loss_values
+        }
+        ep_best_path_loss_sums = {
+            reward_value: {
+                loss_name: tf.constant(0.0, dtype=tf.float32)
+                for loss_name in best_path_loss_names
+            }
+            for reward_value in best_path_loss_values
+        }
         ep_continue_after_reward_sums = tf.zeros(
             [model.time_steps, model.num_categories],
             dtype=tf.float32
@@ -579,6 +759,66 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             dtype=tf.float32
         )
         ep_kl_d_after_previous_reward_counts = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_continue_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_continue_after_best_path_value_counts = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_critic_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_terminal_best_pre_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_terminal_best_post_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_return_target_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_advantage_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_kl_d_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_q_stop_max_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_q_observe_max_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_q_stop_minus_observe_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_policy_stop_prob_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_policy_observe_prob_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_q_argmax_stop_after_best_path_value_sums = tf.zeros(
+            [model.time_steps, model.num_categories],
+            dtype=tf.float32
+        )
+        ep_policy_argmax_stop_after_best_path_value_sums = tf.zeros(
             [model.time_steps, model.num_categories],
             dtype=tf.float32
         )
@@ -676,7 +916,24 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
              kl_d_after_observed_reward_sums,
              kl_d_after_observed_reward_counts,
              kl_d_after_previous_reward_sums,
-             kl_d_after_previous_reward_counts) = train_step(
+             kl_d_after_previous_reward_counts,
+             continue_after_best_path_value_sums,
+             continue_after_best_path_value_counts,
+             critic_after_best_path_value_sums,
+             terminal_best_prob_pre_after_best_path_value_sums,
+             terminal_best_prob_post_after_best_path_value_sums,
+             return_target_after_best_path_value_sums,
+             advantage_after_best_path_value_sums,
+             kl_d_after_best_path_value_sums,
+             q_stop_max_after_best_path_value_sums,
+             q_observe_max_after_best_path_value_sums,
+             q_stop_minus_observe_after_best_path_value_sums,
+             policy_stop_prob_after_best_path_value_sums,
+             policy_observe_prob_after_best_path_value_sums,
+             q_argmax_stop_after_best_path_value_sums,
+             policy_argmax_stop_after_best_path_value_sums,
+             best_path_so_far_m4_count,
+             best_path_so_far_p4_count) = train_step(
                 model=model, 
                 optimizer=optimizer,
                 current_alpha=tf.constant(current_alpha, dtype=tf.float32),
@@ -688,8 +945,16 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 input_data=batch_input_data,
                 input_type_str=input_type,
                 ppo_epochs=ppo_epochs,
-                return_target_rollouts=return_target_rollouts
+                return_target_rollouts=return_target_rollouts,
+                use_lambda_return=use_lambda_return,
+                lambda_return=tf.constant(lambda_return, dtype=tf.float32)
             )
+            if use_lambda_return and target_critic_update_interval > 0:
+                optimizer_step = int(base_opt.iterations.numpy())
+                if optimizer_step >= next_target_critic_update:
+                    model.update_target_critic(tau=target_critic_tau)
+                    while next_target_critic_update <= optimizer_step:
+                        next_target_critic_update += target_critic_update_interval
             
             # Accumulate metrics
             ep_total_loss += loss
@@ -701,6 +966,21 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             ep_continue_rate += continue_rate
             ep_lstm_probe_loss += lstm_probe_loss
             ep_lstm_probe_acc += lstm_probe_acc
+            batch_loss_values = {
+                'total_loss': loss,
+                'kl_loss': kl,
+                'action_loss': act,
+                'reconstruction_loss': rec,
+                'expansion_loss': exp_loss,
+                'lstm_probe_loss': lstm_probe_loss,
+            }
+            for reward_value, count in [
+                (-4, best_path_so_far_m4_count),
+                (4, best_path_so_far_p4_count),
+            ]:
+                ep_best_path_loss_counts[reward_value] += count
+                for loss_name, loss_value in batch_loss_values.items():
+                    ep_best_path_loss_sums[reward_value][loss_name] += loss_value * count
             finite_probe_acc = tf.where(
                 tf.math.is_finite(lstm_probe_acc_by_category),
                 lstm_probe_acc_by_category,
@@ -728,6 +1008,21 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             ep_kl_d_after_observed_reward_counts += kl_d_after_observed_reward_counts
             ep_kl_d_after_previous_reward_sums += kl_d_after_previous_reward_sums
             ep_kl_d_after_previous_reward_counts += kl_d_after_previous_reward_counts
+            ep_continue_after_best_path_value_sums += continue_after_best_path_value_sums
+            ep_continue_after_best_path_value_counts += continue_after_best_path_value_counts
+            ep_critic_after_best_path_value_sums += critic_after_best_path_value_sums
+            ep_terminal_best_pre_after_best_path_value_sums += terminal_best_prob_pre_after_best_path_value_sums
+            ep_terminal_best_post_after_best_path_value_sums += terminal_best_prob_post_after_best_path_value_sums
+            ep_return_target_after_best_path_value_sums += return_target_after_best_path_value_sums
+            ep_advantage_after_best_path_value_sums += advantage_after_best_path_value_sums
+            ep_kl_d_after_best_path_value_sums += kl_d_after_best_path_value_sums
+            ep_q_stop_max_after_best_path_value_sums += q_stop_max_after_best_path_value_sums
+            ep_q_observe_max_after_best_path_value_sums += q_observe_max_after_best_path_value_sums
+            ep_q_stop_minus_observe_after_best_path_value_sums += q_stop_minus_observe_after_best_path_value_sums
+            ep_policy_stop_prob_after_best_path_value_sums += policy_stop_prob_after_best_path_value_sums
+            ep_policy_observe_prob_after_best_path_value_sums += policy_observe_prob_after_best_path_value_sums
+            ep_q_argmax_stop_after_best_path_value_sums += q_argmax_stop_after_best_path_value_sums
+            ep_policy_argmax_stop_after_best_path_value_sums += policy_argmax_stop_after_best_path_value_sums
             
             ep_kl_gn_enc += kl_gn_enc
             ep_kl_gn_lstm += kl_gn_lstm
@@ -781,6 +1076,18 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
         history['learning_rate'].append(current_lr)
         history['expansion_epsilon'].append(current_expansion_epsilon)
         history['return_target_rollouts'].append(return_target_rollouts)
+        history['steps_per_epoch'].append(steps_per_epoch)
+        history['steps_per_batch'].append(steps_per_batch)
+        history['updates_per_epoch'].append(updates_per_epoch)
+        history['rollout_steps'].append(rollout_steps)
+        history['expansion_return_target_mode'].append(
+            "lambda" if use_lambda_return else "monte_carlo"
+        )
+        history['expansion_lambda_return'].append(lambda_return if use_lambda_return else float("nan"))
+        history['target_critic_update_interval'].append(
+            target_critic_update_interval if use_lambda_return else 0
+        )
+        history['target_critic_tau'].append(target_critic_tau if use_lambda_return else float("nan"))
         history['forced_continue_epsilon'].append(current_forced_continue_epsilon)
         history['expansion_entropy_coef'].append(current_expansion_entropy_coef)
         history['total_loss'].append((ep_total_loss / trials_per_epoch).numpy())
@@ -852,6 +1159,17 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
             history[f'lstm_probe_acc_reward_{label}'].append(probe_acc_epoch[idx].numpy())
             history[f'lstm_probe_loss_reward_{label}'].append(probe_loss_epoch[idx].numpy())
             history[f'lstm_probe_n_reward_{label}'].append(ep_lstm_probe_counts[idx].numpy())
+        for reward_value in best_path_loss_values:
+            label = probe_reward_label(reward_value)
+            count = ep_best_path_loss_counts[reward_value]
+            history[f'best_path_so_far_n_{label}'].append(count.numpy())
+            for loss_name in best_path_loss_names:
+                value = tf.where(
+                    count > 0.0,
+                    ep_best_path_loss_sums[reward_value][loss_name] / (count + 1e-6),
+                    tf.constant(float("nan"), dtype=tf.float32)
+                )
+                history[f'{loss_name}_when_best_path_so_far_{label}'].append(value.numpy())
 
         continue_after_reward_epoch = tf.where(
             ep_continue_after_reward_counts > 0.0,
@@ -925,6 +1243,97 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 tf.constant(float("nan"), dtype=tf.float32)
             )
         )
+        continue_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_continue_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        critic_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_critic_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        terminal_best_pre_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_terminal_best_pre_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        terminal_best_post_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_terminal_best_post_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        return_target_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_return_target_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        advantage_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_advantage_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        kl_d_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_kl_d_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill(
+                [model.time_steps, model.num_categories],
+                tf.constant(float("nan"), dtype=tf.float32)
+            )
+        )
+        q_stop_max_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_q_stop_max_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
+        q_observe_max_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_q_observe_max_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
+        q_stop_minus_observe_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_q_stop_minus_observe_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
+        policy_stop_prob_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_policy_stop_prob_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
+        policy_observe_prob_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_policy_observe_prob_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
+        q_argmax_stop_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_q_argmax_stop_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
+        policy_argmax_stop_after_best_path_value_epoch = tf.where(
+            ep_continue_after_best_path_value_counts > 0.0,
+            ep_policy_argmax_stop_after_best_path_value_sums / (ep_continue_after_best_path_value_counts + 1e-6),
+            tf.fill([model.time_steps, model.num_categories], tf.constant(float("nan"), dtype=tf.float32))
+        )
         for decision_step in range(2, time_steps + 1):
             step_idx = decision_step - 1
             for idx, reward_value in enumerate(probe_reward_values):
@@ -949,6 +1358,54 @@ def train_model(model, epochs, trials_per_epoch, batch_size, time_steps, input_t
                 )
                 history[f'exp_advantage_t{decision_step}_after_reward_{label}'].append(
                     advantage_after_reward_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_continue_t{decision_step}_after_best_path_value_{label}'].append(
+                    continue_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_continue_n_t{decision_step}_after_best_path_value_{label}'].append(
+                    ep_continue_after_best_path_value_counts[step_idx, idx].numpy()
+                )
+                history[f'exp_critic_t{decision_step}_after_best_path_value_{label}'].append(
+                    critic_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_terminal_best_pre_t{decision_step}_after_best_path_value_{label}'].append(
+                    terminal_best_pre_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_terminal_best_post_t{decision_step}_after_best_path_value_{label}'].append(
+                    terminal_best_post_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_return_target_t{decision_step}_after_best_path_value_{label}'].append(
+                    return_target_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_advantage_t{decision_step}_after_best_path_value_{label}'].append(
+                    advantage_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_kl_d_t{decision_step}_after_best_path_value_{label}'].append(
+                    kl_d_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_kl_d_n_t{decision_step}_after_best_path_value_{label}'].append(
+                    ep_continue_after_best_path_value_counts[step_idx, idx].numpy()
+                )
+                history[f'exp_q_stop_max_t{decision_step}_after_best_path_value_{label}'].append(
+                    q_stop_max_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_q_observe_max_t{decision_step}_after_best_path_value_{label}'].append(
+                    q_observe_max_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_q_stop_minus_observe_t{decision_step}_after_best_path_value_{label}'].append(
+                    q_stop_minus_observe_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_policy_stop_prob_t{decision_step}_after_best_path_value_{label}'].append(
+                    policy_stop_prob_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_policy_observe_prob_t{decision_step}_after_best_path_value_{label}'].append(
+                    policy_observe_prob_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_q_argmax_stop_t{decision_step}_after_best_path_value_{label}'].append(
+                    q_argmax_stop_after_best_path_value_epoch[step_idx, idx].numpy()
+                )
+                history[f'exp_policy_argmax_stop_t{decision_step}_after_best_path_value_{label}'].append(
+                    policy_argmax_stop_after_best_path_value_epoch[step_idx, idx].numpy()
                 )
         for observation_step in range(1, time_steps + 1):
             step_idx = observation_step - 1

@@ -60,6 +60,10 @@ def model_variant_label(variant):
     return f"variant_{variant}_"
 
 
+def architecture_file_label(config):
+    return f"rnn_{config.rnn_units}_latent_{config.latent_dim}"
+
+
 def model_name_for(config, lambda_, alpha, beta, opportunity_cost):
     variant_label = model_variant_label(config.model_variant)
     tree_label = f"{config.tree_size}n{getattr(config, 'tree_name_suffix', '')}"
@@ -67,7 +71,7 @@ def model_name_for(config, lambda_, alpha, beta, opportunity_cost):
         f"lambda_{lambda_}_alpha_{alpha}_beta_{beta}_opportunity_{opportunity_cost}_"
         f"expansion_{config.expansion_decision_version}_"
         f"{variant_label}"
-        f"seed_{config.seed}_{tree_label}"
+        f"seed_{config.seed}_{tree_label}_{architecture_file_label(config)}"
     )
 
 
@@ -586,6 +590,8 @@ def run_simulation(config):
 
                     dummy_input = tf.zeros((1, config.time_steps, 1), dtype=tf.float32)
                     _ = vrnn_model(dummy_input, training=False)
+                    if hasattr(vrnn_model, "build_target_critic"):
+                        vrnn_model.build_target_critic()
 
                     try:
                         vrnn_model.load_weights(weights_file_path)

@@ -8,6 +8,7 @@ import os
 import sys
 import random
 import itertools
+import math
 import numpy as np
 import tensorflow as tf
 
@@ -44,10 +45,21 @@ try:
     opportunity_cost_values = [float(x) for x in opportunity_cost_string.split(',')]
     expansion_decision_version = sys.argv[12] if len(sys.argv) > 12 else "decoder"
     model_variant = sys.argv[13] if len(sys.argv) > 13 else "vae"
+    rnn_units_arg = sys.argv[14] if len(sys.argv) > 14 else "64"
+    latent_dim_arg = sys.argv[15] if len(sys.argv) > 15 else "32"
 except IndexError:
     print("Error: Missing command-line arguments.")
-    print("Usage: python main.py <lambda> <alpha> <beta> <dir_name> <epochs> <input_type> <seed> <tree_size> <train/simulate> <tree_type> [opportunity_cost] [expansion_decision_version] [model_variant]")
+    print("Usage: python main.py <lambda> <alpha> <beta> <dir_name> <epochs> <input_type> <seed> <tree_size> <train/simulate> <tree_type> [opportunity_cost] [expansion_decision_version] [model_variant] [rnn_units] [latent_dim]")
     sys.exit(1)
+
+def parse_positive_int(value, name):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer. Got {value!r}.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive. Got {parsed}.")
+    return parsed
 
 def normalize_expansion_decision_version(version):
     aliases = {
@@ -189,16 +201,27 @@ if gpus:
 # ---------------------------------------------------------
 # 4. MODEL HYPERPARAMETERS
 # ---------------------------------------------------------
-latent_dim = 32
-output_dim = 64
+latent_dim = parse_positive_int(latent_dim_arg, "latent_dim")
+rnn_units = parse_positive_int(rnn_units_arg, "rnn_units")
+output_dim = rnn_units
 reward_output_dim = tree_size
-rnn_units = output_dim
 time_steps = reward_output_dim
 input_dim = 1
 num_categories = 9
 
 trials_per_epoch = 200
 batch_size = 200
+steps_per_epoch = int(os.environ.get(
+    "STEPS_PER_EPOCH",
+    str(trials_per_epoch * batch_size * time_steps)
+))
+rollout_steps = int(os.environ.get("ROLLOUT_STEPS", str(time_steps)))
+if steps_per_epoch <= 0:
+    raise ValueError(f"STEPS_PER_EPOCH must be positive. Got {steps_per_epoch}.")
+if rollout_steps <= 0:
+    raise ValueError(f"ROLLOUT_STEPS must be positive. Got {rollout_steps}.")
+updates_per_epoch = max(1, math.ceil(steps_per_epoch / (batch_size * time_steps)))
+trials_per_epoch = updates_per_epoch
 kl_scaler = 5
 # ---------------------------------------------------------
 # 5. DECISION TREE SETUP

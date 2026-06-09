@@ -6,6 +6,7 @@ Contains the neural network architecture, custom layers, and the VariationalRNN 
 
 import tensorflow as tf
 from tensorflow.keras import layers, models
+import os
 import helper
 
 
@@ -43,6 +44,27 @@ def build_decoder(latent_dim, output_dim, rnn_units):
     outputs = layers.Dense(output_dim, activation='linear')(x)
     model = models.Model(latent_inputs, outputs, name='decoder')
     return model
+
+def build_critic_head(rnn_units, output_dim=1, name='critic_head'):
+    return tf.keras.Sequential([
+        tf.keras.layers.Dense(
+            rnn_units,
+            activation=None,
+            kernel_initializer='glorot_uniform'
+        ),
+        tf.keras.layers.LayerNormalization(),
+        tf.keras.layers.Activation('relu'),
+        tf.keras.layers.Dense(
+            max(rnn_units // 2, 16),
+            activation='relu',
+            kernel_initializer='glorot_uniform'
+        ),
+        tf.keras.layers.Dense(
+            output_dim,
+            activation=None,
+            kernel_initializer='glorot_uniform'
+        )
+    ], name=name)
 
 class VariationalRNN(tf.keras.Model):
     def __init__(self, encoder, decoder, rnn_units, latent_dim, time_steps, num_paths, 
@@ -100,6 +122,10 @@ class VariationalRNN(tf.keras.Model):
         self.path_map = path_map
         self.path_cov_mat = path_cov_mat
         self.joint_decision_dim = time_steps + num_paths
+        self.belief_rollout_samples = max(
+            int(os.environ.get("BELIEF_ROLLOUT_SAMPLES", "8")),
+            1
+        )
         # The decoder-policy condition cannot make a meaningful no-information
         # terminal decision: stopping before the first observation lets it avoid
         # the VAE bottleneck entirely. Keep that shortcut illegal only there.
@@ -119,31 +145,52 @@ class VariationalRNN(tf.keras.Model):
             initializer="zeros", 
             trainable=True  
         )
-        self.critic_head = tf.keras.Sequential([
-            tf.keras.layers.Dense(
+        self.critic_head = build_critic_head(
+            self.rnn_units,
+            output_dim=self.joint_decision_dim,
+            name='critic_head'
+        )
+        self.target_critic_head = self._no_dependency(
+            build_critic_head(
                 self.rnn_units,
-                activation=None,
-                kernel_initializer='glorot_uniform'
-            ),
-            tf.keras.layers.LayerNormalization(),
-            tf.keras.layers.Activation('relu'),
-            tf.keras.layers.Dense(
-                max(self.rnn_units // 2, 16),
-                activation='relu',
-                kernel_initializer='glorot_uniform'
-            ),
-            tf.keras.layers.Dense(
-                1,
-                activation=None,
-                kernel_initializer='glorot_uniform'
+                output_dim=self.joint_decision_dim,
+                name='target_critic_head'
             )
-        ], name='critic_head')
+        )
+        self.target_critic_head.trainable = False
         self.lstm_reward_probe_head = tf.keras.layers.Dense(
             self.num_categories,
             activation=None,
             kernel_initializer='glorot_uniform',
             name='lstm_reward_probe_head'
         )
+
+    def _build_target_critic_if_needed(self):
+        if self.target_critic_head.built:
+            return
+        if not self.critic_head.built or len(self.critic_head.weights) == 0:
+            return
+        input_dim = int(self.critic_head.weights[0].shape[0])
+        _ = self.target_critic_head(tf.zeros([1, input_dim], dtype=tf.float32))
+
+    def sync_target_critic(self):
+        self._build_target_critic_if_needed()
+        if self.target_critic_head.built:
+            self.target_critic_head.set_weights(self.critic_head.get_weights())
+
+    def build_target_critic(self):
+        self._build_target_critic_if_needed()
+
+    def update_target_critic(self, tau=1.0):
+        self._build_target_critic_if_needed()
+        if not self.target_critic_head.built:
+            return
+        tau = tf.cast(tau, tf.float32)
+        for target_var, source_var in zip(
+            self.target_critic_head.weights,
+            self.critic_head.weights
+        ):
+            target_var.assign(tau * source_var + (1.0 - tau) * target_var)
 
     def normalize_expansion_decision_version(self, version):
         version = str(version).strip().lower()
@@ -178,6 +225,11 @@ class VariationalRNN(tf.keras.Model):
             return 5.11
         return 8.1574
 
+    def reward_support(self):
+        if self.input_type == "binary":
+            return tf.constant([0.0, 1.0], dtype=tf.float32)
+        return tf.constant([-4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0], dtype=tf.float32)
+
     def call(
         self,
         inputs,
@@ -192,7 +244,11 @@ class VariationalRNN(tf.keras.Model):
         ppo_clip=0.2,
         expansion_epsilon=0.0,
         expansion_entropy_coef=0.01,
-        forced_continue_epsilon=0.0
+        forced_continue_epsilon=0.0,
+        return_analysis_tensors=False,
+        analysis_use_posterior_mean=False,
+        use_lambda_return=False,
+        lambda_return=0.95
     ):
         batch_size = tf.shape(inputs)[0]
 
@@ -214,16 +270,21 @@ class VariationalRNN(tf.keras.Model):
 
         all_z_means = []
         all_z_log_vars = []
+        all_prior_means = []
+        all_prior_log_vars = []
         all_category_outputs = []
         all_observed_masks = []
         all_expansion_log_probs = []
+        all_expansion_probs = []
         all_expansion_entropies = []
         all_expansion_entropy_masks = []
+        all_legal_action_masks = []
         all_action_outputs = []
         all_node_selections = []
         all_stop_decisions = []
         all_terminal_path_selections = []
         all_stop_value_preds = []
+        all_target_stop_value_preds = []
         all_kl_d = []
         all_observation_kl_d = []
         all_lstm_states = []
@@ -271,6 +332,10 @@ class VariationalRNN(tf.keras.Model):
             else:
                 expansion_input = pre_lstm_expansion_context
             all_stop_value_preds.append(self.critic_head(expansion_input))
+            if use_lambda_return:
+                all_target_stop_value_preds.append(
+                    tf.stop_gradient(self.target_critic_head(expansion_input))
+                )
 
             expansion_logits = self.expansion_head(expansion_input)
             # Joint action order: observe nodes first, then terminal path choices.
@@ -286,6 +351,8 @@ class VariationalRNN(tf.keras.Model):
                 (1.0 - can_stop) * tf.ones([batch_size, self.num_paths], dtype=tf.float32)
             )
             decision_mask = tf.concat([visited_node_mask, terminal_action_mask], axis=1)
+            legal_action_mask = (1.0 - decision_mask) * active_mask
+            all_legal_action_masks.append(legal_action_mask)
             masked_expansion_logits = expansion_logits + (decision_mask * -1e9)
             masked_expansion_logits = tf.where(
                 tf.math.is_finite(masked_expansion_logits),
@@ -382,6 +449,7 @@ class VariationalRNN(tf.keras.Model):
                 tf.stack([tf.range(batch_size, dtype=tf.int32), next_node_indices], axis=1)
             )
             expansion_probs = tf.nn.softmax(masked_expansion_logits, axis=-1)
+            all_expansion_probs.append(expansion_probs)
             expansion_entropy = -tf.reduce_sum(
                 expansion_probs * tf.math.log(expansion_probs + 1e-8),
                 axis=-1
@@ -464,7 +532,7 @@ class VariationalRNN(tf.keras.Model):
             if self.use_autoencoder:
                 z_mean, z_log_var, z_sampled = self.encoder(encoder_input)
 
-                z = z_sampled
+                z = z_mean if analysis_use_posterior_mean else z_sampled
                 all_z_means.append(z_mean)
                 all_z_log_vars.append(z_log_var)
 
@@ -542,6 +610,9 @@ class VariationalRNN(tf.keras.Model):
 
             if self.use_autoencoder:
                 prior_mean, prior_var = self.compute_time_conditional_prior(t, batch_size)
+                prior_log_var = tf.math.log(prior_var + 1e-6)
+                all_prior_means.append(prior_mean)
+                all_prior_log_vars.append(prior_log_var)
                 kl_per_sample = self.calculate_kl_per_sample(z_mean, z_log_var, prior_mean, prior_var)
                 observe_mask = tf.squeeze(observe_active_mask, axis=-1)
                 observed_kl_per_sample = kl_per_sample * observe_mask
@@ -556,6 +627,8 @@ class VariationalRNN(tf.keras.Model):
             else:
                 masked_kl_per_sample = tf.zeros([batch_size], dtype=tf.float32)
                 observed_kl_per_sample = tf.zeros([batch_size], dtype=tf.float32)
+                all_prior_means.append(tf.zeros([batch_size, self.latent_dim], dtype=tf.float32))
+                all_prior_log_vars.append(tf.zeros([batch_size, self.latent_dim], dtype=tf.float32))
                 kl = tf.constant(0.0, dtype=tf.float32)
             all_kl_d.append(tf.expand_dims(masked_kl_per_sample, axis=-1))
             all_observation_kl_d.append(tf.expand_dims(observed_kl_per_sample, axis=-1))
@@ -568,12 +641,16 @@ class VariationalRNN(tf.keras.Model):
 
         all_z_means = tf.stack(all_z_means, axis=1)
         all_z_log_vars = tf.stack(all_z_log_vars, axis=1)
+        prior_mean_sequence = tf.stack(all_prior_means, axis=1)
+        prior_log_var_sequence = tf.stack(all_prior_log_vars, axis=1)
         observed_masks = tf.stack(all_observed_masks, axis=1)
         action_outputs_sequence = tf.stack(all_action_outputs, axis=1)
+        expansion_probs_sequence = tf.stack(all_expansion_probs, axis=1)
         node_selections = tf.stack(all_node_selections, axis=1)
         terminal_path_selections = tf.stack(all_terminal_path_selections, axis=1)
         stop_decisions = tf.stack(all_stop_decisions, axis=1)
         stop_value_preds = tf.stack(all_stop_value_preds, axis=1)
+        legal_action_masks = tf.stack(all_legal_action_masks, axis=1)
         kl_d_sequence = tf.stack(all_kl_d, axis=1)
         observation_kl_d_sequence = tf.stack(all_observation_kl_d, axis=1)
         lstm_state_sequence = tf.stack(all_lstm_states, axis=1)
@@ -657,8 +734,40 @@ class VariationalRNN(tf.keras.Model):
         else:
             reconstruction_loss = tf.constant(0.0, dtype=tf.float32)
         expansion_log_probs = tf.stack(all_expansion_log_probs, axis=1)
-        # Dreamer-style reward-to-go for each sampled observe/stop decision:
-        # terminal choice value minus future opportunity and information costs.
+        zero_observed_mask = tf.zeros_like(observed_masks[:, :1, :])
+        observed_before_decision_masks = tf.concat(
+            [zero_observed_mask, observed_masks[:, :-1, :]],
+            axis=1
+        )
+        # Multi-step return target for sampled joint actions. For lambda-return
+        # mode, bootstrap with the target critic averaged under the current
+        # legal policy, so observe actions are valued through future continuation
+        # without introducing max-Q overestimation.
+        target_stop_value_preds = (
+            tf.stack(all_target_stop_value_preds, axis=1)
+            if use_lambda_return and len(all_target_stop_value_preds) > 0
+            else None
+        )
+        target_state_value_preds = (
+            tf.reduce_sum(
+                target_stop_value_preds
+                * (
+                    expansion_probs_sequence * legal_action_masks
+                    / (
+                        tf.reduce_sum(
+                            expansion_probs_sequence * legal_action_masks,
+                            axis=-1,
+                            keepdims=True
+                        )
+                        + 1e-6
+                    )
+                ),
+                axis=-1,
+                keepdims=True
+            )
+            if target_stop_value_preds is not None
+            else None
+        )
         expansion_return_targets = self.compute_expansion_return_targets(
             inputs,
             action_outputs_sequence,
@@ -666,22 +775,52 @@ class VariationalRNN(tf.keras.Model):
             valid_step_masks,
             stop_decisions,
             kl_d_sequence,
-            current_beta
+            current_beta,
+            target_stop_value_preds=target_state_value_preds,
+            use_lambda_return=use_lambda_return,
+            lambda_return=lambda_return
         )
+        joint_q_targets, joint_q_target_masks = self.build_joint_action_q_targets(
+            inputs,
+            node_selections,
+            legal_action_masks,
+            expansion_return_targets,
+            valid_step_masks,
+            observed_before_decision_masks,
+            kl_d_sequence,
+            current_beta,
+        )
+        selected_action_indices = tf.stack(
+            [
+                tf.tile(tf.range(batch_size, dtype=tf.int32)[:, None], [1, self.time_steps]),
+                tf.tile(tf.range(self.time_steps, dtype=tf.int32)[None, :], [batch_size, 1]),
+                node_selections,
+            ],
+            axis=-1
+        )
+        selected_q_targets = tf.gather_nd(joint_q_targets, selected_action_indices)
+        selected_q_targets = tf.expand_dims(selected_q_targets, axis=-1)
         critic_loss = self.compute_expansion_critic_loss(
             stop_value_preds,
-            expansion_return_targets,
-            valid_step_masks
+            joint_q_targets,
+            joint_q_target_masks
         )
-        value_pred = stop_value_preds
-        value_target = expansion_return_targets
+        selected_q_preds = tf.gather_nd(stop_value_preds, selected_action_indices)
+        selected_q_preds = tf.expand_dims(selected_q_preds, axis=-1)
+        policy_value_preds = tf.reduce_sum(
+            expansion_probs_sequence * stop_value_preds,
+            axis=-1,
+            keepdims=True
+        )
+        value_pred = selected_q_preds
+        value_target = selected_q_targets
         diagnostic_reward_counts = tf.reduce_sum(previous_reward_masks, axis=1)
         stop_value_preds_t = tf.transpose(
-            tf.squeeze(stop_value_preds, axis=-1),
+            tf.squeeze(selected_q_preds, axis=-1),
             perm=[1, 0]
         )
         return_targets_t = tf.transpose(
-            tf.squeeze(expansion_return_targets, axis=-1),
+            tf.squeeze(selected_q_targets, axis=-1),
             perm=[1, 0]
         )
         advantages_t = return_targets_t - stop_value_preds_t
@@ -705,13 +844,156 @@ class VariationalRNN(tf.keras.Model):
             previous_reward_masks * advantages_t[:, :, None],
             axis=1
         )
+        observed_rewards_before_decision = (
+            tf.squeeze(inputs, axis=-1)[:, None, :]
+            * tf.cast(observed_before_decision_masks, tf.float32)
+        )
+        current_path_values_before_decision = tf.einsum(
+            "btn,pn->btp",
+            observed_rewards_before_decision,
+            tf.cast(self.path_map, tf.float32)
+        )
+        path_observed_counts_before_decision = tf.einsum(
+            "btn,pn->btp",
+            tf.cast(observed_before_decision_masks, tf.float32),
+            tf.cast(self.path_map, tf.float32)
+        )
+        any_observed_path_before_decision = tf.reduce_any(
+            path_observed_counts_before_decision > 0.0,
+            axis=-1
+        )
+        current_path_values_before_decision = tf.where(
+            path_observed_counts_before_decision > 0.0,
+            current_path_values_before_decision,
+            tf.fill(tf.shape(current_path_values_before_decision), -1e9)
+        )
+        current_best_path_values_before_decision = tf.reduce_max(
+            current_path_values_before_decision,
+            axis=-1
+        )
+        current_best_path_values_before_decision = tf.where(
+            any_observed_path_before_decision,
+            current_best_path_values_before_decision,
+            tf.zeros_like(current_best_path_values_before_decision)
+        )
+        best_path_value_onehot = helper.scalar_to_categorical(
+            current_best_path_values_before_decision,
+            self.num_categories
+        )
+        reduced_state_policy_weights = self.compute_reduced_state_frequency_weights(
+            observed_before_decision_masks,
+            current_best_path_values_before_decision,
+            valid_step_masks
+        )
+        best_path_value_masks = (
+            tf.transpose(best_path_value_onehot, perm=[1, 0, 2])
+            * tf.transpose(tf.cast(valid_step_masks, tf.float32), perm=[1, 0, 2])
+        )
+        continue_decisions_t = tf.transpose(
+            tf.squeeze(
+                valid_step_masks * (1.0 - tf.cast(stop_decisions, tf.float32)),
+                axis=-1
+            ),
+            perm=[1, 0]
+        )
+        continue_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * continue_decisions_t[:, :, None],
+            axis=1
+        )
+        best_path_value_counts = tf.reduce_sum(best_path_value_masks, axis=1)
+        critic_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * stop_value_preds_t[:, :, None],
+            axis=1
+        )
+        terminal_best_prob_pre_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * terminal_best_prob_pre[:, :, None],
+            axis=1
+        )
+        terminal_best_prob_post_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * terminal_best_prob_post[:, :, None],
+            axis=1
+        )
+        return_target_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * return_targets_t[:, :, None],
+            axis=1
+        )
+        advantage_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * advantages_t[:, :, None],
+            axis=1
+        )
+        paid_kl_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * paid_kl_t[:, :, None],
+            axis=1
+        )
+        q_values_t = tf.transpose(stop_value_preds, perm=[1, 0, 2])
+        policy_probs_t = tf.transpose(expansion_probs_sequence, perm=[1, 0, 2])
+        legal_actions_t = tf.transpose(legal_action_masks, perm=[1, 0, 2])
+        legal_observe_t = legal_actions_t[:, :, :self.time_steps]
+        legal_stop_t = legal_actions_t[:, :, self.time_steps:self.joint_decision_dim]
+        q_observe_t = q_values_t[:, :, :self.time_steps]
+        q_stop_t = q_values_t[:, :, self.time_steps:self.joint_decision_dim]
+        policy_observe_t = policy_probs_t[:, :, :self.time_steps]
+        policy_stop_t = policy_probs_t[:, :, self.time_steps:self.joint_decision_dim]
+        has_legal_observe_t = tf.reduce_any(legal_observe_t > 0.0, axis=-1)
+        has_legal_stop_t = tf.reduce_any(legal_stop_t > 0.0, axis=-1)
+        q_observe_max_t = tf.reduce_max(
+            tf.where(legal_observe_t > 0.0, q_observe_t, tf.fill(tf.shape(q_observe_t), -1e9)),
+            axis=-1
+        )
+        q_stop_max_t = tf.reduce_max(
+            tf.where(legal_stop_t > 0.0, q_stop_t, tf.fill(tf.shape(q_stop_t), -1e9)),
+            axis=-1
+        )
+        q_observe_max_t = tf.where(has_legal_observe_t, q_observe_max_t, tf.zeros_like(q_observe_max_t))
+        q_stop_max_t = tf.where(has_legal_stop_t, q_stop_max_t, tf.zeros_like(q_stop_max_t))
+        policy_observe_prob_t = tf.reduce_sum(policy_observe_t * legal_observe_t, axis=-1)
+        policy_stop_prob_t = tf.reduce_sum(policy_stop_t * legal_stop_t, axis=-1)
+        q_argmax_action_t = tf.argmax(
+            tf.where(legal_actions_t > 0.0, q_values_t, tf.fill(tf.shape(q_values_t), -1e9)),
+            axis=-1,
+            output_type=tf.int32
+        )
+        policy_argmax_action_t = tf.argmax(policy_probs_t, axis=-1, output_type=tf.int32)
+        q_argmax_stop_t = tf.cast(q_argmax_action_t >= self.time_steps, tf.float32)
+        policy_argmax_stop_t = tf.cast(policy_argmax_action_t >= self.time_steps, tf.float32)
+        q_stop_minus_observe_t = q_stop_max_t - q_observe_max_t
+        q_stop_max_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * q_stop_max_t[:, :, None],
+            axis=1
+        )
+        q_observe_max_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * q_observe_max_t[:, :, None],
+            axis=1
+        )
+        q_stop_minus_observe_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * q_stop_minus_observe_t[:, :, None],
+            axis=1
+        )
+        policy_stop_prob_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * policy_stop_prob_t[:, :, None],
+            axis=1
+        )
+        policy_observe_prob_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * policy_observe_prob_t[:, :, None],
+            axis=1
+        )
+        q_argmax_stop_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * q_argmax_stop_t[:, :, None],
+            axis=1
+        )
+        policy_argmax_stop_after_best_path_value_sums = tf.reduce_sum(
+            best_path_value_masks * policy_argmax_stop_t[:, :, None],
+            axis=1
+        )
         expansion_loss = self.compute_expansion_policy_loss(
             expansion_log_probs,
             tf.stack(all_expansion_entropies, axis=1),
             tf.stack(all_expansion_entropy_masks, axis=1),
             stop_value_preds,
+            policy_value_preds,
             valid_step_masks,
-            expansion_return_targets,
+            selected_q_targets,
+            sample_weights=reduced_state_policy_weights,
             old_log_probs=old_expansion_log_probs,
             use_ppo_loss=use_ppo_loss,
             ppo_clip=ppo_clip,
@@ -770,7 +1052,7 @@ class VariationalRNN(tf.keras.Model):
 
         category_outputs = tf.stack(all_category_outputs, axis=1)
 
-        return (
+        outputs = (
             category_outputs,
             action_output,
             total_loss,
@@ -816,8 +1098,31 @@ class VariationalRNN(tf.keras.Model):
             paid_kl_after_observed_reward_sums,
             paid_kl_after_observed_reward_counts,
             paid_kl_after_reward_sums,
-            paid_kl_after_reward_counts
+            paid_kl_after_reward_counts,
+            continue_after_best_path_value_sums,
+            best_path_value_counts,
+            critic_after_best_path_value_sums,
+            terminal_best_prob_pre_after_best_path_value_sums,
+            terminal_best_prob_post_after_best_path_value_sums,
+            return_target_after_best_path_value_sums,
+            advantage_after_best_path_value_sums,
+            paid_kl_after_best_path_value_sums,
+            q_stop_max_after_best_path_value_sums,
+            q_observe_max_after_best_path_value_sums,
+            q_stop_minus_observe_after_best_path_value_sums,
+            policy_stop_prob_after_best_path_value_sums,
+            policy_observe_prob_after_best_path_value_sums,
+            q_argmax_stop_after_best_path_value_sums,
+            policy_argmax_stop_after_best_path_value_sums
         )
+
+        if return_analysis_tensors:
+            outputs = outputs + (
+                all_z_log_vars,
+                prior_mean_sequence,
+                prior_log_var_sequence,
+            )
+        return outputs
     def compute_time_conditional_prior(self, t, batch_size):
         mu_t = self.prior_mu[t]           
         logvar_t = tf.clip_by_value(self.prior_logvar[t], -10.0, 10.0)
@@ -937,7 +1242,10 @@ class VariationalRNN(tf.keras.Model):
         valid_step_masks,
         stop_decisions,
         kl_d_sequence,
-        current_beta
+        current_beta,
+        target_stop_value_preds=None,
+        use_lambda_return=False,
+        lambda_return=0.95
     ):
         _, path_rewards = self._prepare_path_rewards(inputs)
 
@@ -978,14 +1286,155 @@ class VariationalRNN(tf.keras.Model):
         mask = tf.cast(valid_step_masks, tf.float32)
         stop_decisions = tf.cast(stop_decisions, tf.float32)
         non_stop_expansion = mask * (1.0 - stop_decisions)
-        step_costs = non_stop_expansion * (
-            self.opportunity_cost + current_beta * kl_d_sequence
+        # The first decision happens before any reward has been observed, so
+        # observing the first item should not incur a time/opportunity cost.
+        # Subsequent non-stop decisions occur after at least one observation.
+        timestep_has_prior_observation = tf.reshape(
+            tf.cast(tf.range(self.time_steps) > 0, tf.float32),
+            [1, self.time_steps, 1]
         )
+        opportunity_cost_sequence = (
+            self.opportunity_cost * timestep_has_prior_observation
+        )
+        step_costs = non_stop_expansion * (
+            opportunity_cost_sequence + current_beta * kl_d_sequence
+        )
+        if use_lambda_return and target_stop_value_preds is not None:
+            lambda_return = tf.clip_by_value(
+                tf.cast(lambda_return, tf.float32),
+                0.0,
+                1.0
+            )
+            target_values = tf.stop_gradient(tf.cast(target_stop_value_preds, tf.float32))
+            terminal_reward = tf.cast(terminal_expected_reward, tf.float32)
+            reversed_targets = []
+            next_lambda_target = terminal_reward
+            for t in reversed(range(self.time_steps)):
+                mask_t = mask[:, t, :]
+                stop_t = stop_decisions[:, t, :]
+                cost_t = step_costs[:, t, :]
+                if t < self.time_steps - 1:
+                    next_bootstrap = (
+                        (1.0 - lambda_return) * target_values[:, t + 1, :]
+                        + lambda_return * next_lambda_target
+                    )
+                else:
+                    next_bootstrap = terminal_reward
+                continue_target = -cost_t + next_bootstrap
+                target_t = tf.where(
+                    stop_t > 0.0,
+                    terminal_reward,
+                    continue_target
+                )
+                target_t = tf.where(mask_t > 0.0, target_t, tf.zeros_like(target_t))
+                reversed_targets.append(target_t)
+                next_lambda_target = target_t
+            return tf.stack(list(reversed(reversed_targets)), axis=1)
+
         future_costs = tf.reverse(
             tf.cumsum(tf.reverse(step_costs, axis=[1]), axis=1),
             axis=[1]
         )
         return terminal_expected_reward[:, None, :] - future_costs
+
+    def build_joint_action_q_targets(
+        self,
+        inputs,
+        node_selections,
+        legal_action_masks,
+        selected_action_return_targets,
+        valid_step_masks,
+        observed_before_decision_masks,
+        kl_d_sequence,
+        current_beta,
+    ):
+        # Build Q targets from the agent's belief state before each decision.
+        # Stop actions use expected path values under the known reward prior.
+        # Observe actions marginalize the reward revealed by that action exactly
+        # for small tasks and by reward-prior samples for larger tasks.
+        observed_mask = tf.cast(observed_before_decision_masks, tf.float32)
+        node_rewards = tf.squeeze(inputs, axis=-1)
+        observed_rewards = node_rewards[:, None, :] * observed_mask
+        path_map = tf.cast(self.path_map, tf.float32)
+        reward_support = self.reward_support()
+        reward_prior_mean = tf.reduce_mean(reward_support)
+        reward_norm = tf.cast(self.reward_norm(), tf.float32)
+
+        belief_node_values = (
+            observed_rewards
+            + (1.0 - observed_mask) * reward_prior_mean
+        )
+        stop_targets = (
+            tf.einsum("btn,pn->btp", belief_node_values, path_map)
+            / reward_norm
+        )
+
+        timestep_has_prior_observation = tf.reshape(
+            tf.cast(tf.range(self.time_steps) > 0, tf.float32),
+            [1, self.time_steps]
+        )
+        observe_costs = (
+            self.opportunity_cost * timestep_has_prior_observation
+            + tf.cast(current_beta, tf.float32) * tf.squeeze(kl_d_sequence, axis=-1)
+        )
+
+        if self.time_steps < 4:
+            rollout_rewards = reward_support
+        else:
+            reward_indices = tf.random.uniform(
+                [self.belief_rollout_samples],
+                minval=0,
+                maxval=tf.shape(reward_support)[0],
+                dtype=tf.int32
+            )
+            rollout_rewards = tf.gather(reward_support, reward_indices)
+
+        observe_targets_by_node = []
+        for node_idx in range(self.time_steps):
+            node_onehot = tf.reshape(
+                tf.one_hot(node_idx, self.time_steps, dtype=tf.float32),
+                [1, 1, 1, self.time_steps]
+            )
+            rollout_values = tf.reshape(rollout_rewards, [-1, 1, 1, 1])
+            next_node_values = (
+                belief_node_values[None, :, :, :] * (1.0 - node_onehot)
+                + rollout_values * node_onehot
+            )
+            next_path_values = (
+                tf.einsum("kbtn,pn->kbtp", next_node_values, path_map)
+                / reward_norm
+            )
+            expected_best_stop_after_observe = tf.reduce_mean(
+                tf.reduce_max(next_path_values, axis=-1),
+                axis=0
+            )
+            observe_targets_by_node.append(
+                expected_best_stop_after_observe - observe_costs
+            )
+        observe_targets = tf.stack(observe_targets_by_node, axis=-1)
+        joint_targets = tf.concat([observe_targets, stop_targets], axis=-1)
+
+        if selected_action_return_targets is not None:
+            selected_action_return_targets = tf.cast(selected_action_return_targets, tf.float32)
+            batch_size = tf.shape(node_selections)[0]
+            scatter_indices = tf.stack(
+                [
+                    tf.tile(tf.range(batch_size, dtype=tf.int32)[:, None], [1, self.time_steps]),
+                    tf.tile(tf.range(self.time_steps, dtype=tf.int32)[None, :], [batch_size, 1]),
+                    tf.cast(node_selections, tf.int32),
+                ],
+                axis=-1
+            )
+            joint_targets = tf.tensor_scatter_nd_update(
+                joint_targets,
+                tf.reshape(scatter_indices, [-1, 3]),
+                tf.reshape(selected_action_return_targets, [-1])
+            )
+
+        active_mask = tf.cast(valid_step_masks, tf.float32)
+        legal_action_masks = tf.cast(legal_action_masks, tf.float32)
+        joint_target_masks = legal_action_masks * active_mask
+        return joint_targets, joint_target_masks
 
     def compute_expansion_critic_loss(
         self,
@@ -997,6 +1446,78 @@ class VariationalRNN(tf.keras.Model):
         squared_error = tf.square(stop_value_preds - tf.stop_gradient(return_targets)) * mask
         loss = tf.reduce_sum(squared_error) / (tf.reduce_sum(mask) + 1e-6)
         return tf.where(tf.math.is_finite(loss), loss, tf.constant(0.0, dtype=tf.float32))
+
+    def compute_reduced_state_frequency_weights(
+        self,
+        observed_before_decision_masks,
+        current_best_path_values_before_decision,
+        valid_step_masks,
+        min_weight=0.01,
+        max_weight=100.0,
+    ):
+        # Reweight only by the reduced belief state available before the
+        # decision: timestep, observed count, and best observed path value.
+        # Use inverse empirical frequency so rare diagnostic states contribute
+        # more strongly to the policy gradient, while clipping prevents a single
+        # sparse state from dominating the batch.
+        valid_mask = tf.squeeze(tf.cast(valid_step_masks, tf.float32), axis=-1)
+        observed_count = tf.cast(
+            tf.round(
+                tf.reduce_sum(
+                    tf.cast(observed_before_decision_masks, tf.float32),
+                    axis=-1
+                )
+            ),
+            tf.int32
+        )
+        observed_count = tf.clip_by_value(observed_count, 0, self.time_steps)
+        best_value_onehot = helper.scalar_to_categorical(
+            current_best_path_values_before_decision,
+            self.num_categories
+        )
+        best_value_idx = tf.argmax(best_value_onehot, axis=-1, output_type=tf.int32)
+        batch_size = tf.shape(best_value_idx)[0]
+        timestep_idx = tf.tile(
+            tf.range(self.time_steps, dtype=tf.int32)[None, :],
+            [batch_size, 1]
+        )
+        observed_count_bins = self.time_steps + 1
+        state_bins = (
+            (timestep_idx * self.num_categories + best_value_idx)
+            * observed_count_bins
+            + observed_count
+        )
+        num_bins = self.time_steps * self.num_categories * observed_count_bins
+        flat_bins = tf.reshape(state_bins, [-1])
+        flat_valid = tf.reshape(valid_mask > 0.0, [-1])
+        valid_bins = tf.boolean_mask(flat_bins, flat_valid)
+        counts = tf.math.bincount(
+            valid_bins,
+            minlength=num_bins,
+            maxlength=num_bins,
+            dtype=tf.float32
+        )
+        bin_counts = tf.gather(counts, state_bins)
+        weights = 1.0 / tf.maximum(bin_counts, 1.0)
+        weights = weights * valid_mask
+        mean_weight = (
+            tf.reduce_sum(weights)
+            / (tf.reduce_sum(valid_mask) + 1e-6)
+        )
+        weights = weights / (mean_weight + 1e-6)
+        weights = tf.clip_by_value(
+            weights,
+            tf.cast(min_weight, tf.float32),
+            tf.cast(max_weight, tf.float32)
+        )
+        weights = weights * valid_mask
+        clipped_mean_weight = (
+            tf.reduce_sum(weights)
+            / (tf.reduce_sum(valid_mask) + 1e-6)
+        )
+        weights = weights / (clipped_mean_weight + 1e-6)
+        weights = tf.where(valid_mask > 0.0, weights, tf.zeros_like(weights))
+        return tf.stop_gradient(weights[:, :, None])
 
     def compute_lstm_reward_probe_metrics(
         self,
@@ -1052,15 +1573,21 @@ class VariationalRNN(tf.keras.Model):
         entropies,
         entropy_masks,
         stop_value_preds,
+        policy_value_preds,
         valid_step_masks,
         return_targets,
+        sample_weights=None,
         old_log_probs=None,
         use_ppo_loss=False,
         ppo_clip=0.2,
         entropy_coef=0.01
     ):
         mask = tf.cast(valid_step_masks, tf.float32)
-        advantages = tf.stop_gradient(return_targets - stop_value_preds)
+        if sample_weights is None:
+            policy_weights = mask
+        else:
+            policy_weights = mask * tf.cast(sample_weights, tf.float32)
+        advantages = tf.stop_gradient(return_targets - policy_value_preds)
 
         if use_ppo_loss and old_log_probs is not None:
             old_log_probs = tf.stop_gradient(tf.cast(old_log_probs, tf.float32))
@@ -1068,9 +1595,9 @@ class VariationalRNN(tf.keras.Model):
             ratios = tf.exp(log_ratio)
             clipped_ratios = tf.clip_by_value(ratios, 1.0 - ppo_clip, 1.0 + ppo_clip)
             surrogate = tf.minimum(ratios * advantages, clipped_ratios * advantages)
-            policy_loss = -surrogate * mask
+            policy_loss = -surrogate * policy_weights
         else:
-            policy_loss = -log_probs * advantages * mask
+            policy_loss = -log_probs * advantages * policy_weights
 
         entropy_coef = tf.cast(entropy_coef, tf.float32)
         entropy_mask = mask * tf.cast(entropy_masks, tf.float32)
