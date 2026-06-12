@@ -739,11 +739,11 @@ class VariationalRNN(tf.keras.Model):
             [zero_observed_mask, observed_masks[:, :-1, :]],
             axis=1
         )
-        # Joint-action Q targets are trained from the reduced belief state at
-        # the decision: observe actions reveal one reward and then stop with
-        # the best path under that updated belief; stop actions use the current
-        # expected path values. Do not overwrite the sampled action with a
-        # multi-step continuation/bootstrap return here.
+        target_stop_value_preds = (
+            tf.stack(all_target_stop_value_preds, axis=1)
+            if use_lambda_return
+            else None
+        )
         joint_q_targets, joint_q_target_masks = self.build_joint_action_q_targets(
             inputs,
             legal_action_masks,
@@ -760,13 +760,44 @@ class VariationalRNN(tf.keras.Model):
             ],
             axis=-1
         )
-        selected_q_targets = tf.gather_nd(joint_q_targets, selected_action_indices)
-        selected_q_targets = tf.expand_dims(selected_q_targets, axis=-1)
-        critic_loss = self.compute_expansion_critic_loss(
-            stop_value_preds,
-            joint_q_targets,
-            joint_q_target_masks
-        )
+        if use_lambda_return and target_stop_value_preds is not None:
+            target_policy_value_preds = tf.stop_gradient(
+                tf.reduce_sum(
+                    expansion_probs_sequence * target_stop_value_preds,
+                    axis=-1,
+                    keepdims=True
+                )
+            )
+            selected_q_targets = self.compute_expansion_return_targets(
+                inputs,
+                action_outputs_sequence,
+                terminal_path_selections,
+                valid_step_masks,
+                stop_decisions,
+                kl_d_sequence,
+                current_beta,
+                target_stop_value_preds=target_stop_value_preds,
+                target_state_values=target_policy_value_preds,
+                use_lambda_return=True,
+                lambda_return=lambda_return
+            )
+            selected_action_mask = (
+                tf.one_hot(node_selections, self.joint_decision_dim, dtype=tf.float32)
+                * tf.cast(valid_step_masks, tf.float32)
+            )
+            critic_loss = self.compute_expansion_critic_loss(
+                stop_value_preds,
+                selected_q_targets,
+                selected_action_mask
+            )
+        else:
+            selected_q_targets = tf.gather_nd(joint_q_targets, selected_action_indices)
+            selected_q_targets = tf.expand_dims(selected_q_targets, axis=-1)
+            critic_loss = self.compute_expansion_critic_loss(
+                stop_value_preds,
+                joint_q_targets,
+                joint_q_target_masks
+            )
         selected_q_preds = tf.gather_nd(stop_value_preds, selected_action_indices)
         selected_q_preds = tf.expand_dims(selected_q_preds, axis=-1)
         policy_value_preds = tf.reduce_sum(
@@ -1206,6 +1237,7 @@ class VariationalRNN(tf.keras.Model):
         kl_d_sequence,
         current_beta,
         target_stop_value_preds=None,
+        target_state_values=None,
         use_lambda_return=False,
         lambda_return=0.95
     ):
@@ -1261,7 +1293,14 @@ class VariationalRNN(tf.keras.Model):
                 0.0,
                 1.0
             )
-            target_values = tf.stop_gradient(tf.cast(target_stop_value_preds, tf.float32))
+            if target_state_values is None:
+                target_values = tf.reduce_max(
+                    tf.stop_gradient(tf.cast(target_stop_value_preds, tf.float32)),
+                    axis=-1,
+                    keepdims=True
+                )
+            else:
+                target_values = tf.stop_gradient(tf.cast(target_state_values, tf.float32))
             terminal_reward = tf.cast(terminal_expected_reward, tf.float32)
             reversed_targets = []
             next_lambda_target = terminal_reward
