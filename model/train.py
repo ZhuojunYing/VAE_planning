@@ -495,7 +495,7 @@ def train_model(
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=1e-5,    
         decay_steps=total_steps,       
-        alpha=0.01,                    
+        alpha=0.1,                     
         warmup_target=0.0003,           
         warmup_steps=warmup_steps      
     )

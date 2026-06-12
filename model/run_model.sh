@@ -47,6 +47,22 @@ model_variant=${13:-"vae"}
 tree_config=${14:-""}
 rnn_units=${15:-"64"}
 latent_dim=${16:-"32"}
+
+if [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
+    tf_thread_count="$SLURM_CPUS_PER_TASK"
+else
+    tf_thread_count="${TF_NUM_THREADS:-}"
+fi
+
+if [ -n "${tf_thread_count:-}" ]; then
+    export OMP_NUM_THREADS="$tf_thread_count"
+    export OPENBLAS_NUM_THREADS="$tf_thread_count"
+    export MKL_NUM_THREADS="$tf_thread_count"
+    export NUMEXPR_NUM_THREADS="$tf_thread_count"
+    export TF_NUM_INTRAOP_THREADS="$tf_thread_count"
+    export TF_NUM_INTEROP_THREADS="${TF_NUM_INTEROP_THREADS:-2}"
+fi
+
 # Navigate to the directory containing the virtual environment if it's not in the current directory
 # Uncomment and modify the next line if needed
 # cd /path/to/your/project

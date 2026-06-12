@@ -150,6 +150,9 @@ model_variant = sys.argv[17]
 tree_config = sys.argv[18]
 rnn_units = sys.argv[19]
 latent_dim = sys.argv[20]
+tf_cpus_per_task = sys.argv[21]
+tf_mem = sys.argv[22]
+tf_slurm_time = sys.argv[23]
 
 def parse_float_list(raw):
     values = []
@@ -218,15 +221,21 @@ for seed_list in seed_values_split:
                     lambda_job_str = ", ".join([f"{x}" for x in lambda_list])
                     opportunity_str = ", ".join([f"{x}" for x in opportunity_list])
                     # NOTE: We removed the extra double quotes inside the python print to make parsing easier in bash
-                    command = f'sbatch -p general --time=10:00:00 --output=logs/slurm-%j.out model/run_model.sh "{lambda_job_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}" "{tree_config}" "{rnn_units}" "{latent_dim}"'
+                    command = f'sbatch -p general --time={tf_slurm_time} --cpus-per-task={tf_cpus_per_task} --mem={tf_mem} --output=logs/slurm-%j.out model/run_model.sh "{lambda_job_str}" "{alpha_str}" "{beta_str}" "outputs/models/" "outputs/simulations/" "2000" "{input_type}" "{seed_str}" "{train}" "{opportunity_str}" {tree_size} "{expansion_decision_version}" "{model_variant}" "{tree_config}" "{rnn_units}" "{latent_dim}"'
                     print(command)
 EOL
 
 # Temporary file to store job IDs (needed because the while loop runs in a subshell)
 JID_FILE=$(mktemp)
 
+tf_cpus_per_task=${TF_CPUS_PER_TASK:-1}
+tf_mem=${TF_MEM:-16G}
+tf_slurm_time=${TF_SLURM_TIME:-10:00:00}
+
+echo "TensorFlow Slurm resources: cpus-per-task=${tf_cpus_per_task}, mem=${tf_mem}, time=${tf_slurm_time}"
+
 # Run the Python script and execute each command
-python generate_commands.py "$beta_arg" "$beta_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_arg" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version" "$model_variant" "$tree_config" "$rnn_units" "$latent_dim"| while read -r cmd; do
+python generate_commands.py "$beta_arg" "$beta_max" "$beta_steps" "$alpha_log_min" "$alpha_log_max" "$alpha_steps" "$opportunity_arg" "$opportunity_max" "$opportunity_steps" "$lambda_str" "$seed_str" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version" "$model_variant" "$tree_config" "$rnn_units" "$latent_dim" "$tf_cpus_per_task" "$tf_mem" "$tf_slurm_time"| while read -r cmd; do
     echo "Executing: $cmd"
     
     # 1. Execute the command and capture the output (e.g., "Submitted batch job 12345")

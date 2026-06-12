@@ -739,52 +739,14 @@ class VariationalRNN(tf.keras.Model):
             [zero_observed_mask, observed_masks[:, :-1, :]],
             axis=1
         )
-        # Multi-step return target for sampled joint actions. For lambda-return
-        # mode, bootstrap with the target critic averaged under the current
-        # legal policy, so observe actions are valued through future continuation
-        # without introducing max-Q overestimation.
-        target_stop_value_preds = (
-            tf.stack(all_target_stop_value_preds, axis=1)
-            if use_lambda_return and len(all_target_stop_value_preds) > 0
-            else None
-        )
-        target_state_value_preds = (
-            tf.reduce_sum(
-                target_stop_value_preds
-                * (
-                    expansion_probs_sequence * legal_action_masks
-                    / (
-                        tf.reduce_sum(
-                            expansion_probs_sequence * legal_action_masks,
-                            axis=-1,
-                            keepdims=True
-                        )
-                        + 1e-6
-                    )
-                ),
-                axis=-1,
-                keepdims=True
-            )
-            if target_stop_value_preds is not None
-            else None
-        )
-        expansion_return_targets = self.compute_expansion_return_targets(
-            inputs,
-            action_outputs_sequence,
-            terminal_path_selections,
-            valid_step_masks,
-            stop_decisions,
-            kl_d_sequence,
-            current_beta,
-            target_stop_value_preds=target_state_value_preds,
-            use_lambda_return=use_lambda_return,
-            lambda_return=lambda_return
-        )
+        # Joint-action Q targets are trained from the reduced belief state at
+        # the decision: observe actions reveal one reward and then stop with
+        # the best path under that updated belief; stop actions use the current
+        # expected path values. Do not overwrite the sampled action with a
+        # multi-step continuation/bootstrap return here.
         joint_q_targets, joint_q_target_masks = self.build_joint_action_q_targets(
             inputs,
-            node_selections,
             legal_action_masks,
-            expansion_return_targets,
             valid_step_masks,
             observed_before_decision_masks,
             kl_d_sequence,
@@ -1286,15 +1248,9 @@ class VariationalRNN(tf.keras.Model):
         mask = tf.cast(valid_step_masks, tf.float32)
         stop_decisions = tf.cast(stop_decisions, tf.float32)
         non_stop_expansion = mask * (1.0 - stop_decisions)
-        # The first decision happens before any reward has been observed, so
-        # observing the first item should not incur a time/opportunity cost.
-        # Subsequent non-stop decisions occur after at least one observation.
-        timestep_has_prior_observation = tf.reshape(
-            tf.cast(tf.range(self.time_steps) > 0, tf.float32),
-            [1, self.time_steps, 1]
-        )
         opportunity_cost_sequence = (
-            self.opportunity_cost * timestep_has_prior_observation
+            self.opportunity_cost
+            * tf.ones([1, self.time_steps, 1], dtype=tf.float32)
         )
         step_costs = non_stop_expansion * (
             opportunity_cost_sequence + current_beta * kl_d_sequence
@@ -1340,9 +1296,7 @@ class VariationalRNN(tf.keras.Model):
     def build_joint_action_q_targets(
         self,
         inputs,
-        node_selections,
         legal_action_masks,
-        selected_action_return_targets,
         valid_step_masks,
         observed_before_decision_masks,
         kl_d_sequence,
@@ -1369,12 +1323,9 @@ class VariationalRNN(tf.keras.Model):
             / reward_norm
         )
 
-        timestep_has_prior_observation = tf.reshape(
-            tf.cast(tf.range(self.time_steps) > 0, tf.float32),
-            [1, self.time_steps]
-        )
         observe_costs = (
-            self.opportunity_cost * timestep_has_prior_observation
+            self.opportunity_cost
+            * tf.ones([1, self.time_steps], dtype=tf.float32)
             + tf.cast(current_beta, tf.float32) * tf.squeeze(kl_d_sequence, axis=-1)
         )
 
@@ -1413,23 +1364,6 @@ class VariationalRNN(tf.keras.Model):
             )
         observe_targets = tf.stack(observe_targets_by_node, axis=-1)
         joint_targets = tf.concat([observe_targets, stop_targets], axis=-1)
-
-        if selected_action_return_targets is not None:
-            selected_action_return_targets = tf.cast(selected_action_return_targets, tf.float32)
-            batch_size = tf.shape(node_selections)[0]
-            scatter_indices = tf.stack(
-                [
-                    tf.tile(tf.range(batch_size, dtype=tf.int32)[:, None], [1, self.time_steps]),
-                    tf.tile(tf.range(self.time_steps, dtype=tf.int32)[None, :], [batch_size, 1]),
-                    tf.cast(node_selections, tf.int32),
-                ],
-                axis=-1
-            )
-            joint_targets = tf.tensor_scatter_nd_update(
-                joint_targets,
-                tf.reshape(scatter_indices, [-1, 3]),
-                tf.reshape(selected_action_return_targets, [-1])
-            )
 
         active_mask = tf.cast(valid_step_masks, tf.float32)
         legal_action_masks = tf.cast(legal_action_masks, tf.float32)

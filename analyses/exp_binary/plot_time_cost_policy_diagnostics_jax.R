@@ -22,42 +22,7 @@ seed_arg <- get_arg(13, "auto")
 optimal_time_cost_arg <- get_arg(14, opportunity_arg)
 rnn_units_arg <- get_arg(15, "64")
 latent_dim_arg <- get_arg(16, "32")
-source_arg_values <- c("tf", "tensorflow", "jax")
-arg17 <- get_arg(17, "")
-if (tolower(trimws(arg17)) %in% source_arg_values) {
-  zero_exact_dir <- "analyses/exp_binary/results/exact_time_cost_zero"
-  simulation_source_arg <- arg17
-} else {
-  zero_exact_dir <- get_arg(17, "analyses/exp_binary/results/exact_time_cost_zero")
-  simulation_source_arg <- get_arg(18, "tensorflow")
-}
-
-normalize_simulation_source <- function(source) {
-  source_key <- tolower(trimws(as.character(source)))
-  aliases <- c(
-    "tf" = "tensorflow",
-    "tensorflow" = "tensorflow",
-    "keras" = "tensorflow",
-    "jax" = "jax"
-  )
-  if (!source_key %in% names(aliases)) {
-    stop(sprintf(
-      "simulation_source must be one of: %s. Got %s.",
-      paste(names(aliases), collapse = ", "),
-      source
-    ))
-  }
-  unname(aliases[[source_key]])
-}
-
-simulation_source <- normalize_simulation_source(simulation_source_arg)
-if (
-  identical(simulation_source, "jax") &&
-    normalizePath(input_dir, mustWork = FALSE) == normalizePath("outputs/simulations", mustWork = FALSE)
-) {
-  input_dir <- "outputs/jax_simulations"
-}
-simulation_source_suffix <- if (identical(simulation_source, "jax")) "_source_jax" else ""
+zero_exact_dir <- get_arg(17, "analyses/exp_binary/results/exact_time_cost_zero")
 
 normalize_expansion_decision_version <- function(version) {
   version_key <- tolower(trimws(as.character(version)))
@@ -86,6 +51,9 @@ normalize_model_variant <- function(variant) {
   variant_key <- tolower(trimws(as.character(variant)))
   aliases <- c(
     "vae" = "vae",
+    "jax" = "vae",
+    "jax_vae" = "vae",
+    "jax_ppo" = "jax_ppo",
     "autoencoder" = "vae",
     "rnn" = "rnn",
     "plain_rnn" = "rnn",
@@ -159,7 +127,6 @@ tree_file_label <- paste0(tree_size, "n", if (nzchar(tree_config)) paste0("_", t
 architecture_file_label <- sprintf("rnn_%s_latent_%s", rnn_units_arg, latent_dim_arg)
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
-message(sprintf("Using %s simulation CSVs from %s", simulation_source, input_dir))
 
 panel_width_in <- 60 / 25.4
 panel_height_in <- 60 / 25.4
@@ -2077,10 +2044,10 @@ plot_average_summary_scatter <- function(
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s.png",
       file_prefix,
       input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-      expansion_label, tree_file_label, simulation_source_suffix
+      expansion_label, tree_file_label
     )
   )
   if (include_exact && nzchar(optimal_time_cost_suffix)) {
@@ -2210,9 +2177,9 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s.png",
       file_prefix, input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-      expansion_label, tree_file_label, simulation_source_suffix
+      expansion_label, tree_file_label
     )
   )
   if (nzchar(optimal_time_cost_suffix)) {
@@ -2434,9 +2401,9 @@ plot_kl_by_best_observed_continue_summary <- function(summary_data) {
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s.png",
       file_prefix, input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-      expansion_label, tree_file_label, simulation_source_suffix
+      expansion_label, tree_file_label
     )
   )
   timesteps <- sort(unique(summary_data$observation_timestep))
