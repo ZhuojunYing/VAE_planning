@@ -496,7 +496,7 @@ def train_model(
         initial_learning_rate=1e-5,    
         decay_steps=total_steps,       
         alpha=0.1,                     
-        warmup_target=0.0003,           
+        warmup_target=0.0005,           
         warmup_steps=warmup_steps      
     )
     optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-4, clipnorm=20.0)

@@ -43,6 +43,7 @@ append_xla_flag_if_unset() {
 }
 
 append_xla_flag_if_unset "--xla_cpu_use_xla_runtime=false"
+export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-1}"
 
 case "${JAX_DISABLE_THUNK_RUNTIME:-}" in
     1|true|TRUE|yes|YES)

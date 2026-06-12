@@ -241,7 +241,7 @@ class VariationalRNN(tf.keras.Model):
         old_expansion_log_probs=None,
         use_ppo_loss=False,
         compute_losses=True,
-        ppo_clip=0.2,
+        ppo_clip=0.3,
         expansion_epsilon=0.0,
         expansion_entropy_coef=0.01,
         forced_continue_epsilon=0.0,
@@ -1329,7 +1329,7 @@ class VariationalRNN(tf.keras.Model):
             + tf.cast(current_beta, tf.float32) * tf.squeeze(kl_d_sequence, axis=-1)
         )
 
-        if self.time_steps < 4:
+        if self.time_steps <= 6:
             rollout_rewards = reward_support
         else:
             reward_indices = tf.random.uniform(
@@ -1513,7 +1513,7 @@ class VariationalRNN(tf.keras.Model):
         sample_weights=None,
         old_log_probs=None,
         use_ppo_loss=False,
-        ppo_clip=0.2,
+        ppo_clip=0.3,
         entropy_coef=0.01
     ):
         mask = tf.cast(valid_step_masks, tf.float32)
@@ -1549,7 +1549,7 @@ class VariationalRNN(tf.keras.Model):
         stop_decisions,
         old_log_probs=None,
         use_ppo_loss=False,
-        ppo_clip=0.2
+        ppo_clip=0.3
     ):
         mask = tf.cast(valid_step_masks, tf.float32)
         stop_decisions = tf.cast(stop_decisions, tf.float32)
