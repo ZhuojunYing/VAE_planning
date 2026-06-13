@@ -29,6 +29,7 @@ def train_step(
     ppo_epochs=3,
     return_target_rollouts=1,
     use_lambda_return=True,
+    use_counterfactual_bootstrap=False,
     lambda_return=0.95
 ):
     """
@@ -66,6 +67,7 @@ def train_step(
                 forced_continue_epsilon=current_forced_continue_epsilon,
                 compute_losses=False,
                 use_lambda_return=use_lambda_return,
+                use_counterfactual_bootstrap=use_counterfactual_bootstrap,
                 lambda_return=lambda_return
             )
             rollout_node_selections.append(tf.stop_gradient(rollout_outputs[12]))
@@ -119,6 +121,7 @@ def train_step(
                     old_expansion_log_probs=rollout_expansion_log_probs[rollout_idx],
                     use_ppo_loss=True,
                     use_lambda_return=use_lambda_return,
+                    use_counterfactual_bootstrap=use_counterfactual_bootstrap,
                     lambda_return=lambda_return
                 )
 
@@ -328,6 +331,7 @@ def train_step(
                     old_expansion_log_probs=rollout_expansion_log_probs[rollout_idx],
                     use_ppo_loss=True,
                     use_lambda_return=use_lambda_return,
+                    use_counterfactual_bootstrap=use_counterfactual_bootstrap,
                     lambda_return=lambda_return
                 )
                 ppo_expansion_loss += extra_outputs[5] * rollout_weight
@@ -478,7 +482,13 @@ def train_model(
         1
     )
     return_target_mode = os.environ.get("EXPANSION_RETURN_TARGET", "lambda").strip().lower()
-    use_lambda_return = return_target_mode not in ("mc", "monte_carlo", "montecarlo", "sampled")
+    one_step_modes = {"one_step", "joint_q", "joint", "counterfactual_one_step"}
+    sampled_lambda_modes = {"sampled_lambda", "trajectory_lambda", "lambda_sampled"}
+    non_lambda_modes = one_step_modes | {"mc", "monte_carlo", "montecarlo", "sampled"}
+    use_counterfactual_bootstrap = return_target_mode not in (
+        non_lambda_modes | sampled_lambda_modes
+    )
+    use_lambda_return = return_target_mode not in non_lambda_modes
     lambda_return = float(os.environ.get("EXPANSION_LAMBDA_RETURN", "0.95"))
     target_critic_update_interval = max(
         int(os.environ.get("TARGET_CRITIC_UPDATE_INTERVAL", "100")),
@@ -583,6 +593,8 @@ def train_model(
         'target_critic_tau': [],
         'forced_continue_epsilon': [],
         'expansion_entropy_coef': [],
+        'enable_reconstruction': [],
+        'enable_probe': [],
         'total_loss': [], 'kl_loss': [], 'action_loss': [], 'reconstruction_loss': [],
         'expansion_loss': [], 'expansion_stop_rate': [], 'expansion_continue_rate': [],
         'lstm_probe_loss': [], 'lstm_probe_accuracy': [],
@@ -947,6 +959,7 @@ def train_model(
                 ppo_epochs=ppo_epochs,
                 return_target_rollouts=return_target_rollouts,
                 use_lambda_return=use_lambda_return,
+                use_counterfactual_bootstrap=use_counterfactual_bootstrap,
                 lambda_return=tf.constant(lambda_return, dtype=tf.float32)
             )
             if use_lambda_return and target_critic_update_interval > 0:
@@ -1080,9 +1093,15 @@ def train_model(
         history['steps_per_batch'].append(steps_per_batch)
         history['updates_per_epoch'].append(updates_per_epoch)
         history['rollout_steps'].append(rollout_steps)
-        history['expansion_return_target_mode'].append(
-            "lambda" if use_lambda_return else "monte_carlo"
-        )
+        if use_counterfactual_bootstrap:
+            logged_return_target_mode = "counterfactual_bootstrap"
+        elif use_lambda_return:
+            logged_return_target_mode = "sampled_lambda"
+        elif return_target_mode in one_step_modes:
+            logged_return_target_mode = "one_step_joint_q"
+        else:
+            logged_return_target_mode = "monte_carlo"
+        history['expansion_return_target_mode'].append(logged_return_target_mode)
         history['expansion_lambda_return'].append(lambda_return if use_lambda_return else float("nan"))
         history['target_critic_update_interval'].append(
             target_critic_update_interval if use_lambda_return else 0
@@ -1090,6 +1109,8 @@ def train_model(
         history['target_critic_tau'].append(target_critic_tau if use_lambda_return else float("nan"))
         history['forced_continue_epsilon'].append(current_forced_continue_epsilon)
         history['expansion_entropy_coef'].append(current_expansion_entropy_coef)
+        history['enable_reconstruction'].append(bool(model.enable_reconstruction))
+        history['enable_probe'].append(bool(model.enable_probe))
         history['total_loss'].append((ep_total_loss / trials_per_epoch).numpy())
         history['kl_loss'].append((ep_kl / trials_per_epoch).numpy())
         history['action_loss'].append((ep_act / trials_per_epoch).numpy())

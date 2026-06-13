@@ -59,7 +59,7 @@ fi
 
 mkdir -p logs
 
-jax_cpus_per_task=${JAX_CPUS_PER_TASK:-8}
+jax_cpus_per_task=${JAX_CPUS_PER_TASK:-1}
 jax_mem=${JAX_MEM:-16G}
 jax_slurm_time=${JAX_SLURM_TIME:-10:00:00}
 
