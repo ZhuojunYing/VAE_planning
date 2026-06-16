@@ -16,7 +16,7 @@ mkdir -p logs
 TASK="${1:-disjoint3x2}"
 EXACT_DIR="${2:-analyses/exp_binary/results/exact_time_cost}"
 ZERO_EXACT_DIR="${3:-analyses/exp_binary/results/exact_time_cost_zero}"
-TIME_COSTS="${4:-0.0210510487933,0.0782545291379,0.121501294259,0.172982140391,0.47691401649}"
+TIME_COSTS="${4:-0.00209396675828,0.0210510487933,0.0420040541888,0.0782545291379,0.103839811543,0.121501294259,0.152717337473,0.172982140391,0.206613347125,0.47691401649}"
 
 if [ -f "vae_env/bin/activate" ]; then
   source vae_env/bin/activate

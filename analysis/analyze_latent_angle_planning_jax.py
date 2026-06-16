@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """JAX checkpoint version of analyze_latent_angle_planning.py.
 
-This script uses the JAX/Flax VAE model in model/jax_planning.py and the JAX
-.msgpack checkpoints, then reuses the original latent geometry analysis and
-plotting functions.
+This script uses the current step-batched JAX/Flax VAE model in
+model_jax/planning.py and the JAX .msgpack checkpoints, then reuses the
+original latent geometry analysis and plotting functions.
 """
 
 from __future__ import annotations
@@ -29,7 +29,8 @@ warnings.filterwarnings(
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 MODEL_DIR = REPO_ROOT / "model"
-for path in (str(REPO_ROOT), str(MODEL_DIR), str(SCRIPT_DIR)):
+MODEL_JAX_DIR = REPO_ROOT / "model_jax"
+for path in (str(REPO_ROOT), str(MODEL_DIR), str(MODEL_JAX_DIR), str(SCRIPT_DIR)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
@@ -39,7 +40,10 @@ from flax import serialization
 
 import analyze_latent_angle_planning as base
 import helper
-import jax_planning as jp
+try:
+    from model_jax import planning as jp
+except ModuleNotFoundError:
+    import planning as jp
 from latent_angle_utils import (
     make_model_config,
     sample_rewards,
@@ -86,6 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-reward-group-n", type=int, default=10)
     parser.add_argument("--latent-density-grid-n", type=int, default=150)
     parser.add_argument("--analysis-seed-offset", type=int, default=100_000)
+    parser.add_argument(
+        "--also-plot-combined",
+        action="store_true",
+        help="Also write the old pooled plots in --outdir. Per seed/scaler/opportunity plots are always written.",
+    )
     return parser.parse_args()
 
 
@@ -134,12 +143,13 @@ def find_jax_checkpoint(
     opportunity_cost: float,
     expansion_decision_version: str,
     model_variant: str,
+    input_type: str = "uniform",
 ) -> Tuple[Optional[Path], List[str]]:
     root_path = Path(root)
     if not root_path.exists():
         return None, [f"checkpoint root does not exist: {root}"]
-    task = jp.build_task(tree_size, tree_type, "uniform")
-    expected_tree = jp.tree_label(task)
+    task = jp.build_task(tree_size, tree_type, input_type)
+    expected_tree = f"{tree_size}n{task.tree_name_suffix}"
     model_variant = normalize_variant_for_file(model_variant)
     matches = []
     for path in root_path.rglob("*.msgpack"):
@@ -148,9 +158,10 @@ def find_jax_checkpoint(
         found_scaler = _extract_float(r"scaler_([0-9eE.+-]+)", name)
         found_legacy_beta = _extract_float(r"beta_([0-9eE.+-]+)", name)
         new_match = _close(found_lambda, lambda_value) and _close(found_scaler, beta)
-        legacy_match = _close(found_lambda, beta) and _close(found_legacy_beta, lambda_value)
+        current_beta_match = _close(found_lambda, lambda_value) and _close(found_legacy_beta, beta)
+        reversed_legacy_match = _close(found_lambda, beta) and _close(found_legacy_beta, lambda_value)
         if not (
-            (new_match or legacy_match)
+            (new_match or current_beta_match or reversed_legacy_match)
             and _close(_extract_float(r"alpha_([0-9eE.+-]+)", name), alpha)
             and _extract_int(r"seed_([0-9]+)", name) == seed
             and _close(_extract_float(r"opportunity_([0-9eE.+-]+)", name), opportunity_cost)
@@ -166,7 +177,7 @@ def find_jax_checkpoint(
             continue
         if f"variant_{model_variant}" not in name:
             continue
-        matches.append((0 if new_match else 1, path))
+        matches.append((0 if (new_match or current_beta_match) else 1, path))
     if not matches:
         return None, [f"no .msgpack checkpoint matched tree={expected_tree} variant={model_variant}"]
     matches.sort(key=lambda item: (item[0], -item[1].stat().st_mtime))
@@ -189,80 +200,175 @@ def build_jax_model_and_params(
     latent_dim: int,
 ):
     task = jp.build_task(tree_size, tree_type, input_type)
-    model = jp.JaxVariationalRNN(
-        task=task,
+    path_tuple = tuple(tuple(float(v) for v in row) for row in task.path_map)
+    reward_tuple = tuple(float(v) for v in task.reward_values)
+    model = jp.PlanningVAE(
         rnn_units=int(rnn_dim),
         latent_dim=int(latent_dim),
-        alpha=float(alpha),
-        kl_scaler=float(lambda_value),
-        weight_scaler=float(beta),
-        opportunity_cost=float(opportunity_cost),
-        input_type=input_type,
+        time_steps=task.num_nodes,
+        num_paths=task.num_paths,
+        path_map=path_tuple,
+        reward_values=reward_tuple,
+        reward_norm_value=float(task.reward_norm),
         expansion_decision_version=expansion_decision_version,
         use_autoencoder=(normalize_variant_for_file(model_variant) != "rnn"),
-        min_observations_before_stop=1 if expansion_decision_version == "decoder" else 0,
+        enable_reconstruction=False,
+        enable_probe=False,
+        allow_node_revisit=False,
+        max_observations_before_stop=int(task.num_nodes),
+        opportunity_cost=float(opportunity_cost),
+        lambda_=float(lambda_value),
+        alpha=float(alpha),
+        beta=float(beta),
     )
-    dummy = jnp.zeros((1, task.num_nodes, 1), dtype=jnp.float32)
-    template = model.init(jax.random.PRNGKey(0), dummy, jax.random.PRNGKey(1), training=False, compute_losses=False)
+    dummy = jp.initial_carry(1, task, int(rnn_dim))
+    schedule = jp.ScheduleValues(
+        current_alpha=jnp.asarray(1.0, dtype=jnp.float32),
+        current_beta=jnp.asarray(1.0 / float(beta), dtype=jnp.float32),
+        current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
+        expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
+        expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+        forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
+        ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
+    )
+    template = model.init(
+        jax.random.PRNGKey(0),
+        dummy,
+        jax.random.PRNGKey(1),
+        schedule,
+        None,
+        False,
+        False,
+        False,
+    )["params"]
     params = serialization.from_bytes(template, checkpoint_path.read_bytes())
     return model, params, task
 
 
-def jax_output_tuple(out: jp.VAEForwardResult) -> Tuple:
+def jax_output_tuple(
+    transitions: List[jp.StepTransition],
+    *,
+    task: jp.TaskSpec,
+    rewards: np.ndarray,
+    terminal_rng: np.random.Generator,
+) -> Tuple:
     outputs = [None] * base.BASE_OUTPUT_COUNT
-    outputs[0] = np.asarray(out.category_outputs)
-    outputs[1] = np.asarray(out.action_output)
-    outputs[2] = np.asarray(out.total_loss)
-    outputs[3] = np.asarray(out.first_decoder_loss)
-    outputs[4] = np.asarray(out.second_decoder_loss)
-    outputs[5] = np.asarray(out.action_head_loss)
-    outputs[6] = np.asarray(out.critic_loss)
-    outputs[7] = np.asarray(out.information_loss)
-    outputs[8] = np.asarray(out.action_loss)
-    outputs[9] = np.asarray(out.reconstruction_loss)
-    outputs[10] = np.asarray(out.information_cost)
-    outputs[11] = np.asarray(out.z_means)
-    outputs[12] = np.asarray(out.node_selections)
-    outputs[13] = np.asarray(out.stop_decisions)
-    outputs[14] = np.asarray(out.observed_masks)
-    outputs[15] = np.asarray(out.action_outputs_sequence)
-    outputs[16] = np.asarray(out.kl_d_sequence)
-    outputs[17] = np.asarray(out.expansion_head_loss)
-    outputs[18] = np.asarray(out.expansion_log_probs)
-    outputs[19] = np.asarray(out.expansion_loss)
-    outputs[20] = np.asarray(out.expansion_stop_rate)
-    outputs[21] = np.asarray(out.expansion_continue_rate)
-    outputs[22] = np.asarray(out.opportunity_loss)
-    outputs[23] = np.asarray(out.lstm_probe_loss)
-    outputs[24] = np.asarray(out.lstm_probe_accuracy)
-    outputs[28] = np.asarray(out.terminal_path_output)
-    outputs[29] = np.asarray(out.observation_kl_d_sequence)
-    outputs[30] = np.asarray(out.lstm_state_sequence)
-    outputs[31] = np.asarray(out.decoder_state_sequence)
-    z_mu = np.asarray(out.z_means)
+    if len(transitions) == 0:
+        raise ValueError("No JAX transitions were produced.")
+    z_mu = np.stack([np.asarray(trans.z_mu) for trans in transitions], axis=1)
+    z_logvar = np.stack([np.asarray(trans.z_logvar) for trans in transitions], axis=1)
+    prior_mu = np.stack([np.asarray(trans.prior_mu) for trans in transitions], axis=1)
+    prior_logvar = np.stack([np.asarray(trans.prior_logvar) for trans in transitions], axis=1)
+    node_selections = np.stack([np.asarray(trans.node_index) for trans in transitions], axis=1).astype(int)
+    stop_decisions = np.stack([np.asarray(trans.is_stop) for trans in transitions], axis=1)[:, :, None].astype(bool)
+    observed_masks = np.stack([np.asarray(trans.observed_after) for trans in transitions], axis=1).astype(bool)
+    action_outputs = np.stack([np.asarray(trans.action_output) for trans in transitions], axis=1)
+    paid_kl = np.stack([np.asarray(trans.paid_kl) for trans in transitions], axis=1)[:, :, None]
+    observed_kl = np.stack([np.asarray(trans.observed_kl) for trans in transitions], axis=1)[:, :, None]
+    terminal_path_indices = np.stack(
+        [np.asarray(trans.terminal_path_index) for trans in transitions],
+        axis=1,
+    ).astype(int)
+    path_rewards = np.asarray(rewards, dtype=float) @ np.asarray(task.path_map, dtype=float).T
+    selected_paths = np.full(z_mu.shape[0], -1, dtype=int)
+    for trial_i in range(z_mu.shape[0]):
+        stop_steps = np.where(stop_decisions[trial_i, :, 0])[0]
+        if len(stop_steps) > 0:
+            path_i = int(terminal_path_indices[trial_i, stop_steps[0]])
+            if 0 <= path_i < task.num_paths:
+                selected_paths[trial_i] = path_i
+        if selected_paths[trial_i] < 0:
+            probs = action_outputs[trial_i, -1]
+            probs = np.asarray(probs, dtype=float)
+            probs = np.where(np.isfinite(probs), probs, 0.0)
+            total = probs.sum()
+            if total <= 0:
+                probs = np.ones(task.num_paths, dtype=float) / task.num_paths
+            else:
+                probs = probs / total
+            selected_paths[trial_i] = int(terminal_rng.choice(task.num_paths, p=probs))
+    outputs[0] = np.zeros((z_mu.shape[0], z_mu.shape[1], task.num_nodes, 9), dtype=np.float32)
+    outputs[1] = action_outputs
+    outputs[2] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[3] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[4] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[5] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[6] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[7] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[8] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[9] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[10] = np.sum(paid_kl, axis=(1, 2))
+    outputs[11] = z_mu
+    outputs[12] = node_selections
+    outputs[13] = stop_decisions
+    outputs[14] = observed_masks
+    outputs[15] = action_outputs
+    outputs[16] = paid_kl
+    outputs[17] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[18] = np.zeros((z_mu.shape[0], z_mu.shape[1]), dtype=np.float32)
+    outputs[19] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[20] = np.mean(stop_decisions, axis=1)
+    outputs[21] = 1.0 - outputs[20]
+    outputs[22] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[23] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[24] = np.zeros((z_mu.shape[0],), dtype=np.float32)
+    outputs[28] = selected_paths
+    outputs[29] = observed_kl
+    outputs[30] = np.zeros((z_mu.shape[0], z_mu.shape[1], 1), dtype=np.float32)
+    outputs[31] = np.zeros((z_mu.shape[0], z_mu.shape[1], 1), dtype=np.float32)
     for idx, value in enumerate(outputs):
         if value is None:
             outputs[idx] = np.zeros((z_mu.shape[0],), dtype=np.float32)
-    outputs.extend([
-        np.asarray(out.z_logvars),
-        np.asarray(out.prior_means),
-        np.asarray(out.prior_logvars),
-    ])
+    outputs.extend([z_logvar, prior_mu, prior_logvar])
     return tuple(outputs)
 
 
-def run_jax_model_trials(model, params, rewards: np.ndarray, batch_size: int, seed: int) -> Tuple:
+def run_jax_model_trials(
+    model: jp.PlanningVAE,
+    params,
+    task: jp.TaskSpec,
+    rewards: np.ndarray,
+    batch_size: int,
+    seed: int,
+    beta: float,
+) -> Tuple:
     batches = []
     for batch_i, start in enumerate(range(0, rewards.shape[0], batch_size)):
-        batch = jnp.asarray(rewards[start:start + batch_size, :, None], dtype=jnp.float32)
-        out = model.apply(
-            params,
-            batch,
-            jax.random.PRNGKey(seed + batch_i),
-            training=False,
-            compute_losses=False,
+        batch_rewards = rewards[start:start + batch_size]
+        carry = jp.initial_carry(batch_rewards.shape[0], task, model.rnn_units)
+        carry = jp.reset_done_envs(carry, jnp.asarray(batch_rewards, dtype=jnp.float32))
+        schedule = jp.ScheduleValues(
+            current_alpha=jnp.asarray(1.0, dtype=jnp.float32),
+            current_beta=jnp.asarray(1.0 / float(beta), dtype=jnp.float32),
+            current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
+            expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
+            expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+            forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
+            ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
         )
-        batches.append(jax_output_tuple(out))
+        rng = jax.random.PRNGKey(seed + batch_i)
+        transitions = []
+        for _ in range(task.num_nodes):
+            rng, step_rng = jax.random.split(rng)
+            carry, trans = model.apply(
+                {"params": params},
+                carry,
+                step_rng,
+                schedule,
+                None,
+                True,
+                False,
+                False,
+                method=jp.PlanningVAE.__call__,
+            )
+            transitions.append(jax.device_get(trans))
+        terminal_rng = np.random.default_rng(seed + 50_000 + batch_i)
+        batches.append(jax_output_tuple(
+            transitions,
+            task=task,
+            rewards=batch_rewards,
+            terminal_rng=terminal_rng,
+        ))
     merged = []
     n_outputs = len(batches[0])
     for output_i in range(n_outputs):
@@ -273,6 +379,152 @@ def run_jax_model_trials(model, params, rewards: np.ndarray, batch_size: int, se
         else:
             merged.append(first)
     return tuple(merged)
+
+
+def file_token(value) -> str:
+    text = str(value)
+    text = text.replace("-", "m").replace(".", "p")
+    return re.sub(r"[^A-Za-z0-9_]+", "_", text)
+
+
+def per_combo_group_columns(df: pd.DataFrame) -> List[str]:
+    preferred = [
+        "seed",
+        "beta",
+        "opportunity_cost",
+        "lambda_value",
+        "alpha",
+        "rnn_dim",
+        "latent_dim",
+        "tree_size",
+        "tree_type",
+        "input_type",
+        "expansion_decision_version",
+        "model_variant",
+    ]
+    return [col for col in preferred if col in df.columns]
+
+
+def per_combo_output_dir(outdir: Path, group_name: dict) -> Path:
+    parts = [
+        f"seed_{file_token(group_name.get('seed', 'NA'))}",
+        f"beta_{file_token(group_name.get('beta', 'NA'))}",
+        f"opp_{file_token(group_name.get('opportunity_cost', 'NA'))}",
+    ]
+    if "lambda_value" in group_name:
+        parts.append(f"lambda_{file_token(group_name.get('lambda_value'))}")
+    if "rnn_dim" in group_name:
+        parts.append(f"rnn_{file_token(group_name.get('rnn_dim'))}")
+    if "latent_dim" in group_name:
+        parts.append(f"latent_{file_token(group_name.get('latent_dim'))}")
+    if "tree_type" in group_name:
+        parts.append(f"tree_{file_token(group_name.get('tree_type'))}")
+    return outdir / "by_seed_beta_opportunity" / "_".join(parts)
+
+
+def grouped_failures(failures: List[dict], group_df: pd.DataFrame) -> List[dict]:
+    if not failures or "model_id" not in group_df.columns:
+        return []
+    model_ids = set(group_df["model_id"].dropna().astype(str).unique())
+    return [
+        failure for failure in failures
+        if str(failure.get("model_id", "")) in model_ids
+    ]
+
+
+def group_trial_count(group_df: pd.DataFrame, fallback: int) -> int:
+    if "trial_uid" in group_df.columns:
+        count = int(group_df["trial_uid"].nunique())
+        if count > 0:
+            return count
+    if "trial_id" in group_df.columns:
+        count = int(group_df["trial_id"].nunique())
+        if count > 0:
+            return count
+    return int(fallback)
+
+
+def run_plotting_pipeline(
+    df: pd.DataFrame,
+    outdir: Path,
+    args: argparse.Namespace,
+    failures: List[dict],
+    *,
+    label: str,
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    base.plot_latent_2d_density_reward_outputs(
+        df,
+        outdir,
+        args.latent_density_grid_n,
+        args.cv_folds,
+    )
+    base.run_reward_encoding_analyses(
+        df,
+        outdir,
+        args.cv_folds,
+        failures,
+        group_trial_count(df, args.n_trials),
+        make_plots=False,
+    )
+    base.run_geometry_meaning_analyses(
+        df,
+        outdir,
+        args.cv_folds,
+        args.min_within_path_n,
+        make_plots=False,
+    )
+    base.run_halfplane_reward_geometry_analysis(
+        df,
+        outdir,
+        args.min_reward_group_n,
+        make_plots=False,
+    )
+    try:
+        base.run_prior_centered_geometry_reward_analysis(
+            df,
+            outdir,
+            args.min_reward_group_n,
+        )
+    except Exception as exc:
+        print(f"Plotting failed for {label}: {exc}")
+
+
+def run_per_combo_plotting(
+    data: pd.DataFrame,
+    outdir: Path,
+    args: argparse.Namespace,
+    failures: List[dict],
+) -> pd.DataFrame:
+    group_cols = per_combo_group_columns(data)
+    if not group_cols:
+        run_plotting_pipeline(data, outdir / "by_seed_beta_opportunity" / "all", args, failures, label="all")
+        return pd.DataFrame([{"plot_outdir": str(outdir / "by_seed_beta_opportunity" / "all")}])
+
+    index_rows = []
+    grouped = data.groupby(group_cols, dropna=False)
+    for values, group_df in grouped:
+        if not isinstance(values, tuple):
+            values = (values,)
+        group_name = dict(zip(group_cols, values))
+        group_outdir = per_combo_output_dir(outdir, group_name)
+        label = ", ".join(f"{key}={value}" for key, value in group_name.items())
+        print(f"Writing per-combination JAX latent plots for {label} -> {group_outdir}")
+        run_plotting_pipeline(
+            group_df.copy(),
+            group_outdir,
+            args,
+            grouped_failures(failures, group_df),
+            label=label,
+        )
+        index_rows.append({
+            **group_name,
+            "n_rows": int(len(group_df)),
+            "n_trials": group_trial_count(group_df, args.n_trials),
+            "plot_outdir": str(group_outdir),
+            "figures_dir": str(group_outdir / "figures"),
+        })
+    return pd.DataFrame(index_rows)
 
 
 def main() -> None:
@@ -317,6 +569,7 @@ def main() -> None:
                 opportunity_cost=opportunity_cost,
                 expansion_decision_version=args.expansion_decision_version,
                 model_variant=model_variant,
+                input_type=args.input_type,
             )
             if checkpoint_path is None:
                 failures.append({"model_id": model_id, "reason": "; ".join(notes)})
@@ -357,9 +610,11 @@ def main() -> None:
             outputs = run_jax_model_trials(
                 model,
                 params,
+                task,
                 rewards,
                 args.batch_size,
                 seed=args.analysis_seed_offset + seed + 10_000,
+                beta=scaler,
             )
             metadata = {
                 "model_id": model_id,
@@ -421,14 +676,18 @@ def main() -> None:
     except Exception as exc:
         print(f"Temporal transition parquet output skipped: {exc}")
 
-    base.plot_latent_2d_density_reward_outputs(data, outdir, args.latent_density_grid_n, args.cv_folds)
     base.run_reward_encoding_analyses(data, outdir, args.cv_folds, failures, args.n_trials, make_plots=False)
     base.run_geometry_meaning_analyses(data, outdir, args.cv_folds, args.min_within_path_n, make_plots=False)
     base.run_halfplane_reward_geometry_analysis(data, outdir, args.min_reward_group_n, make_plots=False)
-    try:
-        base.run_prior_centered_geometry_reward_analysis(data, outdir, args.min_reward_group_n)
-    except Exception as exc:
-        print(f"Plotting failed: {exc}")
+    group_plot_index = run_per_combo_plotting(data, outdir, args, failures)
+    group_plot_index.to_csv(outdir / "per_seed_beta_opportunity_plot_index.csv", index=False)
+    if args.also_plot_combined:
+        print(f"Writing combined JAX latent plots to {outdir}")
+        base.plot_latent_2d_density_reward_outputs(data, outdir, args.latent_density_grid_n, args.cv_folds)
+        try:
+            base.run_prior_centered_geometry_reward_analysis(data, outdir, args.min_reward_group_n)
+        except Exception as exc:
+            print(f"Combined plotting failed: {exc}")
     print(f"Saved JAX latent angle analysis outputs to {outdir}")
 
 

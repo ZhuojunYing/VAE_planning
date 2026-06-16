@@ -6,8 +6,8 @@ get_arg <- function(i, default) {
   if (length(args) >= i && nzchar(args[[i]])) args[[i]] else default
 }
 
-beta_arg <- get_arg(1, "0.01,0.1,1.0,2.0,4.0,6.0,8.0,10.0")
-lambda_arg <- get_arg(2, "1.0")
+lambda_arg <- get_arg(1, "0.01,0.1,1.0,2.0,4.0,6.0,8.0,10.0")
+scaler_arg <- get_arg(2, "1.0")
 alpha_arg <- get_arg(3, "0.0")
 opportunity_arg <- get_arg(4, "0.0")
 input_dir <- get_arg(5, "outputs/simulations")
@@ -31,6 +31,15 @@ if (tolower(trimws(arg17)) %in% source_arg_values) {
   zero_exact_dir <- get_arg(17, "analyses/exp_binary/results/exact_time_cost_zero")
   simulation_source_arg <- get_arg(18, "tensorflow")
 }
+
+# This variant uses the current manuscript parameter names:
+#   lambda = KL/memory-cost parameter formerly called beta in older filenames
+#   scaler = global reward/action/critic multiplier formerly called lambda
+#
+# Keep old internal column names where the plotting code already expects them,
+# but labels and filenames emitted by this script use lambda/scaler.
+beta_arg <- lambda_arg
+legacy_lambda_arg <- scaler_arg
 
 normalize_simulation_source <- function(source) {
   source_key <- tolower(trimws(as.character(source)))
@@ -233,10 +242,11 @@ expansion_label <- sprintf(
   arg_label(model_variant),
   arg_label(architecture_file_label)
 )
-lambda_label <- compact_arg_label(trimws(strsplit(lambda_arg, ",")[[1]]))
+lambda_label <- compact_arg_label(beta_values)
+scaler_label <- compact_arg_label(trimws(strsplit(scaler_arg, ",")[[1]]))
 alpha_label <- compact_arg_label(trimws(strsplit(alpha_arg, ",")[[1]]))
 opportunity_label <- compact_arg_label(opportunity_values)
-beta_label <- compact_arg_label(beta_values)
+beta_label <- lambda_label
 optimal_time_cost_label <- compact_arg_label(optimal_time_cost_values)
 optimal_time_cost_suffix <- if (!identical(optimal_time_cost_arg, opportunity_arg)) {
   "_optimal"
@@ -350,33 +360,51 @@ value_candidates <- function(x) {
 }
 
 numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed) {
-  requested <- suppressWarnings(as.numeric(c(
+  requested_legacy <- suppressWarnings(as.numeric(c(
     lambda_value, alpha_value, beta_value, opportunity_value
   )))
-  if (any(is.na(requested))) {
+  requested_lambda_scaler <- suppressWarnings(as.numeric(c(
+    beta_value, alpha_value, lambda_value, opportunity_value
+  )))
+  if (any(is.na(requested_legacy)) || any(is.na(requested_lambda_scaler))) {
     return(NA_character_)
   }
 
   files <- list.files(input_dir, full.names = TRUE)
   for (tree_label_candidate in simulation_tree_file_labels()) {
     for (variant_file_segment in variant_file_segments) {
-      pattern <- paste0(
-        "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
-        "expansion_", expansion_decision_version, "_", variant_file_segment,
-        "seed_", seed, "_", tree_label_candidate, "_", input_type, "\\.csv$"
+      pattern_infos <- list(
+        list(
+          pattern = paste0(
+            "^lambda_([^_]+)_alpha_([^_]+)_scaler_([^_]+)_opportunity_([^_]+)_",
+            "expansion_", expansion_decision_version, "_", variant_file_segment,
+            "seed_", seed, "_", tree_label_candidate, "_", input_type, "\\.csv$"
+          ),
+          requested = requested_lambda_scaler
+        ),
+        list(
+          pattern = paste0(
+            "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
+            "expansion_", expansion_decision_version, "_", variant_file_segment,
+            "seed_", seed, "_", tree_label_candidate, "_", input_type, "\\.csv$"
+          ),
+          requested = requested_legacy
+        )
       )
-      matches <- regexec(pattern, basename(files))
-      pieces <- regmatches(basename(files), matches)
-      for (i in seq_along(pieces)) {
-        if (length(pieces[[i]]) == 0) {
-          next
-        }
-        found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
-        if (any(is.na(found))) {
-          next
-        }
-        if (all(abs(found - requested) < 1e-8)) {
-          return(files[[i]])
+      for (pattern_info in pattern_infos) {
+        matches <- regexec(pattern_info$pattern, basename(files))
+        pieces <- regmatches(basename(files), matches)
+        for (i in seq_along(pieces)) {
+          if (length(pieces[[i]]) == 0) {
+            next
+          }
+          found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
+          if (any(is.na(found))) {
+            next
+          }
+          if (all(abs(found - pattern_info$requested) < 1e-8)) {
+            return(files[[i]])
+          }
         }
       }
     }
@@ -385,6 +413,27 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
 }
 
 simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed) {
+  for (memory_lambda_candidate in value_candidates(beta_value)) {
+    for (alpha_candidate in value_candidates(alpha_value)) {
+      for (scaler_candidate in value_candidates(lambda_value)) {
+        for (opportunity_candidate in value_candidates(opportunity_value)) {
+          for (tree_label_candidate in simulation_tree_file_labels()) {
+            for (variant_file_segment in variant_file_segments) {
+              file_name <- sprintf(
+                "lambda_%s_alpha_%s_scaler_%s_opportunity_%s_expansion_%s_%sseed_%d_%s_%s.csv",
+                memory_lambda_candidate, alpha_candidate, scaler_candidate, opportunity_candidate,
+                expansion_decision_version, variant_file_segment, seed, tree_label_candidate, input_type
+              )
+              file_path <- file.path(input_dir, file_name)
+              if (file.exists(file_path)) {
+                return(file_path)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
   for (lambda_candidate in value_candidates(lambda_value)) {
     for (alpha_candidate in value_candidates(alpha_value)) {
       for (beta_candidate in value_candidates(beta_value)) {
@@ -410,10 +459,13 @@ simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_v
 }
 
 matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opportunity_value) {
-  requested <- suppressWarnings(as.numeric(c(
+  requested_legacy <- suppressWarnings(as.numeric(c(
     lambda_value, alpha_value, beta_value, opportunity_value
   )))
-  if (any(is.na(requested))) {
+  requested_lambda_scaler <- suppressWarnings(as.numeric(c(
+    beta_value, alpha_value, lambda_value, opportunity_value
+  )))
+  if (any(is.na(requested_legacy)) || any(is.na(requested_lambda_scaler))) {
     return(data.frame(path = character(), seed = integer(), stringsAsFactors = FALSE))
   }
 
@@ -422,28 +474,43 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
   for (tree_label_candidate in simulation_tree_file_labels()) {
     tree_rows <- list()
     for (variant_file_segment in variant_file_segments) {
-      pattern <- paste0(
-        "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
-        "expansion_", expansion_decision_version, "_", variant_file_segment,
-        "seed_([0-9]+)_", tree_label_candidate, "_", input_type, "\\.csv$"
+      pattern_infos <- list(
+        list(
+          pattern = paste0(
+            "^lambda_([^_]+)_alpha_([^_]+)_scaler_([^_]+)_opportunity_([^_]+)_",
+            "expansion_", expansion_decision_version, "_", variant_file_segment,
+            "seed_([0-9]+)_", tree_label_candidate, "_", input_type, "\\.csv$"
+          ),
+          requested = requested_lambda_scaler
+        ),
+        list(
+          pattern = paste0(
+            "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
+            "expansion_", expansion_decision_version, "_", variant_file_segment,
+            "seed_([0-9]+)_", tree_label_candidate, "_", input_type, "\\.csv$"
+          ),
+          requested = requested_legacy
+        )
       )
-      matches <- regexec(pattern, basename(files))
-      pieces <- regmatches(basename(files), matches)
-      for (i in seq_along(pieces)) {
-        if (length(pieces[[i]]) == 0) {
-          next
-        }
-        found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
-        seed_value <- suppressWarnings(as.integer(pieces[[i]][6]))
-        if (any(is.na(found)) || is.na(seed_value)) {
-          next
-        }
-        if (all(abs(found - requested) < 1e-8)) {
-          tree_rows[[length(tree_rows) + 1]] <- data.frame(
-            path = files[[i]],
-            seed = seed_value,
-            stringsAsFactors = FALSE
-          )
+      for (pattern_info in pattern_infos) {
+        matches <- regexec(pattern_info$pattern, basename(files))
+        pieces <- regmatches(basename(files), matches)
+        for (i in seq_along(pieces)) {
+          if (length(pieces[[i]]) == 0) {
+            next
+          }
+          found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
+          seed_value <- suppressWarnings(as.integer(pieces[[i]][6]))
+          if (any(is.na(found)) || is.na(seed_value)) {
+            next
+          }
+          if (all(abs(found - pattern_info$requested) < 1e-8)) {
+            tree_rows[[length(tree_rows) + 1]] <- data.frame(
+              path = files[[i]],
+              seed = seed_value,
+              stringsAsFactors = FALSE
+            )
+          }
         }
       }
     }
@@ -464,11 +531,11 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
 }
 
 read_seed_file <- function(beta_value, opportunity_value, seed) {
-  file_path <- simulation_path(lambda_arg, alpha_arg, beta_value, opportunity_value, seed)
+  file_path <- simulation_path(legacy_lambda_arg, alpha_arg, beta_value, opportunity_value, seed)
   if (is.na(file_path)) {
     warning(sprintf(
-      "Missing simulation file for beta=%s opportunity=%s seed=%d model_variant=%s",
-      beta_value, opportunity_value, seed, model_variant
+      "Missing simulation file for lambda=%s scaler=%s opportunity=%s seed=%d model_variant=%s",
+      beta_value, legacy_lambda_arg, opportunity_value, seed, model_variant
     ))
     return(NULL)
   }
@@ -479,6 +546,8 @@ read_seed_file <- function(beta_value, opportunity_value, seed) {
   )
   dat <- unique(dat)
   dat$beta <- beta_value
+  dat$lambda <- beta_value
+  dat$scaler <- legacy_lambda_arg
   dat$opportunity <- opportunity_value
   dat$seed <- seed
   dat$model_variant <- model_variant
@@ -495,6 +564,8 @@ read_simulation_file <- function(file_path, beta_value, opportunity_value, seed)
   )
   dat <- unique(dat)
   dat$beta <- beta_value
+  dat$lambda <- beta_value
+  dat$scaler <- legacy_lambda_arg
   dat$opportunity <- opportunity_value
   dat$seed <- seed
   dat$model_variant <- model_variant
@@ -523,15 +594,15 @@ for (beta_value in beta_values) {
   for (opportunity_value in opportunity_values) {
     if (auto_seeds) {
       combo_files <- matching_simulation_files(
-        lambda_arg,
+        legacy_lambda_arg,
         alpha_arg,
         beta_value,
         opportunity_value
       )
       if (nrow(combo_files) == 0) {
         warning(sprintf(
-          "Missing simulation files for beta=%s opportunity=%s model_variant=%s",
-          beta_value, opportunity_value, model_variant
+          "Missing simulation files for lambda=%s scaler=%s opportunity=%s model_variant=%s",
+          beta_value, legacy_lambda_arg, opportunity_value, model_variant
         ))
       }
       for (file_i in seq_len(nrow(combo_files))) {
@@ -556,7 +627,7 @@ for (beta_value in beta_values) {
 
 all_data <- bind_rows_fill(loaded_data)
 if (is.null(all_data) || nrow(all_data) == 0) {
-  stop("No simulation CSVs were found. Check beta/lambda/alpha values and input_dir.")
+  stop("No simulation CSVs were found. Check lambda/scaler/alpha values and input_dir.")
 }
 
 if ("opportunity_cost" %in% names(all_data)) {
@@ -1290,7 +1361,7 @@ color_by <- if (length(opportunity_levels) > 1 && length(beta_levels) == 1) {
 }
 
 if (length(beta_levels) > 1 && length(opportunity_levels) > 1) {
-  warning("Both beta and opportunity have multiple values; using beta for color and keeping opportunity point/line styles fixed.")
+  warning("Both lambda and opportunity have multiple values; using lambda for color and keeping opportunity point/line styles fixed.")
 }
 
 color_levels <- if (identical(color_by, "opportunity")) opportunity_levels else beta_levels
@@ -1319,7 +1390,7 @@ palette_cols <- if (identical(color_by, "opportunity")) {
   # Opportunity cost: blue gradient, darker for higher opportunity cost.
   numeric_gradient_colors(color_levels, palette = "Blues", darker_high = TRUE)
 } else {
-  # Memory cost/beta: green gradient, darker for lower beta.
+  # Memory cost/lambda: green gradient, darker for lower lambda.
   numeric_gradient_colors(color_levels, palette = "Greens", darker_high = FALSE)
 }
 color_cols <- palette_cols
@@ -1342,7 +1413,7 @@ series_color <- function(beta_value, opportunity_value) {
   }
 }
 
-color_legend_title <- if (identical(color_by, "opportunity")) "opportunity" else "beta"
+color_legend_title <- if (identical(color_by, "opportunity")) "opportunity" else "lambda"
 color_legend_labels <- paste(color_legend_title, color_level_labels)
 opportunity_pch <- setNames(
   rep(19, length.out = length(opportunity_levels)),
@@ -2534,9 +2605,9 @@ plot_average_summary_scatter <- function(
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_scaler_%s_opportunity_%s_expansion_%s_%s%s.png",
       file_prefix,
-      input_type, lambda_label, alpha_label, beta_label, opportunity_label,
+      input_type, lambda_label, alpha_label, scaler_label, opportunity_label,
       expansion_label, tree_file_label, simulation_source_suffix
     )
   )
@@ -2675,8 +2746,8 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
-      file_prefix, input_type, lambda_label, alpha_label, beta_label, opportunity_label,
+      "%s_%s_lambda_%s_alpha_%s_scaler_%s_opportunity_%s_expansion_%s_%s%s.png",
+      file_prefix, input_type, lambda_label, alpha_label, scaler_label, opportunity_label,
       expansion_label, tree_file_label, simulation_source_suffix
     )
   )
@@ -2813,7 +2884,7 @@ condition_action_parameter_label <- function(dat, row_i, source) {
   if (identical(source, "optimal")) {
     return(sprintf("time cost %s", format_plot_values(dat$time_cost[[row_i]])))
   }
-  sprintf("beta %s, opportunity %s", dat$beta[[row_i]], dat$opportunity[[row_i]])
+  sprintf("lambda %s, scaler %s, opportunity %s", dat$beta[[row_i]], scaler_label, dat$opportunity[[row_i]])
 }
 
 plot_disjoint3x2_condition_action_probabilities <- function(summary_data, exact_summary) {
@@ -2929,9 +3000,9 @@ plot_disjoint3x2_condition_action_probabilities <- function(summary_data, exact_
     pdf_path <- file.path(
       results_dir,
       sprintf(
-        "disjoint3x2_condition_action_probabilities_t%d_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+        "disjoint3x2_condition_action_probabilities_t%d_%s_lambda_%s_alpha_%s_scaler_%s_opportunity_%s_expansion_%s_%s%s.png",
         decision_timestep,
-        input_type, lambda_label, alpha_label, beta_label, opportunity_label,
+        input_type, lambda_label, alpha_label, scaler_label, opportunity_label,
         expansion_label, tree_file_label, simulation_source_suffix
       )
     )
@@ -3162,8 +3233,8 @@ plot_kl_by_best_observed_continue_summary <- function(summary_data) {
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
-      file_prefix, input_type, lambda_label, alpha_label, beta_label, opportunity_label,
+      "%s_%s_lambda_%s_alpha_%s_scaler_%s_opportunity_%s_expansion_%s_%s%s.png",
+      file_prefix, input_type, lambda_label, alpha_label, scaler_label, opportunity_label,
       expansion_label, tree_file_label, simulation_source_suffix
     )
   )

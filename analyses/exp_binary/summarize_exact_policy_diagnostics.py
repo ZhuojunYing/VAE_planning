@@ -420,6 +420,91 @@ def build_best_continue_summary(task: str, actions: pd.DataFrame, states: pd.Dat
     return summary
 
 
+def disjoint3x2_condition_from_state(
+    path_states: Sequence[Sequence[float]],
+) -> Tuple[str, str, float, List[int]]:
+    path_values = np.asarray([sum(path_state) for path_state in path_states], dtype=float)
+    path_counts = np.asarray([len(path_state) for path_state in path_states], dtype=int)
+    order = sorted(range(len(path_states)), key=lambda idx: (-path_counts[idx], idx))
+    ordered_counts = path_counts[order]
+    ordered_values = path_values[order]
+    count_pattern = "(" + ",".join(str(int(count)) for count in ordered_counts) + ")"
+    best_value = float(np.max(ordered_values))
+    best_indices = np.where(np.isclose(ordered_values, best_value))[0]
+    if count_pattern == "(1,0,0)" and 0 not in best_indices:
+        best_path_identity = "not_P1"
+    else:
+        best_path_identity = "tie" if len(best_indices) != 1 else f"P{int(best_indices[0]) + 1}"
+    return count_pattern, best_path_identity, best_value, order
+
+
+def disjoint3x2_exact_action_label(
+    action: pd.Series,
+    path_states: Sequence[Sequence[float]],
+    path_order: Sequence[int],
+) -> str:
+    action_kind = str(action.get("action_kind", ""))
+    if action_kind == "stop":
+        return "stop"
+    if action_kind != "observe":
+        return action_kind or "unknown"
+    target = parse_path_state(action.get("observe_path_state", ""))
+    for rank, path_index in enumerate(path_order, start=1):
+        path_state = path_states[path_index]
+        if len(path_state) < 2 and same_path_state(path_state, target):
+            return f"observe_P{rank}"
+    return "observe_unknown"
+
+
+def build_disjoint3x2_condition_action_summary(actions: pd.DataFrame, states: pd.DataFrame) -> pd.DataFrame:
+    if actions.empty or states.empty:
+        return pd.DataFrame()
+    task = "disjoint3x2"
+    paths = TASK_SPECS[task]
+    node_count = max(node for path in paths for node in path) + 1
+    actions_by_key = build_actions_by_cost_state(actions)
+    rows = []
+    for row in states.itertuples(index=False):
+        observed_count = int(row.observed_count) if not pd.isna(row.observed_count) else -1
+        if observed_count <= 0 or observed_count >= node_count:
+            continue
+        state_label_value = str(row.state_label)
+        state = parse_state_label(state_label_value)
+        if len(state) != 3:
+            continue
+        state_actions = actions_by_key.get((cost_key(row.time_cost), state_label_value))
+        if state_actions is None or state_actions.empty:
+            continue
+        action = stop_prefer_action(state_actions)
+        if action is None:
+            continue
+        count_pattern, best_path_identity, best_path_value, path_order = disjoint3x2_condition_from_state(state)
+        rows.append({
+            "time_cost": normalize_cost(row.time_cost),
+            "decision_timestep": observed_count + 1,
+            "count_pattern": count_pattern,
+            "best_path_identity": best_path_identity,
+            "best_path_value": best_path_value,
+            "action_label": disjoint3x2_exact_action_label(action, state, path_order),
+            "mass": 1.0,
+        })
+    if not rows:
+        return pd.DataFrame()
+    dat = pd.DataFrame(rows)
+    group_cols = [
+        "time_cost",
+        "decision_timestep",
+        "count_pattern",
+        "best_path_identity",
+        "best_path_value",
+    ]
+    action_counts = dat.groupby(group_cols + ["action_label"], as_index=False).agg(n=("mass", "sum"))
+    denominators = dat.groupby(group_cols, as_index=False).agg(total_n=("mass", "sum"))
+    summary = action_counts.merge(denominators, on=group_cols, how="left")
+    summary["p_action"] = summary["n"] / summary["total_n"]
+    return summary[group_cols + ["action_label", "p_action", "n"]]
+
+
 def ordered_node_sequences(nodes: Sequence[int], k: int):
     if k == 0:
         yield tuple()
@@ -516,6 +601,12 @@ def main():
     if task in {"bandit3", "bandit4", "disjoint3x2"}:
         continue_summary = build_best_continue_summary(task, actions, states)
         write_csv(os.path.join(output_dir, f"{prefix}_continue_best_summary.csv"), continue_summary)
+        if task == "disjoint3x2":
+            condition_action_summary = build_disjoint3x2_condition_action_summary(actions, states)
+            write_csv(
+                os.path.join(output_dir, f"{prefix}_condition_action_summary.csv"),
+                condition_action_summary,
+            )
     elif task in {"default2", "disjoint2x2"}:
         continue_summary = build_difference_continue_summary(task, actions)
         write_csv(os.path.join(output_dir, f"{prefix}_continue_difference_summary.csv"), continue_summary)

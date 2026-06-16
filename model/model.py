@@ -134,12 +134,10 @@ class VariationalRNN(tf.keras.Model):
             int(os.environ.get("BELIEF_ROLLOUT_SAMPLES", "8")),
             1
         )
-        # The decoder-policy condition cannot make a meaningful no-information
-        # terminal decision: stopping before the first observation lets it avoid
-        # the VAE bottleneck entirely. Keep that shortcut illegal only there.
-        self.min_observations_before_stop = (
-            1 if self.expansion_decision_version == "decoder" else 0
-        )
+        # No terminal path choice is legal before at least one reward has been
+        # observed; otherwise the model can avoid the memory/inspection problem
+        # by stopping with no task information.
+        self.min_observations_before_stop = 1
 
         self.prior_mu = self.add_weight(
             name="prior_mu", 

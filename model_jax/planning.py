@@ -5,8 +5,9 @@ objective in ``model/``.  The important parity points are:
 
 * the same positional command-line interface and filename convention;
 * the same task/path maps for default, bandit, and disjoint trees;
-* joint expansion actions ordered as unobserved-node actions followed by
-  terminal path actions;
+* joint expansion actions ordered as node-observation actions followed by
+  terminal path actions; by default observed nodes are masked, with an optional
+  revisit mode that keeps them legal;
 * an LSTM state, Gaussian posterior, timestep Gaussian prior, decoder, joint
   expansion policy, action-value critic, and reward probe;
 * KL scaling semantics match TensorFlow: the command-line beta is an inverse
@@ -127,6 +128,8 @@ class RunConfig:
     profile_update_components_every: int
     enable_reconstruction: bool
     enable_probe: bool
+    allow_node_revisit: bool
+    max_observations_before_stop: int
     save_every_update: bool = False
 
 
@@ -179,6 +182,10 @@ class StepTransition(NamedTuple):
     expansion_input: jax.Array
     pre_decoded_h: jax.Array
     pre_decoded_c: jax.Array
+    z_mu: jax.Array
+    z_logvar: jax.Array
+    prior_mu: jax.Array
+    prior_logvar: jax.Array
     paid_kl: jax.Array
     observed_kl: jax.Array
     expanded_reward: jax.Array
@@ -392,11 +399,17 @@ def architecture_file_label(rnn_units: int, latent_dim: int) -> str:
 
 def model_name_for(config: RunConfig, task: TaskSpec) -> str:
     tree_label = f"{config.tree_size}n{task.tree_name_suffix}"
+    revisit_label = (
+        f"_revisit_maxobs_{config.max_observations_before_stop}"
+        if config.allow_node_revisit
+        else ""
+    )
     return (
         f"lambda_{config.lambda_}_alpha_{config.alpha}_beta_{config.beta}_"
         f"opportunity_{config.opportunity_cost}_expansion_{config.expansion_decision_version}_"
         f"{model_variant_label(config.model_variant)}"
         f"seed_{config.seed}_{tree_label}_{architecture_file_label(config.rnn_units, config.latent_dim)}"
+        f"{revisit_label}"
     )
 
 
@@ -508,6 +521,8 @@ class PlanningVAE(nn.Module):
     use_autoencoder: bool
     enable_reconstruction: bool
     enable_probe: bool
+    allow_node_revisit: bool
+    max_observations_before_stop: int
     opportunity_cost: float
     lambda_: float
     alpha: float
@@ -695,7 +710,18 @@ class PlanningVAE(nn.Module):
         min_observations = 1.0 if self.expansion_decision_version == "decoder" else 0.0
         can_stop = (observed_count >= min_observations).astype(jnp.float32)
         terminal_invalid = (1.0 - can_stop) * jnp.ones((batch_size, self.num_paths), dtype=jnp.float32)
-        decision_mask = jnp.concatenate([carry.observed, terminal_invalid], axis=-1)
+        observation_limit_reached = (
+            carry.step_index[:, None] >= int(self.max_observations_before_stop)
+        )
+        base_observe_invalid = (
+            jnp.zeros_like(carry.observed) if self.allow_node_revisit else carry.observed
+        )
+        observe_invalid = jnp.where(
+            observation_limit_reached,
+            jnp.ones_like(carry.observed),
+            base_observe_invalid,
+        )
+        decision_mask = jnp.concatenate([observe_invalid, terminal_invalid], axis=-1)
         legal_mask = (1.0 - decision_mask) * active_2
         masked_logits = logits + decision_mask * -1e9
         probs = jax.nn.softmax(masked_logits, axis=-1)
@@ -710,7 +736,14 @@ class PlanningVAE(nn.Module):
             explore = jax.random.uniform(rng_eps, (batch_size,)) < schedule.expansion_epsilon
             uniform_logits = decision_mask * -1e9
             uniform_action = jax.random.categorical(rng_eps, uniform_logits, axis=-1)
-            legal_observe = 1.0 - carry.observed
+            base_legal_observe = (
+                jnp.ones_like(carry.observed) if self.allow_node_revisit else (1.0 - carry.observed)
+            )
+            legal_observe = jnp.where(
+                observation_limit_reached,
+                jnp.zeros_like(base_legal_observe),
+                base_legal_observe,
+            )
             observe_logits = (1.0 - legal_observe) * -1e9
             observe_action = jax.random.categorical(rng_force, observe_logits, axis=-1)
             has_observe = jnp.sum(legal_observe, axis=-1) > 0
@@ -752,7 +785,7 @@ class PlanningVAE(nn.Module):
             dec_h, dec_c = self.decode(z)
             dec_h = dec_h * observe_mask + prev_decoded_h * (1.0 - observe_mask)
             dec_c = dec_c * observe_mask + prev_decoded_c * (1.0 - observe_mask)
-            prior_mu, _prior_logvar, prior_var = self.prior(carry.step_index)
+            prior_mu, prior_logvar, prior_var = self.prior(carry.step_index)
             post_var = jnp.exp(jnp.clip(z_logvar, -10.0, 10.0))
             kl_per_dim = 0.5 * (
                 jnp.log(prior_var + 1e-6)
@@ -771,6 +804,9 @@ class PlanningVAE(nn.Module):
         else:
             dec_h, dec_c = raw_h, raw_c
             z_mu = jnp.zeros((batch_size, self.latent_dim), dtype=jnp.float32)
+            z_logvar = jnp.zeros((batch_size, self.latent_dim), dtype=jnp.float32)
+            prior_mu = jnp.zeros((batch_size, self.latent_dim), dtype=jnp.float32)
+            prior_logvar = jnp.zeros((batch_size, self.latent_dim), dtype=jnp.float32)
             observed_kl = jnp.zeros((batch_size,), dtype=jnp.float32)
             paid_kl = jnp.zeros((batch_size,), dtype=jnp.float32)
             pending_kl = carry.pending_kl
@@ -841,7 +877,7 @@ class PlanningVAE(nn.Module):
 
         path_rewards = carry.rewards @ path_map.T
         terminal_expected_reward = jnp.sum(action_output * path_rewards, axis=-1) / self.reward_norm_value
-        episode_done = carry.done | is_stop | ((carry.step_index >= (self.time_steps - 1)) & is_observe)
+        episode_done = carry.done | is_stop
         next_step = carry.step_index + active.astype(jnp.int32)
         next_carry = RunnerCarry(
             rewards=carry.rewards,
@@ -882,6 +918,10 @@ class PlanningVAE(nn.Module):
             expansion_input=expansion_input,
             pre_decoded_h=prev_decoded_h,
             pre_decoded_c=prev_decoded_c,
+            z_mu=z_mu,
+            z_logvar=z_logvar,
+            prior_mu=prior_mu,
+            prior_logvar=prior_logvar,
             paid_kl=paid_kl,
             observed_kl=observed_kl,
             expanded_reward=jnp.where(is_observe, chosen_reward, jnp.nan),
@@ -1081,6 +1121,8 @@ def counterfactual_bootstrap_q_targets(
     opportunity_cost: float,
     current_beta: jax.Array,
     min_observations_before_stop: float,
+    allow_node_revisit: bool,
+    max_observations_before_stop: int,
 ) -> jax.Array:
     step_count, batch_size, time_steps = transitions.observed_before.shape
     reward_prior_mean = jnp.mean(reward_values)
@@ -1141,7 +1183,19 @@ def counterfactual_bootstrap_q_targets(
             (1.0 - next_can_stop)
             * jnp.ones((step_count, batch_size, path_map.shape[0]), dtype=jnp.float32)
         )
-        next_decision_mask = jnp.concatenate([next_observed, next_terminal_invalid], axis=-1)
+        next_observation_count = transitions.step_index + 1
+        next_observation_limit_reached = (
+            next_observation_count[:, :, None] >= int(max_observations_before_stop)
+        )
+        base_next_observe_invalid = (
+            jnp.zeros_like(next_observed) if allow_node_revisit else next_observed
+        )
+        next_observe_invalid = jnp.where(
+            next_observation_limit_reached,
+            jnp.ones_like(next_observed),
+            base_next_observe_invalid,
+        )
+        next_decision_mask = jnp.concatenate([next_observe_invalid, next_terminal_invalid], axis=-1)
         next_active = transitions.valid[:, :, None] * has_next_decision[:, :, None]
         next_legal_mask = (1.0 - next_decision_mask) * next_active
         next_masked_logits = next_logits + (1.0 - next_legal_mask) * -1e9
@@ -1211,6 +1265,8 @@ def apply_expansion_return_targets(
             config.opportunity_cost,
             schedule.current_beta,
             min_observations,
+            config.allow_node_revisit,
+            config.max_observations_before_stop,
         )
         selected_q_target = jnp.take_along_axis(
             q_targets,
@@ -1239,14 +1295,16 @@ def tf_style_terminal_action_loss(
 
     TensorFlow gathers the terminal path distribution from the first stop
     decision, or from the final timestep if the trajectory never explicitly
-    stops.  For the step-batched JAX runner, a segment can contain a completed
-    final-observation episode before the segment ends, so the equivalent
-    terminal event is the first explicit stop or final observation.
+    stops.  In revisit mode the final unique-node observation is not terminal;
+    the terminal event is an explicit stop or the final rollout step.
     """
-    time_steps = int(path_map.shape[1])
+    final_rollout_step = jax.nn.one_hot(
+        transitions.is_stop.shape[0] - 1,
+        transitions.is_stop.shape[0],
+        dtype=jnp.float32,
+    )[:, None]
     terminal_flags = (transitions.is_stop > 0.0) | (
-        (transitions.step_index >= (time_steps - 1))
-        & (transitions.is_observe > 0.0)
+        (final_rollout_step > 0.0) & (transitions.valid > 0.0)
     )
     has_terminal = jnp.any(terminal_flags, axis=0)
     first_terminal = jnp.argmax(terminal_flags.astype(jnp.int32), axis=0)
@@ -2096,6 +2154,8 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         use_autoencoder=(config.model_variant == "vae"),
         enable_reconstruction=config.enable_reconstruction,
         enable_probe=config.enable_probe,
+        allow_node_revisit=config.allow_node_revisit,
+        max_observations_before_stop=config.max_observations_before_stop,
         opportunity_cost=config.opportunity_cost,
         lambda_=config.lambda_,
         alpha=config.alpha,
@@ -2124,7 +2184,9 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         f"lambda_return={config.lambda_return} | "
         f"target_interval={config.target_critic_update_interval} | "
         f"reconstruction={config.enable_reconstruction} | "
-        f"probe={config.enable_probe}",
+        f"probe={config.enable_probe} | "
+        f"allow_node_revisit={config.allow_node_revisit} | "
+        f"max_observations_before_stop={config.max_observations_before_stop}",
         flush=True,
     )
     rows = []
@@ -2224,6 +2286,8 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
                 "timing_profile_ppo_head_grad_norm": profile_ppo_head_grad_norm,
                 "enable_reconstruction": bool(config.enable_reconstruction),
                 "enable_probe": bool(config.enable_probe),
+                "allow_node_revisit": bool(config.allow_node_revisit),
+                "max_observations_before_stop": int(config.max_observations_before_stop),
             }
         )
         rows.append(row)
@@ -2288,6 +2352,8 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
         use_autoencoder=(config.model_variant == "vae"),
         enable_reconstruction=config.enable_reconstruction,
         enable_probe=config.enable_probe,
+        allow_node_revisit=config.allow_node_revisit,
+        max_observations_before_stop=config.max_observations_before_stop,
         opportunity_cost=config.opportunity_cost,
         lambda_=config.lambda_,
         alpha=config.alpha,
@@ -2331,7 +2397,7 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
     sched = ScheduleValues(1.0, 1.0 / config.beta, 0.0, 0.0, 0.0, 0.0, 0.3)
     transitions = []
     rollout_start = time.perf_counter()
-    for _ in range(task.num_nodes):
+    for _ in range(config.num_steps):
         rng, step_rng = jax.random.split(rng)
         carry, trans = model.apply(
             {"params": params},
@@ -2370,6 +2436,8 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
             "MI": float(np.nansum([np.asarray(t.paid_kl)[trial] for t in transitions])),
             "opportunity_cost": config.opportunity_cost,
             "expansion_decision_version": config.expansion_decision_version,
+            "allow_node_revisit": bool(config.allow_node_revisit),
+            "max_observations_before_stop": int(config.max_observations_before_stop),
         }
         for t, trans in enumerate(transitions, start=1):
             node_idx = int(np.asarray(trans.node_index)[trial])
@@ -2382,7 +2450,7 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
             row = dict(trial_row)
             row["node"] = node + 1
             row["actual_reward"] = float(rewards[node])
-            for t in range(1, task.num_nodes + 1):
+            for t in range(1, config.num_steps + 1):
                 row[f"estimated_reward_t{t}"] = np.nan
             rows.append(row)
     rows_sec = time.perf_counter() - rows_start
@@ -2486,6 +2554,21 @@ def parse_args() -> RunConfig:
         action="store_true",
         help="Compute and train the LSTM reward probe head. Disabled by default for speed.",
     )
+    parser.add_argument(
+        "--allow-node-revisit",
+        action="store_true",
+        default=os.environ.get("ALLOW_NODE_REVISIT", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Keep previously observed nodes legal as observe actions. Disabled by default.",
+    )
+    parser.add_argument(
+        "--max-observations-before-stop",
+        type=int,
+        default=int(os.environ.get("MAX_OBSERVATIONS_BEFORE_STOP", "10")),
+        help=(
+            "Maximum number of observe decisions before terminal path actions are forced. "
+            "Used most often with --allow-node-revisit. Default: 10."
+        ),
+    )
     args = parser.parse_args()
 
     lambda_values = parse_float_list(args.lambda_string)
@@ -2495,13 +2578,17 @@ def parse_args() -> RunConfig:
     if not (len(lambda_values) == len(alpha_values) == len(beta_values) == len(opportunity_values) == 1):
         raise ValueError("model_jax/planning.py expects one lambda/alpha/beta/opportunity per process.")
     tree_size = int(args.tree_size)
-    num_steps = int(args.num_steps or tree_size)
-    if num_steps != tree_size:
+    max_observations_before_stop = max(int(args.max_observations_before_stop), 1)
+    num_steps = int(
+        args.num_steps
+        or ((max_observations_before_stop + 1) if args.allow_node_revisit else tree_size)
+    )
+    if args.allow_node_revisit and num_steps <= max_observations_before_stop:
         raise ValueError(
-            "TF-style padded finite episodes require --num-steps to equal tree_size. "
-            f"Got --num-steps={num_steps} and tree_size={tree_size}."
+            "Revisit mode needs one terminal decision after the observation cap. "
+            f"Got --num-steps={num_steps} and --max-observations-before-stop={max_observations_before_stop}."
         )
-    steps_per_epoch = int(args.steps_per_epoch or (200 * 200 * tree_size))
+    steps_per_epoch = int(args.steps_per_epoch or (200 * 200 * num_steps))
     sim_dir = args.sim_dir or "outputs/jax_simulations"
     return RunConfig(
         lambda_=lambda_values[0],
@@ -2536,6 +2623,8 @@ def parse_args() -> RunConfig:
         profile_update_components_every=max(int(args.profile_update_components_every), 1),
         enable_reconstruction=bool(args.enable_reconstruction),
         enable_probe=bool(args.enable_probe),
+        allow_node_revisit=bool(args.allow_node_revisit),
+        max_observations_before_stop=max_observations_before_stop,
     )
 
 
