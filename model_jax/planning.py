@@ -130,6 +130,9 @@ class RunConfig:
     enable_probe: bool
     allow_node_revisit: bool
     max_observations_before_stop: int
+    observation_sigma: float
+    kl_start_multiplier: float
+    kl_annealing_epochs: int
     save_every_update: bool = False
 
 
@@ -145,6 +148,7 @@ class ScheduleValues(NamedTuple):
 
 class RunnerCarry(NamedTuple):
     rewards: jax.Array
+    observed_rewards: jax.Array
     observed: jax.Array
     step_index: jax.Array
     done: jax.Array
@@ -161,6 +165,8 @@ class RunnerCarry(NamedTuple):
 
 class StepTransition(NamedTuple):
     rewards: jax.Array
+    observed_rewards_before: jax.Array
+    observed_rewards_after: jax.Array
     valid: jax.Array
     observed_before: jax.Array
     observed_after: jax.Array
@@ -233,6 +239,7 @@ class ProfileReplayInputs(NamedTuple):
     reset_rewards: jax.Array
     replay_keys: jax.Array
     forced_actions: jax.Array
+    forced_observations: jax.Array
     old_logp: jax.Array
     collect_carry: RunnerCarry
     checksum: jax.Array
@@ -404,12 +411,27 @@ def model_name_for(config: RunConfig, task: TaskSpec) -> str:
         if config.allow_node_revisit
         else ""
     )
+    sigma_label = (
+        f"_obs_sigma_{config.observation_sigma:g}"
+        if abs(float(config.observation_sigma)) > 1e-12
+        else ""
+    )
+    kl_schedule_label = (
+        f"_klstart_{config.kl_start_multiplier:g}_klanneal_{config.kl_annealing_epochs}"
+        if (
+            abs(float(config.kl_start_multiplier) - 1.0) > 1e-12
+            or int(config.kl_annealing_epochs) > 0
+        )
+        else ""
+    )
     return (
         f"lambda_{config.lambda_}_alpha_{config.alpha}_beta_{config.beta}_"
         f"opportunity_{config.opportunity_cost}_expansion_{config.expansion_decision_version}_"
         f"{model_variant_label(config.model_variant)}"
         f"seed_{config.seed}_{tree_label}_{architecture_file_label(config.rnn_units, config.latent_dim)}"
         f"{revisit_label}"
+        f"{sigma_label}"
+        f"{kl_schedule_label}"
     )
 
 
@@ -420,6 +442,10 @@ def scalar_to_category_index(values: jax.Array) -> jax.Array:
 
 def scalar_to_onehot(values: jax.Array) -> jax.Array:
     return jax.nn.one_hot(scalar_to_category_index(values), 9, dtype=jnp.float32)
+
+
+def reward_feature_dim_for_sigma(observation_sigma: float) -> int:
+    return 1 if abs(float(observation_sigma)) > 1e-12 else 9
 
 
 def sample_reward_matrix(
@@ -445,9 +471,15 @@ def sample_reward_sequence(
     return values[idx]
 
 
-def initial_carry(num_envs: int, task: TaskSpec, rnn_units: int) -> RunnerCarry:
+def initial_carry(
+    num_envs: int,
+    task: TaskSpec,
+    rnn_units: int,
+    reward_feature_dim: int = 9,
+) -> RunnerCarry:
     return RunnerCarry(
         rewards=jnp.zeros((num_envs, task.num_nodes), dtype=jnp.float32),
+        observed_rewards=jnp.zeros((num_envs, task.num_nodes), dtype=jnp.float32),
         observed=jnp.zeros((num_envs, task.num_nodes), dtype=jnp.float32),
         step_index=jnp.zeros((num_envs,), dtype=jnp.int32),
         done=jnp.ones((num_envs,), dtype=jnp.bool_),
@@ -456,9 +488,12 @@ def initial_carry(num_envs: int, task: TaskSpec, rnn_units: int) -> RunnerCarry:
         decoded_h=jnp.zeros((num_envs, rnn_units), dtype=jnp.float32),
         decoded_c=jnp.zeros((num_envs, rnn_units), dtype=jnp.float32),
         lstm_context=jnp.zeros((num_envs, rnn_units), dtype=jnp.float32),
-        pre_context=jnp.zeros((num_envs, rnn_units + task.num_nodes + 1 + 9), dtype=jnp.float32),
+        pre_context=jnp.zeros(
+            (num_envs, rnn_units + task.num_nodes + 1 + reward_feature_dim),
+            dtype=jnp.float32,
+        ),
         pending_kl=jnp.zeros((num_envs,), dtype=jnp.float32),
-        last_reward_onehot=jnp.zeros((num_envs, 9), dtype=jnp.float32),
+        last_reward_onehot=jnp.zeros((num_envs, reward_feature_dim), dtype=jnp.float32),
         trial_id=jnp.zeros((num_envs,), dtype=jnp.int32),
     )
 
@@ -472,6 +507,7 @@ def reset_done_envs(carry: RunnerCarry, reset_rewards: jax.Array) -> RunnerCarry
     zeros_reward = jnp.zeros_like(carry.last_reward_onehot)
     return RunnerCarry(
         rewards=jnp.where(done_2 > 0, reset_rewards, carry.rewards),
+        observed_rewards=jnp.where(done_2 > 0, zeros_nodes, carry.observed_rewards),
         observed=jnp.where(done_2 > 0, zeros_nodes, carry.observed),
         step_index=jnp.where(carry.done, jnp.zeros_like(carry.step_index), carry.step_index),
         done=jnp.zeros_like(carry.done),
@@ -494,6 +530,7 @@ def reset_all_envs(carry: RunnerCarry, reset_rewards: jax.Array) -> RunnerCarry:
     zeros_reward = jnp.zeros_like(carry.last_reward_onehot)
     return RunnerCarry(
         rewards=reset_rewards,
+        observed_rewards=zeros_nodes,
         observed=zeros_nodes,
         step_index=jnp.zeros_like(carry.step_index),
         done=jnp.zeros_like(carry.done),
@@ -524,12 +561,21 @@ class PlanningVAE(nn.Module):
     allow_node_revisit: bool
     max_observations_before_stop: int
     opportunity_cost: float
+    observation_sigma: float
     lambda_: float
     alpha: float
     beta: float
 
+    def reward_feature_dim(self) -> int:
+        return reward_feature_dim_for_sigma(self.observation_sigma)
+
+    def reward_features(self, values: jax.Array) -> jax.Array:
+        if self.reward_feature_dim() == 1:
+            return values[..., None].astype(jnp.float32)
+        return scalar_to_onehot(values)
+
     def setup(self):
-        input_dim = self.time_steps + 1 + 9
+        input_dim = self.time_steps + 1 + self.reward_feature_dim()
         self.lstm_kernel = self.param(
             "lstm_kernel",
             nn.initializers.orthogonal(),
@@ -625,10 +671,10 @@ class PlanningVAE(nn.Module):
             node_token.reshape((1, 1, time_steps + 1)),
             (step_count, batch_size, time_steps + 1),
         )
-        reward_tokens = scalar_to_onehot(sampled_rewards)
+        reward_tokens = self.reward_features(sampled_rewards)
         lstm_inputs = jnp.concatenate([node_tokens, reward_tokens], axis=-1)
 
-        flat_inputs = lstm_inputs.reshape((-1, time_steps + 1 + 9))
+        flat_inputs = lstm_inputs.reshape((-1, time_steps + 1 + self.reward_feature_dim()))
         flat_h = pre_decoded_h.reshape((-1, self.rnn_units))
         flat_c = pre_decoded_c.reshape((-1, self.rnn_units))
         raw_h, raw_c = self.lstm_cell(flat_inputs, flat_h, flat_c)
@@ -687,6 +733,7 @@ class PlanningVAE(nn.Module):
         training: bool = True,
         use_posterior_mean: bool = False,
         compute_targets: bool = True,
+        forced_observation: jax.Array | None = None,
     ) -> tuple[RunnerCarry, StepTransition]:
         if len(carry.rewards.shape) != 2 or len(carry.h.shape) != 2 or len(carry.decoded_h.shape) != 2:
             raise ValueError(
@@ -728,7 +775,7 @@ class PlanningVAE(nn.Module):
         log_probs_all = jax.nn.log_softmax(masked_logits, axis=-1)
         entropy = -jnp.sum(probs * jnp.log(probs + 1e-8), axis=-1)
 
-        rng_action, rng_eps, rng_force, rng_z = jax.random.split(rng, 4)
+        rng_action, rng_eps, rng_force, rng_z, rng_obs = jax.random.split(rng, 5)
         sampled_action = jax.random.categorical(rng_action, masked_logits, axis=-1)
         if forced_action is not None:
             action = forced_action.astype(jnp.int32)
@@ -765,8 +812,24 @@ class PlanningVAE(nn.Module):
         is_observe = is_observe_raw & (active > 0.0)
         safe_node = jnp.minimum(action, self.time_steps - 1)
         terminal_path = jnp.where(is_stop, action - self.time_steps, -jnp.ones_like(action))
-        chosen_reward = jnp.take_along_axis(carry.rewards, safe_node[:, None], axis=1)[:, 0]
-        reward_onehot = scalar_to_onehot(chosen_reward) * is_observe[:, None].astype(jnp.float32)
+        chosen_true_reward = jnp.take_along_axis(carry.rewards, safe_node[:, None], axis=1)[:, 0]
+        if abs(float(self.observation_sigma)) > 1e-12:
+            observation_noise = (
+                float(self.observation_sigma)
+                * jax.random.normal(rng_obs, chosen_true_reward.shape, dtype=jnp.float32)
+            )
+            sampled_observed_reward = chosen_true_reward + observation_noise
+        else:
+            sampled_observed_reward = chosen_true_reward
+        if forced_observation is not None:
+            chosen_observed_reward = jnp.where(
+                jnp.isfinite(forced_observation),
+                forced_observation,
+                sampled_observed_reward,
+            )
+        else:
+            chosen_observed_reward = sampled_observed_reward
+        reward_onehot = self.reward_features(chosen_observed_reward) * is_observe[:, None].astype(jnp.float32)
         node_token = jnp.where(is_observe, safe_node, self.time_steps)
         node_onehot = jax.nn.one_hot(node_token, self.time_steps + 1, dtype=jnp.float32)
         lstm_input = jnp.concatenate([node_onehot, reward_onehot], axis=-1)
@@ -820,6 +883,11 @@ class PlanningVAE(nn.Module):
 
         node_obs = jax.nn.one_hot(safe_node, self.time_steps, dtype=jnp.float32) * observe_mask
         observed_after = jnp.minimum(carry.observed + node_obs, 1.0)
+        observed_rewards_after = jnp.where(
+            node_obs > 0.0,
+            chosen_observed_reward[:, None],
+            carry.observed_rewards,
+        )
         if self.use_autoencoder and self.enable_reconstruction:
             rec_probs = self.reconstruct_probs(dec_h)
             target_onehot = scalar_to_onehot(carry.rewards)
@@ -833,7 +901,7 @@ class PlanningVAE(nn.Module):
 
         if self.enable_probe:
             probe_logits = self.probe_head(jax.lax.stop_gradient(raw_h))
-            reward_idx = scalar_to_category_index(chosen_reward)
+            reward_idx = scalar_to_category_index(chosen_observed_reward)
             probe_ce = optax.softmax_cross_entropy_with_integer_labels(probe_logits, reward_idx)
             probe_loss = probe_ce * is_observe.astype(jnp.float32)
             probe_correct = (
@@ -847,7 +915,7 @@ class PlanningVAE(nn.Module):
             valid_probe = jnp.zeros((batch_size,), dtype=jnp.float32)
 
         if compute_targets:
-            observed_rewards = carry.rewards[:, None, :] * carry.observed[:, None, :]
+            observed_rewards = carry.observed_rewards[:, None, :] * carry.observed[:, None, :]
             reward_prior_mean = jnp.mean(reward_values)
             belief_values = observed_rewards + (1.0 - carry.observed[:, None, :]) * reward_prior_mean
             stop_targets = jnp.einsum("btn,pn->btp", belief_values, path_map)[:, 0, :] / self.reward_norm_value
@@ -881,6 +949,7 @@ class PlanningVAE(nn.Module):
         next_step = carry.step_index + active.astype(jnp.int32)
         next_carry = RunnerCarry(
             rewards=carry.rewards,
+            observed_rewards=observed_rewards_after,
             observed=observed_after,
             step_index=next_step,
             done=episode_done,
@@ -897,6 +966,8 @@ class PlanningVAE(nn.Module):
 
         transition = StepTransition(
             rewards=carry.rewards,
+            observed_rewards_before=carry.observed_rewards,
+            observed_rewards_after=observed_rewards_after,
             valid=active,
             observed_before=carry.observed,
             observed_after=observed_after,
@@ -924,7 +995,7 @@ class PlanningVAE(nn.Module):
             prior_logvar=prior_logvar,
             paid_kl=paid_kl,
             observed_kl=observed_kl,
-            expanded_reward=jnp.where(is_observe, chosen_reward, jnp.nan),
+            expanded_reward=jnp.where(is_observe, chosen_observed_reward, jnp.nan),
             action_output=action_output,
             terminal_expected_reward=terminal_expected_reward,
             reconstruction_loss=reconstruction_loss,
@@ -942,6 +1013,19 @@ def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) ->
     # every batch in the epoch. Keep the JAX schedule epoch-discrete too.
     epoch = update_idx // max(updates_per_epoch, 1)
     target_beta = 1.0 / config.beta
+    if int(config.kl_annealing_epochs) > 0:
+        epoch_value = jnp.asarray(epoch, dtype=jnp.float32)
+        kl_progress = jnp.minimum(
+            epoch_value / float(max(int(config.kl_annealing_epochs) - 1, 1)),
+            1.0,
+        )
+        kl_multiplier = (
+            float(config.kl_start_multiplier)
+            + (1.0 - float(config.kl_start_multiplier)) * kl_progress
+        )
+    else:
+        kl_multiplier = 1.0
+    current_beta = target_beta * kl_multiplier
     if config.tree_size == 6:
         target_critic_coef = 1.0
     elif config.tree_size == 30:
@@ -955,7 +1039,7 @@ def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) ->
     else:
         critic_coef = target_critic_coef * (1.0 - ((epoch - 80) / 120.0))
     if config.tree_size > 2:
-        entropy_start, entropy_end, entropy_epochs, entropy_hold = 1.5, 0.01, 80.0, 90.0
+        entropy_start, entropy_end, entropy_epochs, entropy_hold = 1.5, 0.0, 60.0, 60.0
     else:
         entropy_start, entropy_end, entropy_epochs, entropy_hold = 1.0, 0.0, 50.0, 100.0
     if epoch >= entropy_hold:
@@ -967,7 +1051,7 @@ def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) ->
         entropy = entropy_start + (entropy_end - entropy_start) * progress
     return ScheduleValues(
         current_alpha=jnp.asarray(1.0, dtype=jnp.float32),
-        current_beta=jnp.asarray(target_beta, dtype=jnp.float32),
+        current_beta=jnp.asarray(current_beta, dtype=jnp.float32),
         current_critic_coef=jnp.asarray(critic_coef, dtype=jnp.float32),
         expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_entropy_coef=jnp.asarray(entropy, dtype=jnp.float32),
@@ -985,13 +1069,16 @@ def learning_rate_at(step: jax.Array, total_steps: int) -> jax.Array:
 
 def reduced_state_weights(transitions: StepTransition, time_steps: int) -> jax.Array:
     observed_count = jnp.sum(transitions.observed_before, axis=-1).astype(jnp.int32)
-    observed_rewards = transitions.rewards[:, :, None, :] * transitions.observed_before[:, :, None, :]
+    observed_rewards = (
+        transitions.observed_rewards_before[:, :, None, :]
+        * transitions.observed_before[:, :, None, :]
+    )
     # transitions arrays are [num_steps, num_envs, ...]; path calculation is done outside
     return observed_count
 
 
 def best_path_value_indices(transitions: StepTransition, path_map: jax.Array) -> tuple[jax.Array, jax.Array]:
-    observed_rewards = transitions.rewards * transitions.observed_before
+    observed_rewards = transitions.observed_rewards_before * transitions.observed_before
     path_values = jnp.einsum("sbn,pn->sbp", observed_rewards, path_map)
     path_counts = jnp.einsum("sbn,pn->sbp", transitions.observed_before, path_map)
     masked_path_values = jnp.where(path_counts > 0.0, path_values, -1e9)
@@ -1063,13 +1150,13 @@ def sampled_lambda_selected_targets(
 
     reward_prior_mean = jnp.mean(reward_values)
     before_values = belief_path_values(
-        transitions.rewards,
+        transitions.observed_rewards_before,
         transitions.observed_before,
         path_map,
         reward_prior_mean,
     )
     after_values = belief_path_values(
-        transitions.rewards,
+        transitions.observed_rewards_after,
         transitions.observed_after,
         path_map,
         reward_prior_mean,
@@ -1115,6 +1202,7 @@ def counterfactual_bootstrap_q_targets(
     params,
     target_params,
     transitions: StepTransition,
+    rng: jax.Array,
     path_map: jax.Array,
     reward_values: jax.Array,
     reward_norm_value: float,
@@ -1127,7 +1215,7 @@ def counterfactual_bootstrap_q_targets(
     step_count, batch_size, time_steps = transitions.observed_before.shape
     reward_prior_mean = jnp.mean(reward_values)
     stop_targets = belief_path_values(
-        transitions.rewards,
+        transitions.observed_rewards_before,
         transitions.observed_before,
         path_map,
         reward_prior_mean,
@@ -1135,18 +1223,33 @@ def counterfactual_bootstrap_q_targets(
     observe_cost = float(opportunity_cost) + current_beta * transitions.paid_kl
     step_ids = jnp.arange(step_count, dtype=jnp.int32)[:, None]
     has_next_decision = (step_ids < (time_steps - 1)).astype(jnp.float32)
+    if abs(float(model.observation_sigma)) > 1e-12:
+        counterfactual_noise = (
+            float(model.observation_sigma)
+            * jax.random.normal(
+                rng,
+                (time_steps, step_count, batch_size),
+                dtype=jnp.float32,
+            )
+        )
+    else:
+        counterfactual_noise = jnp.zeros(
+            (time_steps, step_count, batch_size),
+            dtype=jnp.float32,
+        )
 
     observe_targets_by_node = []
     for node_idx in range(time_steps):
         node_onehot = jax.nn.one_hot(node_idx, time_steps, dtype=jnp.float32)
         sampled_node_rewards = transitions.rewards[:, :, node_idx]
+        sampled_node_observations = sampled_node_rewards + counterfactual_noise[node_idx]
         next_node_values = (
-            transitions.rewards * transitions.observed_before
+            transitions.observed_rewards_before * transitions.observed_before
             + (1.0 - transitions.observed_before) * reward_prior_mean
         )
         next_node_values = (
             next_node_values * (1.0 - node_onehot.reshape((1, 1, time_steps)))
-            + sampled_node_rewards[:, :, None] * node_onehot.reshape((1, 1, time_steps))
+            + sampled_node_observations[:, :, None] * node_onehot.reshape((1, 1, time_steps))
         )
         terminal_best_stop = jnp.max(
             jnp.einsum("sbn,pn->sbp", next_node_values, path_map)
@@ -1157,7 +1260,7 @@ def counterfactual_bootstrap_q_targets(
             {"params": params},
             transitions.pre_decoded_h,
             transitions.pre_decoded_c,
-            sampled_node_rewards,
+            sampled_node_observations,
             node_idx,
             method=PlanningVAE.counterfactual_next_expansion_input,
         )
@@ -1221,6 +1324,7 @@ def apply_expansion_return_targets(
     config: RunConfig,
     task: TaskSpec,
     schedule: ScheduleValues,
+    rng: jax.Array,
 ) -> StepTransition:
     path_map = jnp.asarray(task.path_map, dtype=jnp.float32)
     reward_values = jnp.asarray(task.reward_values, dtype=jnp.float32)
@@ -1259,6 +1363,7 @@ def apply_expansion_return_targets(
             params,
             target_params,
             transitions,
+            rng,
             path_map,
             reward_values,
             task.reward_norm,
@@ -1383,6 +1488,7 @@ def build_rollout_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig):
         rng: jax.Array,
         schedule: ScheduleValues,
         forced_actions=None,
+        forced_observations=None,
         reset_rewards=None,
         training: bool = True,
         compute_targets: bool = True,
@@ -1396,6 +1502,7 @@ def build_rollout_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig):
             step_carry, step_rng = scan_carry
             step_rng, model_rng = jax.random.split(step_rng)
             forced_action = None if forced_actions is None else forced_actions[step_i]
+            forced_observation = None if forced_observations is None else forced_observations[step_i]
             next_carry, transition = model.apply(
                 {"params": params},
                 step_carry,
@@ -1404,6 +1511,7 @@ def build_rollout_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig):
                 forced_action,
                 training,
                 compute_targets=compute_targets,
+                forced_observation=forced_observation,
                 method=PlanningVAE.__call__,
             )
             transition = transition._replace(reset_rewards=reset_rewards, reset_trial_id=step_carry.trial_id)
@@ -1420,7 +1528,8 @@ def build_rollout_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig):
 
 
 def create_train_state(model: PlanningVAE, config: RunConfig, task: TaskSpec, rng: jax.Array, total_updates: int):
-    dummy_carry = initial_carry(config.num_envs, task, config.rnn_units)
+    reward_feature_dim = reward_feature_dim_for_sigma(config.observation_sigma)
+    dummy_carry = initial_carry(config.num_envs, task, config.rnn_units, reward_feature_dim)
     dummy_schedule = ScheduleValues(1.0, 1.0 / config.beta, 0.1, 0.0, 1.0, 0.0, 0.3)
     params = model.init(rng, dummy_carry, rng, dummy_schedule, None, True)["params"]
     schedule = lambda step: learning_rate_at(step, total_updates * max(config.update_epochs, 1))
@@ -1566,15 +1675,18 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
         rollout_carries, old_transitions = jax.vmap(collect_one)(rollout_keys)
         collect_carry = jax.tree_util.tree_map(lambda x: x[0], rollout_carries)
         forced_actions = jax.lax.stop_gradient(old_transitions.action)
+        forced_observations = jax.lax.stop_gradient(old_transitions.expanded_reward)
         old_logp = jax.lax.stop_gradient(old_transitions.log_prob)
 
-        def loss_for_rollout(params, replay_key, rollout_actions, rollout_old_logp):
+        def loss_for_rollout(params, replay_key, rollout_actions, rollout_observations, rollout_old_logp):
+            replay_rollout_key, target_key = jax.random.split(replay_key)
             _, _, transitions = rollout(
                 params,
                 carry,
-                replay_key,
+                replay_rollout_key,
                 schedule,
                 forced_actions=rollout_actions,
+                forced_observations=rollout_observations,
                 reset_rewards=reset_rewards,
                 training=True,
             )
@@ -1586,6 +1698,7 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
                 config,
                 task,
                 schedule,
+                target_key,
             )
             weights = compute_policy_weights(transitions, path_map, task.num_nodes)
             advantages = jax.lax.stop_gradient(transitions.selected_q_target - transitions.policy_value_pred)
@@ -1675,13 +1788,14 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
 
         def loss_fn(params):
             losses, _expansion_head_losses, metrics_tree = jax.vmap(
-                lambda replay_key, rollout_actions, rollout_old_logp: loss_for_rollout(
+                lambda replay_key, rollout_actions, rollout_observations, rollout_old_logp: loss_for_rollout(
                     params,
                     replay_key,
                     rollout_actions,
+                    rollout_observations,
                     rollout_old_logp,
                 )
-            )(replay_keys, forced_actions, old_logp)
+            )(replay_keys, forced_actions, forced_observations, old_logp)
             first_metrics = jax.tree_util.tree_map(lambda x: x[0], metrics_tree)
             metrics = first_metrics._replace(
                 total_loss=jnp.mean(metrics_tree.total_loss),
@@ -1699,13 +1813,14 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
 
         def expansion_head_loss_fn(params):
             _losses, expansion_head_losses, _metrics_tree = jax.vmap(
-                lambda replay_key, rollout_actions, rollout_old_logp: loss_for_rollout(
+                lambda replay_key, rollout_actions, rollout_observations, rollout_old_logp: loss_for_rollout(
                     params,
                     replay_key,
                     rollout_actions,
+                    rollout_observations,
                     rollout_old_logp,
                 )
-            )(replay_keys, forced_actions, old_logp)
+            )(replay_keys, forced_actions, forced_observations, old_logp)
             return jnp.mean(expansion_head_losses)
 
         def expansion_head_loss_from_subtree(expansion_head_params, params):
@@ -1817,6 +1932,7 @@ def build_update_component_profile_fns(
         rollout_carries, old_transitions = jax.vmap(collect_one)(rollout_keys)
         collect_carry = jax.tree_util.tree_map(lambda x: x[0], rollout_carries)
         forced_actions = jax.lax.stop_gradient(old_transitions.action)
+        forced_observations = jax.lax.stop_gradient(old_transitions.expanded_reward)
         old_logp = jax.lax.stop_gradient(old_transitions.log_prob)
         checksum = (
             jnp.sum(old_transitions.valid)
@@ -1827,6 +1943,7 @@ def build_update_component_profile_fns(
             reset_rewards=reset_rewards,
             replay_keys=replay_keys,
             forced_actions=forced_actions,
+            forced_observations=forced_observations,
             old_logp=old_logp,
             collect_carry=collect_carry,
             checksum=checksum,
@@ -1840,14 +1957,17 @@ def build_update_component_profile_fns(
         schedule: ScheduleValues,
         reset_rewards,
         rollout_actions,
+        rollout_observations,
         rollout_old_logp,
     ):
+        replay_rollout_key, target_key = jax.random.split(replay_key)
         _, _, transitions = rollout(
             params,
             carry,
-            replay_key,
+            replay_rollout_key,
             schedule,
             forced_actions=rollout_actions,
+            forced_observations=rollout_observations,
             reset_rewards=reset_rewards,
             training=True,
         )
@@ -1859,6 +1979,7 @@ def build_update_component_profile_fns(
             config,
             task,
             schedule,
+            target_key,
         )
         weights = compute_policy_weights(transitions, path_map, task.num_nodes)
         advantages = jax.lax.stop_gradient(transitions.selected_q_target - transitions.policy_value_pred)
@@ -1923,7 +2044,7 @@ def build_update_component_profile_fns(
     ):
         def loss_fn(loss_params):
             losses, _expansion_losses = jax.vmap(
-                lambda replay_key, rollout_actions, rollout_old_logp: profiled_loss_for_rollout(
+                lambda replay_key, rollout_actions, rollout_observations, rollout_old_logp: profiled_loss_for_rollout(
                     loss_params,
                     target_params,
                     carry,
@@ -1931,11 +2052,13 @@ def build_update_component_profile_fns(
                     schedule,
                     replay_inputs.reset_rewards,
                     rollout_actions,
+                    rollout_observations,
                     rollout_old_logp,
                 )
             )(
                 replay_inputs.replay_keys,
                 replay_inputs.forced_actions,
+                replay_inputs.forced_observations,
                 replay_inputs.old_logp,
             )
             return jnp.mean(losses)
@@ -1952,7 +2075,7 @@ def build_update_component_profile_fns(
     ):
         def expansion_head_loss_fn(loss_params):
             _losses, expansion_head_losses = jax.vmap(
-                lambda replay_key, rollout_actions, rollout_old_logp: profiled_loss_for_rollout(
+                lambda replay_key, rollout_actions, rollout_observations, rollout_old_logp: profiled_loss_for_rollout(
                     loss_params,
                     target_params,
                     carry,
@@ -1960,11 +2083,13 @@ def build_update_component_profile_fns(
                     schedule,
                     replay_inputs.reset_rewards,
                     rollout_actions,
+                    rollout_observations,
                     rollout_old_logp,
                 )
             )(
                 replay_inputs.replay_keys,
                 replay_inputs.forced_actions,
+                replay_inputs.forced_observations,
                 replay_inputs.old_logp,
             )
             return jnp.mean(expansion_head_losses)
@@ -2157,6 +2282,7 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         allow_node_revisit=config.allow_node_revisit,
         max_observations_before_stop=config.max_observations_before_stop,
         opportunity_cost=config.opportunity_cost,
+        observation_sigma=config.observation_sigma,
         lambda_=config.lambda_,
         alpha=config.alpha,
         beta=config.beta,
@@ -2165,7 +2291,8 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
     total_updates = config.epochs * updates_per_epoch
     rng, init_rng = jax.random.split(rng)
     state = create_train_state(model, config, task, init_rng, total_updates)
-    carry = initial_carry(config.num_envs, task, config.rnn_units)
+    reward_feature_dim = reward_feature_dim_for_sigma(config.observation_sigma)
+    carry = initial_carry(config.num_envs, task, config.rnn_units, reward_feature_dim)
     update_fn = build_update_fn(model, task, config, total_updates)
     profile_fns = (
         build_update_component_profile_fns(model, task, config)
@@ -2186,7 +2313,10 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         f"reconstruction={config.enable_reconstruction} | "
         f"probe={config.enable_probe} | "
         f"allow_node_revisit={config.allow_node_revisit} | "
-        f"max_observations_before_stop={config.max_observations_before_stop}",
+        f"max_observations_before_stop={config.max_observations_before_stop} | "
+        f"observation_sigma={config.observation_sigma} | "
+        f"kl_start_multiplier={config.kl_start_multiplier} | "
+        f"kl_annealing_epochs={config.kl_annealing_epochs}",
         flush=True,
     )
     rows = []
@@ -2288,6 +2418,9 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
                 "enable_probe": bool(config.enable_probe),
                 "allow_node_revisit": bool(config.allow_node_revisit),
                 "max_observations_before_stop": int(config.max_observations_before_stop),
+                "observation_sigma": float(config.observation_sigma),
+                "kl_start_multiplier": float(config.kl_start_multiplier),
+                "kl_annealing_epochs": int(config.kl_annealing_epochs),
             }
         )
         rows.append(row)
@@ -2355,12 +2488,14 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
         allow_node_revisit=config.allow_node_revisit,
         max_observations_before_stop=config.max_observations_before_stop,
         opportunity_cost=config.opportunity_cost,
+        observation_sigma=config.observation_sigma,
         lambda_=config.lambda_,
         alpha=config.alpha,
         beta=config.beta,
     )
     rng = jax.random.PRNGKey(config.seed)
-    dummy = initial_carry(1, task, config.rnn_units)
+    reward_feature_dim = reward_feature_dim_for_sigma(config.observation_sigma)
+    dummy = initial_carry(1, task, config.rnn_units, reward_feature_dim)
     sched = ScheduleValues(1.0, 1.0 / config.beta, 0.0, 0.0, 0.0, 0.0, 0.3)
     params = model.init(rng, dummy, rng, sched, None, False)["params"]
     weights_path = Path(config.model_dir) / f"{model_name_for(config, task)}.msgpack"
@@ -2390,7 +2525,8 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
     rng = jax.random.PRNGKey(config.seed + 100_000)
     np_rng = np.random.default_rng(config.seed + 200_000)
     num_trials = int(config.n_sim_trials)
-    carry = initial_carry(num_trials, task, config.rnn_units)
+    reward_feature_dim = reward_feature_dim_for_sigma(config.observation_sigma)
+    carry = initial_carry(num_trials, task, config.rnn_units, reward_feature_dim)
     rng, reset_rng = jax.random.split(rng)
     reset_rewards = sample_reward_matrix(reset_rng, num_trials, task.num_nodes, task.reward_values)
     carry = reset_done_envs(carry, reset_rewards)
@@ -2404,9 +2540,10 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
             carry,
             step_rng,
             sched,
-            None,
-            True,
-            False,
+            forced_action=None,
+            training=True,
+            use_posterior_mean=False,
+            compute_targets=False,
             method=PlanningVAE.__call__,
         )
         transitions.append(jax.device_get(trans))
@@ -2435,17 +2572,28 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
             "V": chosen_value,
             "MI": float(np.nansum([np.asarray(t.paid_kl)[trial] for t in transitions])),
             "opportunity_cost": config.opportunity_cost,
+            "observation_sigma": float(config.observation_sigma),
             "expansion_decision_version": config.expansion_decision_version,
             "allow_node_revisit": bool(config.allow_node_revisit),
             "max_observations_before_stop": int(config.max_observations_before_stop),
         }
+        stopped_before_timestep = False
         for t, trans in enumerate(transitions, start=1):
             node_idx = int(np.asarray(trans.node_index)[trial])
+            stopped_now = bool(np.asarray(trans.is_stop)[trial] > 0)
             trial_row[f"expanded_node_t{t}"] = np.nan if node_idx < 0 else node_idx + 1
             trial_row[f"expanded_reward_t{t}"] = np.asarray(trans.expanded_reward)[trial]
-            trial_row[f"stop_t{t}"] = bool(np.asarray(trans.is_stop)[trial] > 0)
+            trial_row[f"stop_t{t}"] = stopped_now
             trial_row[f"kl_d_t{t}"] = float(np.asarray(trans.paid_kl)[trial])
             trial_row[f"kl_d_obs_t{t}"] = float(np.asarray(trans.observed_kl)[trial])
+            trial_row[f"action_policy_entropy_t{t}"] = (
+                np.nan if stopped_before_timestep else float(np.asarray(trans.entropy)[trial])
+            )
+            terminal_choice_probs = np.asarray(trans.action_output[trial], dtype=float)
+            for path_idx, path_prob in enumerate(terminal_choice_probs, start=1):
+                trial_row[f"action_output_path{path_idx}_t{t}"] = float(path_prob)
+                trial_row[f"terminal_choice_prob_path{path_idx}_t{t}"] = float(path_prob)
+            stopped_before_timestep = stopped_before_timestep or stopped_now
         for node in range(task.num_nodes):
             row = dict(trial_row)
             row["node"] = node + 1
@@ -2569,6 +2717,36 @@ def parse_args() -> RunConfig:
             "Used most often with --allow-node-revisit. Default: 10."
         ),
     )
+    parser.add_argument(
+        "--observation-sigma",
+        "--sigma",
+        dest="observation_sigma",
+        type=float,
+        default=float(os.environ.get("OBSERVATION_SIGMA", "0.0")),
+        help=(
+            "Standard deviation of Gaussian observation noise. Observed rewards "
+            "are sampled as Normal(true_reward, sigma^2). Default: 0."
+        ),
+    )
+    parser.add_argument(
+        "--kl-start-multiplier",
+        type=float,
+        default=float(os.environ.get("KL_START_MULTIPLIER", "1.0")),
+        help=(
+            "Initial multiplier on the effective KL weight 1/beta. "
+            "Use 0 with --kl-annealing-epochs for classic KL warm-up, or >1 "
+            "to start with stronger KL pressure and anneal back to target. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--kl-annealing-epochs",
+        type=int,
+        default=int(os.environ.get("KL_ANNEALING_EPOCHS", "0")),
+        help=(
+            "Number of schedule epochs over which KL multiplier moves from "
+            "--kl-start-multiplier to 1. Default: 0, no KL annealing."
+        ),
+    )
     args = parser.parse_args()
 
     lambda_values = parse_float_list(args.lambda_string)
@@ -2625,6 +2803,9 @@ def parse_args() -> RunConfig:
         enable_probe=bool(args.enable_probe),
         allow_node_revisit=bool(args.allow_node_revisit),
         max_observations_before_stop=max_observations_before_stop,
+        observation_sigma=max(float(args.observation_sigma), 0.0),
+        kl_start_multiplier=max(float(args.kl_start_multiplier), 0.0),
+        kl_annealing_epochs=max(int(args.kl_annealing_epochs), 0),
     )
 
 

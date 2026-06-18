@@ -442,10 +442,18 @@ def disjoint3x2_exact_action_label(
     action: pd.Series,
     path_states: Sequence[Sequence[float]],
     path_order: Sequence[int],
+    prior_mean: float = 0.0,
 ) -> str:
     action_kind = str(action.get("action_kind", ""))
     if action_kind == "stop":
-        return "stop"
+        path_length = len(TASK_SPECS["disjoint3x2"][0])
+        posterior_values = np.asarray([
+            sum(path_state) + (path_length - len(path_state)) * prior_mean
+            for path_state in path_states
+        ], dtype=float)
+        ordered_values = posterior_values[list(path_order)]
+        best_rank = int(np.where(np.isclose(ordered_values, np.max(ordered_values)))[0][0]) + 1
+        return f"stop_P{best_rank}"
     if action_kind != "observe":
         return action_kind or "unknown"
     target = parse_path_state(action.get("observe_path_state", ""))
@@ -462,6 +470,8 @@ def build_disjoint3x2_condition_action_summary(actions: pd.DataFrame, states: pd
     task = "disjoint3x2"
     paths = TASK_SPECS[task]
     node_count = max(node for path in paths for node in path) + 1
+    reward_values = reward_values_from_actions(actions)
+    prior_mean = float(np.mean(reward_values)) if reward_values else 0.0
     actions_by_key = build_actions_by_cost_state(actions)
     rows = []
     for row in states.itertuples(index=False):
@@ -485,7 +495,7 @@ def build_disjoint3x2_condition_action_summary(actions: pd.DataFrame, states: pd
             "count_pattern": count_pattern,
             "best_path_identity": best_path_identity,
             "best_path_value": best_path_value,
-            "action_label": disjoint3x2_exact_action_label(action, state, path_order),
+            "action_label": disjoint3x2_exact_action_label(action, state, path_order, prior_mean),
             "mass": 1.0,
         })
     if not rows:

@@ -570,6 +570,8 @@ def trial_timestep_dataframe(
         observed_order_json = safe_json_dumps(observed_order)
         t1_observed_value = observed_values[trial_i, 0] if n_steps > 0 else np.nan
         t2_observed_value = observed_values[trial_i, 1] if n_steps > 1 else np.nan
+        t1_observed_node = observed_nodes[trial_i, 0] if n_steps > 0 else np.nan
+        t2_observed_node = observed_nodes[trial_i, 1] if n_steps > 1 else np.nan
         reward_t2_minus_reward_t1 = (
             t2_observed_value - t1_observed_value
             if np.isfinite(t1_observed_value) and np.isfinite(t2_observed_value)
@@ -615,6 +617,8 @@ def trial_timestep_dataframe(
                 "trial_uid": f"{metadata['model_id']}::trial_{trial_i}",
                 "timestep": int(t + 1),
                 "observed_node": observed_nodes[trial_i, t],
+                "observed_node_t1": t1_observed_node,
+                "observed_node_t2": t2_observed_node,
                 "observed_value": observed_values[trial_i, t],
                 "t1_observed_value": t1_observed_value,
                 "reward_t1": t1_observed_value,
@@ -6984,7 +6988,7 @@ def geometry_coordinate_space_lookup() -> Dict[str, Dict]:
 
 
 def build_geometry_coordinate_long(df: pd.DataFrame) -> pd.DataFrame:
-    df = add_geometry_meaning_columns(df)
+    df = ensure_observed_node_summary_columns(add_geometry_meaning_columns(df))
     meta_cols = [
         col for col in (
             MODEL_GROUP_COLUMNS
@@ -6994,6 +6998,9 @@ def build_geometry_coordinate_long(df: pd.DataFrame) -> pd.DataFrame:
                 "timestep",
                 "reward_t1",
                 "reward_t2",
+                "observed_node",
+                "observed_node_t1",
+                "observed_node_t2",
                 "current_best_path",
                 "current_best_path_value",
                 "current_best_path_margin",
@@ -7177,35 +7184,42 @@ def plot_geometry_coordinate_scatter_t1(coord: pd.DataFrame, figdir: Path):
             dims = [dim for dim in (0, 1) if (piece["latent_dimension"] == dim).any()]
             if not dims:
                 continue
-            fig, axes = plt.subplots(1, len(dims), figsize=panel_figsize(len(dims), 1, colorbar=True, title=True), squeeze=False)
+            panel_groups = node_condition_groups(piece, ["observed_node_t1"], fallback_label="all")
+            fig, axes = plt.subplots(
+                len(panel_groups),
+                len(dims),
+                figsize=panel_figsize(len(dims), len(panel_groups), colorbar=True, title=True),
+                squeeze=False,
+            )
             scatter = None
-            for col_i, dim in enumerate(dims):
-                ax = axes[0, col_i]
-                dim_df = piece[piece["latent_dimension"] == dim].copy()
-                numeric = dim_df[["x", "y", "reward_t1"]].apply(pd.to_numeric, errors="coerce")
-                dim_df = dim_df[np.isfinite(numeric).all(axis=1)].copy()
-                if len(dim_df) > 8000:
-                    dim_df = dim_df.sample(8000, random_state=301 + dim)
-                scatter = ax.scatter(
-                    dim_df["x"],
-                    dim_df["y"],
-                    c=pd.to_numeric(dim_df["reward_t1"], errors="coerce"),
-                    cmap=cmap,
-                    norm=norm,
-                    s=6,
-                    alpha=0.42,
-                    linewidths=0,
-                )
-                draw_geometry_space_background(ax, space)
-                if space in axis_limits:
-                    ax.set_xlim(*axis_limits[space][0])
-                    ax.set_ylim(*axis_limits[space][1])
-                ax.set_title(f"dim {dim}", fontsize=PANEL_FONT_SIZE)
-                ax.set_xlabel(space_spec["x_label"], fontsize=PANEL_FONT_SIZE)
-                ax.set_ylabel(space_spec["y_label"], fontsize=PANEL_FONT_SIZE)
-                ax.tick_params(labelsize=PANEL_FONT_SIZE)
+            for row_i, (panel_label, panel_df) in enumerate(panel_groups):
+                for col_i, dim in enumerate(dims):
+                    ax = axes[row_i, col_i]
+                    dim_df = panel_df[panel_df["latent_dimension"] == dim].copy()
+                    numeric = dim_df[["x", "y", "reward_t1"]].apply(pd.to_numeric, errors="coerce")
+                    dim_df = dim_df[np.isfinite(numeric).all(axis=1)].copy()
+                    if len(dim_df) > 8000:
+                        dim_df = dim_df.sample(8000, random_state=301 + row_i * 10 + dim)
+                    scatter = ax.scatter(
+                        dim_df["x"],
+                        dim_df["y"],
+                        c=pd.to_numeric(dim_df["reward_t1"], errors="coerce"),
+                        cmap=cmap,
+                        norm=norm,
+                        s=6,
+                        alpha=0.42,
+                        linewidths=0,
+                    )
+                    draw_geometry_space_background(ax, space)
+                    if space in axis_limits:
+                        ax.set_xlim(*axis_limits[space][0])
+                        ax.set_ylim(*axis_limits[space][1])
+                    ax.set_title(f"{panel_label}, dim {dim}", fontsize=PANEL_FONT_SIZE)
+                    ax.set_xlabel(space_spec["x_label"], fontsize=PANEL_FONT_SIZE)
+                    ax.set_ylabel(space_spec["y_label"], fontsize=PANEL_FONT_SIZE)
+                    ax.tick_params(labelsize=PANEL_FONT_SIZE)
             fig.suptitle(f"{space}, t1, seed {seed}", fontsize=PANEL_FONT_SIZE)
-            fig.subplots_adjust(right=0.80, wspace=0.82, top=0.84)
+            fig.subplots_adjust(right=0.80, wspace=0.82, hspace=0.46, top=0.90)
             if scatter is not None:
                 add_first_row_colorbar(fig, axes, scatter, "reward_t1", width=0.035)
             fig.savefig(
@@ -7239,18 +7253,17 @@ def plot_geometry_coordinate_scatter_t2_by_r1(coord: pd.DataFrame, figdir: Path)
             space = space_spec["space"]
             piece = seed_df[seed_df["space"] == space].copy()
             dims = [dim for dim in (0, 1) if (piece["latent_dimension"] == dim).any()]
-            reward_t1_values = sorted(pd.to_numeric(piece["reward_t1"], errors="coerce").dropna().unique())
-            if not dims or not reward_t1_values:
+            panel_groups = node_condition_groups(piece, ["observed_node_t1", "observed_node_t2"], fallback_label="all")
+            if not dims or not panel_groups:
                 continue
             fig, axes = plt.subplots(
-                len(reward_t1_values),
+                len(panel_groups),
                 len(dims),
-                figsize=panel_figsize(len(dims), len(reward_t1_values), colorbar=True, title=True),
+                figsize=panel_figsize(len(dims), len(panel_groups), colorbar=True, title=True),
                 squeeze=False,
             )
             scatter = None
-            for row_i, reward_t1_value in enumerate(reward_t1_values):
-                row_df = piece[np.isclose(pd.to_numeric(piece["reward_t1"], errors="coerce"), reward_t1_value)].copy()
+            for row_i, (panel_label, row_df) in enumerate(panel_groups):
                 for col_i, dim in enumerate(dims):
                     ax = axes[row_i, col_i]
                     dim_df = row_df[row_df["latent_dimension"] == dim].copy()
@@ -7272,7 +7285,7 @@ def plot_geometry_coordinate_scatter_t2_by_r1(coord: pd.DataFrame, figdir: Path)
                     if space in axis_limits:
                         ax.set_xlim(*axis_limits[space][0])
                         ax.set_ylim(*axis_limits[space][1])
-                    ax.set_title(f"R1={reward_t1_value:g}, dim {dim}", fontsize=PANEL_FONT_SIZE)
+                    ax.set_title(f"{panel_label}, dim {dim}", fontsize=PANEL_FONT_SIZE)
                     ax.set_xlabel(space_spec["x_label"], fontsize=PANEL_FONT_SIZE)
                     ax.set_ylabel(space_spec["y_label"], fontsize=PANEL_FONT_SIZE)
                     ax.tick_params(labelsize=PANEL_FONT_SIZE)
@@ -7319,35 +7332,36 @@ def plot_geometry_feature_reward_relationships(coord: pd.DataFrame, figdir: Path
             ]
             if not dims:
                 continue
+            t1_space = seed_t1[seed_t1["space"] == space].copy()
+            t1_panel_groups = node_condition_groups(t1_space, ["observed_node_t1"], fallback_label="all")
             fig, axes = plt.subplots(
-                len(GEOMETRY_COORDINATE_FEATURES),
+                len(GEOMETRY_COORDINATE_FEATURES) * len(t1_panel_groups),
                 len(dims),
-                figsize=panel_figsize(len(dims), len(GEOMETRY_COORDINATE_FEATURES), title=True),
+                figsize=panel_figsize(len(dims), len(GEOMETRY_COORDINATE_FEATURES) * len(t1_panel_groups), title=True),
                 squeeze=False,
             )
-            for row_i, feature in enumerate(GEOMETRY_COORDINATE_FEATURES):
-                for col_i, dim in enumerate(dims):
-                    ax = axes[row_i, col_i]
-                    piece = seed_t1[
-                        (seed_t1["space"] == space)
-                        & (seed_t1["latent_dimension"] == dim)
-                    ].copy()
-                    numeric = piece[["reward_t1", feature]].apply(pd.to_numeric, errors="coerce")
-                    piece = piece[np.isfinite(numeric).all(axis=1)].copy()
-                    ax.scatter(
-                        pd.to_numeric(piece["reward_t1"], errors="coerce"),
-                        pd.to_numeric(piece[feature], errors="coerce"),
-                        s=7,
-                        alpha=0.38,
-                        linewidths=0,
-                        color="#2b6cb0",
-                    )
-                    if (space, feature) in feature_limits:
-                        ax.set_ylim(*feature_limits[(space, feature)])
-                    ax.set_title(f"{feature}, dim {dim}", fontsize=PANEL_FONT_SIZE)
-                    ax.set_xlabel("reward_t1", fontsize=PANEL_FONT_SIZE)
-                    ax.set_ylabel(feature, fontsize=PANEL_FONT_SIZE)
-                    ax.tick_params(labelsize=PANEL_FONT_SIZE)
+            for panel_i, (panel_label, panel_df) in enumerate(t1_panel_groups):
+                for feature_i, feature in enumerate(GEOMETRY_COORDINATE_FEATURES):
+                    row_i = panel_i * len(GEOMETRY_COORDINATE_FEATURES) + feature_i
+                    for col_i, dim in enumerate(dims):
+                        ax = axes[row_i, col_i]
+                        piece = panel_df[panel_df["latent_dimension"] == dim].copy()
+                        numeric = piece[["reward_t1", feature]].apply(pd.to_numeric, errors="coerce")
+                        piece = piece[np.isfinite(numeric).all(axis=1)].copy()
+                        ax.scatter(
+                            pd.to_numeric(piece["reward_t1"], errors="coerce"),
+                            pd.to_numeric(piece[feature], errors="coerce"),
+                            s=7,
+                            alpha=0.38,
+                            linewidths=0,
+                            color="#2b6cb0",
+                        )
+                        if (space, feature) in feature_limits:
+                            ax.set_ylim(*feature_limits[(space, feature)])
+                        ax.set_title(f"{panel_label}, {feature}, dim {dim}", fontsize=PANEL_FONT_SIZE)
+                        ax.set_xlabel("reward_t1", fontsize=PANEL_FONT_SIZE)
+                        ax.set_ylabel(feature, fontsize=PANEL_FONT_SIZE)
+                        ax.tick_params(labelsize=PANEL_FONT_SIZE)
             fig.suptitle(f"{space}, t1, seed {seed}", fontsize=PANEL_FONT_SIZE)
             fig.subplots_adjust(wspace=0.35, hspace=0.58, top=0.92)
             fig.savefig(
@@ -7359,38 +7373,39 @@ def plot_geometry_feature_reward_relationships(coord: pd.DataFrame, figdir: Path
 
             if t2_norm is None:
                 continue
+            t2_space = seed_t2[seed_t2["space"] == space].copy()
+            t2_panel_groups = node_condition_groups(t2_space, ["observed_node_t1", "observed_node_t2"], fallback_label="all")
             fig, axes = plt.subplots(
-                len(GEOMETRY_COORDINATE_FEATURES),
+                len(GEOMETRY_COORDINATE_FEATURES) * len(t2_panel_groups),
                 len(dims),
-                figsize=panel_figsize(len(dims), len(GEOMETRY_COORDINATE_FEATURES), colorbar=True, title=True),
+                figsize=panel_figsize(len(dims), len(GEOMETRY_COORDINATE_FEATURES) * len(t2_panel_groups), colorbar=True, title=True),
                 squeeze=False,
             )
             scatter = None
-            for row_i, feature in enumerate(GEOMETRY_COORDINATE_FEATURES):
-                for col_i, dim in enumerate(dims):
-                    ax = axes[row_i, col_i]
-                    piece = seed_t2[
-                        (seed_t2["space"] == space)
-                        & (seed_t2["latent_dimension"] == dim)
-                    ].copy()
-                    numeric = piece[["reward_t1", "reward_t2", feature]].apply(pd.to_numeric, errors="coerce")
-                    piece = piece[np.isfinite(numeric).all(axis=1)].copy()
-                    scatter = ax.scatter(
-                        pd.to_numeric(piece["reward_t2"], errors="coerce"),
-                        pd.to_numeric(piece[feature], errors="coerce"),
-                        c=pd.to_numeric(piece["reward_t1"], errors="coerce"),
-                        cmap=t2_cmap,
-                        norm=t2_norm,
-                        s=7,
-                        alpha=0.38,
-                        linewidths=0,
-                    )
-                    if (space, feature) in feature_limits:
-                        ax.set_ylim(*feature_limits[(space, feature)])
-                    ax.set_title(f"{feature}, dim {dim}", fontsize=PANEL_FONT_SIZE)
-                    ax.set_xlabel("reward_t2", fontsize=PANEL_FONT_SIZE)
-                    ax.set_ylabel(feature, fontsize=PANEL_FONT_SIZE)
-                    ax.tick_params(labelsize=PANEL_FONT_SIZE)
+            for panel_i, (panel_label, panel_df) in enumerate(t2_panel_groups):
+                for feature_i, feature in enumerate(GEOMETRY_COORDINATE_FEATURES):
+                    row_i = panel_i * len(GEOMETRY_COORDINATE_FEATURES) + feature_i
+                    for col_i, dim in enumerate(dims):
+                        ax = axes[row_i, col_i]
+                        piece = panel_df[panel_df["latent_dimension"] == dim].copy()
+                        numeric = piece[["reward_t1", "reward_t2", feature]].apply(pd.to_numeric, errors="coerce")
+                        piece = piece[np.isfinite(numeric).all(axis=1)].copy()
+                        scatter = ax.scatter(
+                            pd.to_numeric(piece["reward_t2"], errors="coerce"),
+                            pd.to_numeric(piece[feature], errors="coerce"),
+                            c=pd.to_numeric(piece["reward_t1"], errors="coerce"),
+                            cmap=t2_cmap,
+                            norm=t2_norm,
+                            s=7,
+                            alpha=0.38,
+                            linewidths=0,
+                        )
+                        if (space, feature) in feature_limits:
+                            ax.set_ylim(*feature_limits[(space, feature)])
+                        ax.set_title(f"{panel_label}, {feature}, dim {dim}", fontsize=PANEL_FONT_SIZE)
+                        ax.set_xlabel("reward_t2", fontsize=PANEL_FONT_SIZE)
+                        ax.set_ylabel(feature, fontsize=PANEL_FONT_SIZE)
+                        ax.tick_params(labelsize=PANEL_FONT_SIZE)
             fig.suptitle(f"{space}, t2, seed {seed}", fontsize=PANEL_FONT_SIZE)
             fig.subplots_adjust(right=0.84, wspace=0.35, hspace=0.58, top=0.92)
             if scatter is not None:
@@ -8141,7 +8156,95 @@ def ensure_latent_density_reward_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["observed_reward_t1"] = df["reward_t1"]
     if "observed_reward_t2" not in df.columns and "reward_t2" in df.columns:
         df["observed_reward_t2"] = df["reward_t2"]
+    df = ensure_observed_node_summary_columns(df)
     return df
+
+
+def ensure_observed_node_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add stable node-at-t1/t2 columns when only per-row observed_node exists."""
+    if df is None or len(df) == 0:
+        return df.copy() if hasattr(df, "copy") else pd.DataFrame()
+    out = df.copy()
+    if {"observed_node_t1", "observed_node_t2"}.issubset(out.columns):
+        return out
+    if not {"observed_node", "timestep"}.issubset(out.columns):
+        return out
+    key_cols = [
+        col for col in ["model_id", "trial_uid"]
+        if col in out.columns
+    ]
+    if "trial_uid" not in key_cols and "trial_id" in out.columns:
+        metadata_cols = [
+            "model_id",
+            "checkpoint_path",
+            "seed",
+            "lambda_value",
+            "beta",
+            "alpha",
+            "opportunity_cost",
+            "rnn_dim",
+            "latent_dim",
+            "tree_size",
+            "tree_type",
+            "input_type",
+            "expansion_decision_version",
+            "model_variant",
+        ]
+        key_cols = [col for col in metadata_cols if col in out.columns] + ["trial_id"]
+    if not key_cols:
+        return out
+    work = out[key_cols + ["timestep", "observed_node"]].copy()
+    work["_timestep"] = pd.to_numeric(work["timestep"], errors="coerce")
+    work["_observed_node"] = pd.to_numeric(work["observed_node"], errors="coerce")
+    for timestep in (1, 2):
+        col = f"observed_node_t{timestep}"
+        if col in out.columns:
+            continue
+        lookup = (
+            work[np.isclose(work["_timestep"], timestep)]
+            .drop_duplicates(key_cols, keep="first")
+            .set_index(key_cols)["_observed_node"]
+        )
+        keys = pd.MultiIndex.from_frame(out[key_cols]) if len(key_cols) > 1 else out[key_cols[0]]
+        out[col] = lookup.reindex(keys).to_numpy()
+    return out
+
+
+def node_condition_groups(
+    df: pd.DataFrame,
+    node_cols: Sequence[str],
+    *,
+    fallback_label: str = "all",
+) -> List[Tuple[str, pd.DataFrame]]:
+    """Return plot panels keyed by observed node sequence."""
+    if df is None or len(df) == 0 or not all(col in df.columns for col in node_cols):
+        return [(fallback_label, df)]
+    work = df.copy()
+    numeric_cols = []
+    for col in node_cols:
+        num_col = f"_{col}_numeric"
+        work[num_col] = pd.to_numeric(work[col], errors="coerce")
+        numeric_cols.append(num_col)
+    valid = np.isfinite(work[numeric_cols]).all(axis=1)
+    if not bool(valid.any()):
+        return [(fallback_label, df)]
+    groups = []
+    valid_work = work[valid].copy()
+    order = (
+        valid_work[numeric_cols]
+        .drop_duplicates()
+        .sort_values(numeric_cols)
+        .itertuples(index=False, name=None)
+    )
+    for values in order:
+        mask = np.ones(len(valid_work), dtype=bool)
+        labels = []
+        for col, num_col, value in zip(node_cols, numeric_cols, values):
+            mask &= np.isclose(valid_work[num_col], value)
+            labels.append(f"{col.replace('observed_node_', 'node ')}={int(value)}")
+        label = ", ".join(labels)
+        groups.append((label, valid_work[mask].drop(columns=numeric_cols, errors="ignore")))
+    return groups if groups else [(fallback_label, df)]
 
 
 def latent_density_group_suffix(piece: pd.DataFrame) -> str:
@@ -8226,38 +8329,50 @@ def plot_latent_2d_density_t1(
         reward_max += 0.5
     cmap = plt.get_cmap("viridis")
     norm = Normalize(vmin=reward_min, vmax=reward_max)
-    fig, ax = plt.subplots(figsize=panel_figsize(1, 1, colorbar=True, title=True))
-    for label in order:
-        group = t1[t1["_reward_group"] == label]
-        if len(group) == 0:
-            continue
-        group_rewards = pd.to_numeric(group["reward_t1"], errors="coerce")
-        color = cmap(norm(float(group_rewards.mean())))
-        ax.scatter(
-            group["z_mu_0"],
-            group["z_mu_1"],
-            c=group_rewards,
-            cmap=cmap,
-            norm=norm,
-            s=5,
-            alpha=0.15,
-            linewidths=0,
-        )
-        density = compute_gaussian_mixture_density(
-            group, x_grid, y_grid, "z_mu_0", "z_mu_1", "z_sigma_0", "z_sigma_1"
-        )
-        levels = positive_contour_levels(density)
-        if levels is not None:
-            ax.contour(x_grid, y_grid, density, levels=levels, colors=[color], linewidths=1.0)
-    ax.set_xlim(*xlim)
-    ax.set_ylim(*ylim)
-    ax.set_xlabel("z_0")
-    ax.set_ylabel("z_1")
-    ax.set_title(latent_density_title(piece, "Timestep 1: aggregate 2D posterior density by observed reward at t1"), fontsize=PANEL_FONT_SIZE)
+    panel_groups = node_condition_groups(t1, ["observed_node_t1"], fallback_label="all")
+    n_panels = len(panel_groups)
+    ncols = min(2, n_panels)
+    nrows = int(math.ceil(n_panels / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=panel_figsize(ncols, nrows, colorbar=True, title=True), squeeze=False)
+    for ax in axes.ravel()[n_panels:]:
+        ax.axis("off")
+    for panel_i, (panel_label, panel_df) in enumerate(panel_groups):
+        ax = axes.ravel()[panel_i]
+        for label in order:
+            group = panel_df[panel_df["_reward_group"] == label]
+            if len(group) == 0:
+                continue
+            group_rewards = pd.to_numeric(group["reward_t1"], errors="coerce")
+            color = cmap(norm(float(group_rewards.mean())))
+            ax.scatter(
+                group["z_mu_0"],
+                group["z_mu_1"],
+                c=group_rewards,
+                cmap=cmap,
+                norm=norm,
+                s=5,
+                alpha=0.15,
+                linewidths=0,
+            )
+            density = compute_gaussian_mixture_density(
+                group, x_grid, y_grid, "z_mu_0", "z_mu_1", "z_sigma_0", "z_sigma_1"
+            )
+            levels = positive_contour_levels(density)
+            if levels is not None:
+                ax.contour(x_grid, y_grid, density, levels=levels, colors=[color], linewidths=1.0)
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_xlabel("z_0")
+        ax.set_ylabel("z_1")
+        ax.set_title(panel_label, fontsize=PANEL_FONT_SIZE)
+    fig.suptitle(
+        latent_density_title(piece, "Timestep 1: aggregate 2D posterior density; panels = node observed at t1"),
+        fontsize=PANEL_FONT_SIZE,
+    )
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
-    fig.tight_layout(rect=[0, 0, 0.86, 1])
-    add_first_row_colorbar(fig, np.asarray([[ax]], dtype=object), sm, "reward_t1", width=0.03)
+    fig.tight_layout(rect=[0, 0, 0.86, 0.94])
+    add_first_row_colorbar(fig, axes, sm, "reward_t1", width=0.03)
     name = "latent_2d_density_t1_by_reward_t1.png" if standard_name else f"latent_2d_density_t1_by_reward_t1{filename_suffix}.png"
     fig.savefig(figdir / name, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -8295,12 +8410,10 @@ def plot_latent_2d_density_t2(
     xlim, ylim = limits
     x_grid = np.linspace(xlim[0], xlim[1], grid_n)
     y_grid = np.linspace(ylim[0], ylim[1], grid_n)
-    r1_labels, r1_order, _ = latent_density_reward_groups(t2, "reward_t1")
     r2_labels, r2_order, _ = latent_density_reward_groups(t2, "reward_t2")
-    if not r1_order or not r2_order:
+    if not r2_order:
         return
     t2 = t2.copy()
-    t2["_reward_t1_group"] = r1_labels
     t2["_reward_t2_group"] = r2_labels
     reward_numeric = pd.to_numeric(t2["reward_t2"], errors="coerce")
     finite_reward = reward_numeric[np.isfinite(reward_numeric)]
@@ -8313,15 +8426,30 @@ def plot_latent_2d_density_t2(
         reward_max += 0.5
     cmap = plt.get_cmap("viridis")
     norm = Normalize(vmin=reward_min, vmax=reward_max)
-    n_panels = len(r1_order)
+    have_node_panels = all(col in t2.columns for col in ["observed_node_t1", "observed_node_t2"]) and bool(
+        np.isfinite(t2[["observed_node_t1", "observed_node_t2"]].apply(pd.to_numeric, errors="coerce")).all(axis=1).any()
+    )
+    if have_node_panels:
+        panel_groups = node_condition_groups(t2, ["observed_node_t1", "observed_node_t2"], fallback_label="all")
+        panel_title = "Timestep 2: aggregate 2D posterior density; panels = node observed at t1/t2, color = reward at t2"
+    else:
+        r1_labels, r1_order, _ = latent_density_reward_groups(t2, "reward_t1")
+        if not r1_order:
+            return
+        t2["_reward_t1_group"] = r1_labels
+        panel_groups = [
+            (f"reward_t1={r1_label}", t2[t2["_reward_t1_group"] == r1_label])
+            for r1_label in r1_order
+        ]
+        panel_title = "Timestep 2: aggregate 2D posterior density; panels = reward at t1, color = reward at t2"
+    n_panels = len(panel_groups)
     ncols = 2 if n_panels > 4 else 1
     nrows = int(math.ceil(n_panels / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=panel_figsize(ncols, nrows, colorbar=True, title=True), squeeze=False)
     for ax in axes.ravel()[n_panels:]:
         ax.axis("off")
-    for panel_i, r1_label in enumerate(r1_order):
+    for panel_i, (panel_label, panel) in enumerate(panel_groups):
         ax = axes.ravel()[panel_i]
-        panel = t2[t2["_reward_t1_group"] == r1_label]
         for r2_label in r2_order:
             group = panel[panel["_reward_t2_group"] == r2_label]
             if len(group) == 0:
@@ -8348,9 +8476,9 @@ def plot_latent_2d_density_t2(
         ax.set_ylim(*ylim)
         ax.set_xlabel("z_0")
         ax.set_ylabel("z_1")
-        ax.set_title(f"reward_t1={r1_label}", fontsize=PANEL_FONT_SIZE)
+        ax.set_title(panel_label, fontsize=PANEL_FONT_SIZE)
     fig.suptitle(
-        latent_density_title(piece, "Timestep 2: aggregate 2D posterior density; panels = reward at t1, color = reward at t2"),
+        latent_density_title(piece, panel_title),
         fontsize=PANEL_FONT_SIZE,
     )
     fig.tight_layout(rect=[0, 0, 0.86, 0.95])

@@ -370,6 +370,7 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
     return(NA_character_)
   }
 
+  optional_training_suffix <- "(_klstart_[^_]+_klanneal_[^_]+)?"
   files <- list.files(input_dir, full.names = TRUE)
   for (tree_label_candidate in simulation_tree_file_labels()) {
     for (variant_file_segment in variant_file_segments) {
@@ -378,7 +379,9 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
           pattern = paste0(
             "^lambda_([^_]+)_alpha_([^_]+)_scaler_([^_]+)_opportunity_([^_]+)_",
             "expansion_", expansion_decision_version, "_", variant_file_segment,
-            "seed_", seed, "_", tree_label_candidate, "_", input_type, "\\.csv$"
+            "seed_", seed, "_", tree_label_candidate,
+            optional_training_suffix,
+            "_", input_type, "\\.csv$"
           ),
           requested = requested_lambda_scaler
         ),
@@ -386,7 +389,9 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
           pattern = paste0(
             "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
             "expansion_", expansion_decision_version, "_", variant_file_segment,
-            "seed_", seed, "_", tree_label_candidate, "_", input_type, "\\.csv$"
+            "seed_", seed, "_", tree_label_candidate,
+            optional_training_suffix,
+            "_", input_type, "\\.csv$"
           ),
           requested = requested_legacy
         )
@@ -469,6 +474,7 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
     return(data.frame(path = character(), seed = integer(), stringsAsFactors = FALSE))
   }
 
+  optional_training_suffix <- "(_klstart_[^_]+_klanneal_[^_]+)?"
   files <- list.files(input_dir, full.names = TRUE)
   rows <- list()
   for (tree_label_candidate in simulation_tree_file_labels()) {
@@ -479,7 +485,9 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
           pattern = paste0(
             "^lambda_([^_]+)_alpha_([^_]+)_scaler_([^_]+)_opportunity_([^_]+)_",
             "expansion_", expansion_decision_version, "_", variant_file_segment,
-            "seed_([0-9]+)_", tree_label_candidate, "_", input_type, "\\.csv$"
+            "seed_([0-9]+)_", tree_label_candidate,
+            optional_training_suffix,
+            "_", input_type, "\\.csv$"
           ),
           requested = requested_lambda_scaler
         ),
@@ -487,7 +495,9 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
           pattern = paste0(
             "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
             "expansion_", expansion_decision_version, "_", variant_file_segment,
-            "seed_([0-9]+)_", tree_label_candidate, "_", input_type, "\\.csv$"
+            "seed_([0-9]+)_", tree_label_candidate,
+            optional_training_suffix,
+            "_", input_type, "\\.csv$"
           ),
           requested = requested_legacy
         )

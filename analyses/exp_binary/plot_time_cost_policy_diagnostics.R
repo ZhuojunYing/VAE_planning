@@ -27,9 +27,11 @@ arg17 <- get_arg(17, "")
 if (tolower(trimws(arg17)) %in% source_arg_values) {
   zero_exact_dir <- "analyses/exp_binary/results/exact_time_cost_zero"
   simulation_source_arg <- arg17
+  sigma_arg <- get_arg(18, "0")
 } else {
   zero_exact_dir <- get_arg(17, "analyses/exp_binary/results/exact_time_cost_zero")
   simulation_source_arg <- get_arg(18, "tensorflow")
+  sigma_arg <- get_arg(19, "0")
 }
 
 normalize_simulation_source <- function(source) {
@@ -190,6 +192,7 @@ apply_panel_text_style <- function() {
 beta_values <- trimws(strsplit(beta_arg, ",")[[1]])
 opportunity_values <- trimws(strsplit(opportunity_arg, ",")[[1]])
 optimal_time_cost_values <- trimws(strsplit(optimal_time_cost_arg, ",")[[1]])
+sigma_values <- trimws(strsplit(sigma_arg, ",")[[1]])
 auto_seeds <- identical(tolower(trimws(seed_arg)), "auto")
 seed_values <- if (auto_seeds) {
   integer()
@@ -237,7 +240,13 @@ lambda_label <- compact_arg_label(trimws(strsplit(lambda_arg, ",")[[1]]))
 alpha_label <- compact_arg_label(trimws(strsplit(alpha_arg, ",")[[1]]))
 opportunity_label <- compact_arg_label(opportunity_values)
 beta_label <- compact_arg_label(beta_values)
+sigma_label <- compact_arg_label(sigma_values)
 optimal_time_cost_label <- compact_arg_label(optimal_time_cost_values)
+sigma_numeric_values <- suppressWarnings(as.numeric(sigma_values))
+sigma_arg_is_default <- length(sigma_values) == 1L &&
+  !is.na(sigma_numeric_values[[1]]) &&
+  abs(sigma_numeric_values[[1]]) < 1e-12
+sigma_file_suffix <- if (sigma_arg_is_default) "" else paste0("_sigma_", sigma_label)
 optimal_time_cost_suffix <- if (!identical(optimal_time_cost_arg, opportunity_arg)) {
   "_optimal"
 } else {
@@ -260,6 +269,31 @@ simulation_tree_file_labels <- function() {
     labels <- c(labels, tree_file_label)
   }
   unique(labels)
+}
+
+simulation_optional_suffix_regex <- function() {
+  # JAX filenames may include non-default analysis/training suffixes before
+  # the input-type tag, e.g. _obs_sigma_0.5_klstart_5_klanneal_60.
+  # Do not match revisit suffixes here; those runs are intentionally separate.
+  "(_obs_sigma_[^_]+)?(_klstart_[^_]+_klanneal_[0-9]+)?"
+}
+
+filename_sigma_value <- function(path) {
+  matches <- regexec("_obs_sigma_([^_]+)", basename(path))
+  pieces <- regmatches(basename(path), matches)[[1]]
+  if (length(pieces) >= 2L) {
+    return(pieces[[2L]])
+  }
+  "0"
+}
+
+sigma_matches <- function(path, sigma_value) {
+  found <- suppressWarnings(as.numeric(filename_sigma_value(path)))
+  requested <- suppressWarnings(as.numeric(sigma_value))
+  if (!is.na(found) && !is.na(requested)) {
+    return(abs(found - requested) < 1e-8)
+  }
+  identical(as.character(filename_sigma_value(path)), as.character(sigma_value))
 }
 
 drop_unnamed_index_columns <- function(dat) {
@@ -320,8 +354,11 @@ read_csv_fast <- function(path, keep_names = character(), keep_patterns = charac
 simulation_keep_names <- c(
   "V",
   "graph",
+  "node",
+  "actual_reward",
   "chosen_path",
   "opportunity_cost",
+  "observation_sigma",
   "expansion_decision_version"
 )
 simulation_keep_patterns <- c(
@@ -349,7 +386,7 @@ value_candidates <- function(x) {
   unique(candidates)
 }
 
-numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed) {
+numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed, sigma_value) {
   requested <- suppressWarnings(as.numeric(c(
     lambda_value, alpha_value, beta_value, opportunity_value
   )))
@@ -363,7 +400,9 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
       pattern <- paste0(
         "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
         "expansion_", expansion_decision_version, "_", variant_file_segment,
-        "seed_", seed, "_", tree_label_candidate, "_", input_type, "\\.csv$"
+        "seed_", seed, "_", tree_label_candidate,
+        simulation_optional_suffix_regex(),
+        "_", input_type, "\\.csv$"
       )
       matches <- regexec(pattern, basename(files))
       pieces <- regmatches(basename(files), matches)
@@ -376,7 +415,9 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
           next
         }
         if (all(abs(found - requested) < 1e-8)) {
-          return(files[[i]])
+          if (sigma_matches(files[[i]], sigma_value)) {
+            return(files[[i]])
+          }
         }
       }
     }
@@ -384,21 +425,31 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
   NA_character_
 }
 
-simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed) {
+simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed, sigma_value) {
   for (lambda_candidate in value_candidates(lambda_value)) {
     for (alpha_candidate in value_candidates(alpha_value)) {
       for (beta_candidate in value_candidates(beta_value)) {
         for (opportunity_candidate in value_candidates(opportunity_value)) {
           for (tree_label_candidate in simulation_tree_file_labels()) {
             for (variant_file_segment in variant_file_segments) {
-              file_name <- sprintf(
-                "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%s_%s.csv",
-                lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate,
-                expansion_decision_version, variant_file_segment, seed, tree_label_candidate, input_type
-              )
-              file_path <- file.path(input_dir, file_name)
-              if (file.exists(file_path)) {
-                return(file_path)
+              for (sigma_candidate in value_candidates(sigma_value)) {
+                sigma_num <- suppressWarnings(as.numeric(sigma_candidate))
+                suffixes <- if (!is.na(sigma_num) && abs(sigma_num) < 1e-12) {
+                  c("", paste0("_obs_sigma_", sigma_candidate))
+                } else {
+                  paste0("_obs_sigma_", sigma_candidate)
+                }
+                for (suffix in suffixes) {
+                  file_name <- sprintf(
+                    "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%s%s_%s.csv",
+                    lambda_candidate, alpha_candidate, beta_candidate, opportunity_candidate,
+                    expansion_decision_version, variant_file_segment, seed, tree_label_candidate, suffix, input_type
+                  )
+                  file_path <- file.path(input_dir, file_name)
+                  if (file.exists(file_path)) {
+                    return(file_path)
+                  }
+                }
               }
             }
           }
@@ -406,10 +457,10 @@ simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_v
       }
     }
   }
-  numeric_file_match(lambda_value, alpha_value, beta_value, opportunity_value, seed)
+  numeric_file_match(lambda_value, alpha_value, beta_value, opportunity_value, seed, sigma_value)
 }
 
-matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opportunity_value) {
+matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opportunity_value, sigma_value) {
   requested <- suppressWarnings(as.numeric(c(
     lambda_value, alpha_value, beta_value, opportunity_value
   )))
@@ -425,7 +476,9 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
       pattern <- paste0(
         "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
         "expansion_", expansion_decision_version, "_", variant_file_segment,
-        "seed_([0-9]+)_", tree_label_candidate, "_", input_type, "\\.csv$"
+        "seed_([0-9]+)_", tree_label_candidate,
+        simulation_optional_suffix_regex(),
+        "_", input_type, "\\.csv$"
       )
       matches <- regexec(pattern, basename(files))
       pieces <- regmatches(basename(files), matches)
@@ -438,10 +491,11 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
         if (any(is.na(found)) || is.na(seed_value)) {
           next
         }
-        if (all(abs(found - requested) < 1e-8)) {
+        if (all(abs(found - requested) < 1e-8) && sigma_matches(files[[i]], sigma_value)) {
           tree_rows[[length(tree_rows) + 1]] <- data.frame(
             path = files[[i]],
             seed = seed_value,
+            sigma = sigma_value,
             stringsAsFactors = FALSE
           )
         }
@@ -463,12 +517,12 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
   out[order(out$seed, out$path), , drop = FALSE]
 }
 
-read_seed_file <- function(beta_value, opportunity_value, seed) {
-  file_path <- simulation_path(lambda_arg, alpha_arg, beta_value, opportunity_value, seed)
+read_seed_file <- function(beta_value, opportunity_value, seed, sigma_value) {
+  file_path <- simulation_path(lambda_arg, alpha_arg, beta_value, opportunity_value, seed, sigma_value)
   if (is.na(file_path)) {
     warning(sprintf(
-      "Missing simulation file for beta=%s opportunity=%s seed=%d model_variant=%s",
-      beta_value, opportunity_value, seed, model_variant
+      "Missing simulation file for beta=%s opportunity=%s sigma=%s seed=%d model_variant=%s",
+      beta_value, opportunity_value, sigma_value, seed, model_variant
     ))
     return(NULL)
   }
@@ -480,6 +534,7 @@ read_seed_file <- function(beta_value, opportunity_value, seed) {
   dat <- unique(dat)
   dat$beta <- beta_value
   dat$opportunity <- opportunity_value
+  dat$sigma <- sigma_value
   dat$seed <- seed
   dat$model_variant <- model_variant
   dat$file_path <- file_path
@@ -487,7 +542,7 @@ read_seed_file <- function(beta_value, opportunity_value, seed) {
   dat
 }
 
-read_simulation_file <- function(file_path, beta_value, opportunity_value, seed) {
+read_simulation_file <- function(file_path, beta_value, opportunity_value, seed, sigma_value) {
   dat <- read_csv_fast(
     file_path,
     keep_names = simulation_keep_names,
@@ -496,6 +551,7 @@ read_simulation_file <- function(file_path, beta_value, opportunity_value, seed)
   dat <- unique(dat)
   dat$beta <- beta_value
   dat$opportunity <- opportunity_value
+  dat$sigma <- sigma_value
   dat$seed <- seed
   dat$model_variant <- model_variant
   dat$file_path <- file_path
@@ -521,33 +577,37 @@ bind_rows_fill <- function(data_list) {
 loaded_data <- list()
 for (beta_value in beta_values) {
   for (opportunity_value in opportunity_values) {
-    if (auto_seeds) {
-      combo_files <- matching_simulation_files(
-        lambda_arg,
-        alpha_arg,
-        beta_value,
-        opportunity_value
-      )
-      if (nrow(combo_files) == 0) {
-        warning(sprintf(
-          "Missing simulation files for beta=%s opportunity=%s model_variant=%s",
-          beta_value, opportunity_value, model_variant
-        ))
-      }
-      for (file_i in seq_len(nrow(combo_files))) {
-        seed_data <- read_simulation_file(
-          combo_files$path[[file_i]],
+    for (sigma_value in sigma_values) {
+      if (auto_seeds) {
+        combo_files <- matching_simulation_files(
+          lambda_arg,
+          alpha_arg,
           beta_value,
           opportunity_value,
-          combo_files$seed[[file_i]]
+          sigma_value
         )
-        loaded_data[[length(loaded_data) + 1]] <- seed_data
-      }
-    } else {
-      for (seed in seed_values) {
-        seed_data <- read_seed_file(beta_value, opportunity_value, seed)
-        if (!is.null(seed_data)) {
+        if (nrow(combo_files) == 0) {
+          warning(sprintf(
+            "Missing simulation files for beta=%s opportunity=%s sigma=%s model_variant=%s",
+            beta_value, opportunity_value, sigma_value, model_variant
+          ))
+        }
+        for (file_i in seq_len(nrow(combo_files))) {
+          seed_data <- read_simulation_file(
+            combo_files$path[[file_i]],
+            beta_value,
+            opportunity_value,
+            combo_files$seed[[file_i]],
+            combo_files$sigma[[file_i]]
+          )
           loaded_data[[length(loaded_data) + 1]] <- seed_data
+        }
+      } else {
+        for (seed in seed_values) {
+          seed_data <- read_seed_file(beta_value, opportunity_value, seed, sigma_value)
+          if (!is.null(seed_data)) {
+            loaded_data[[length(loaded_data) + 1]] <- seed_data
+          }
         }
       }
     }
@@ -582,6 +642,35 @@ if (nrow(all_data) == 0) {
   stop("No rows remained after filtering opportunity_cost and expansion_decision_version.")
 }
 
+all_data$sigma <- as.character(all_data$sigma)
+
+sigma_value_matches <- function(values, sigma_value) {
+  value_nums <- suppressWarnings(as.numeric(values))
+  sigma_num <- suppressWarnings(as.numeric(sigma_value))
+  if (!is.na(sigma_num) && any(!is.na(value_nums))) {
+    return(!is.na(value_nums) & abs(value_nums - sigma_num) < 1e-8)
+  }
+  as.character(values) == as.character(sigma_value)
+}
+
+sigma_levels <- sigma_values[vapply(sigma_values, function(sigma_value) {
+  any(sigma_value_matches(all_data$sigma, sigma_value))
+}, logical(1))]
+if (length(sigma_levels) == 0) {
+  sigma_levels <- unique(as.character(all_data$sigma))
+}
+
+filter_sigma_rows <- function(dat, sigma_value) {
+  if (is.null(dat) || nrow(dat) == 0 || !"sigma" %in% names(dat)) {
+    return(dat)
+  }
+  dat[sigma_value_matches(dat$sigma, sigma_value), , drop = FALSE]
+}
+
+sigma_panel_title <- function(sigma_value) {
+  sprintf("sigma %s", format_plot_values(sigma_value))
+}
+
 as_logical_col <- function(x) {
   if (is.logical(x)) {
     return(x)
@@ -613,7 +702,7 @@ trial_alive_before_decision <- function(row_data, decision_timestep) {
 }
 
 unique_trial_rows <- function(dat, required_cols) {
-  trial_id_cols <- intersect(c("beta", "opportunity", "seed", "graph"), names(dat))
+  trial_id_cols <- intersect(c("sigma", "beta", "opportunity", "seed", "graph"), names(dat))
   trial_cols <- unique(c(trial_id_cols, required_cols))
   unique(dat[, trial_cols, drop = FALSE])
 }
@@ -663,6 +752,7 @@ build_difference_continue_feature_summary_fast <- function(dat, max_decision_tim
   ))
   required_cols <- required_cols[required_cols %in% names(dat)]
   trial_data <- unique_trial_rows(dat, required_cols)
+  actual_lookup <- build_node_actual_reward_lookup(dat)
   rows <- list()
   row_index <- seq_len(nrow(trial_data))
 
@@ -681,7 +771,7 @@ build_difference_continue_feature_summary_fast <- function(dat, max_decision_tim
         next
       }
       node_values <- suppressWarnings(as.integer(trial_data[[node_col]]))
-      reward_values_t <- suppressWarnings(as.numeric(trial_data[[reward_col]]))
+      reward_values_t <- observed_actual_reward_values(trial_data, node_col, reward_col, actual_lookup)
       path_indices <- path_id_for_node(node_values)
       valid_obs <- !is.na(path_indices) &
         !is.na(reward_values_t) &
@@ -709,6 +799,7 @@ build_difference_continue_feature_summary_fast <- function(dat, max_decision_tim
     }
 
     rows[[length(rows) + 1L]] <- data.frame(
+      sigma = trial_data$sigma[keep],
       beta = trial_data$beta[keep],
       opportunity = trial_data$opportunity[keep],
       decision_timestep = decision_timestep,
@@ -724,7 +815,104 @@ build_difference_continue_feature_summary_fast <- function(dat, max_decision_tim
   continue_data <- do.call(rbind, rows)
   summarize_probability(
     continue_data,
-    group_cols = c("beta", "opportunity", "decision_timestep", "path_value_difference"),
+    group_cols = c("sigma", "beta", "opportunity", "decision_timestep", "path_value_difference"),
+    action_col = "continue_action",
+    out_col = "p_continue"
+  )
+}
+
+build_best_continue_feature_summary_fast <- function(dat, max_decision_timestep) {
+  if (max_decision_timestep < 2L) {
+    return(data.frame())
+  }
+  required_cols <- unique(c(
+    paste0("expanded_node_t", seq_len(max_decision_timestep - 1L)),
+    paste0("expanded_reward_t", seq_len(max_decision_timestep - 1L)),
+    paste0("stop_t", seq_len(max_decision_timestep))
+  ))
+  required_cols <- required_cols[required_cols %in% names(dat)]
+  trial_data <- unique_trial_rows(dat, required_cols)
+  if (nrow(trial_data) == 0) {
+    return(data.frame())
+  }
+  actual_lookup <- build_node_actual_reward_lookup(dat)
+
+  rows <- list()
+  row_index <- seq_len(nrow(trial_data))
+  path_values <- matrix(0, nrow = nrow(trial_data), ncol = task_path_count)
+  path_counts <- matrix(0L, nrow = nrow(trial_data), ncol = task_path_count)
+
+  for (decision_timestep in 2:max_decision_timestep) {
+    observed_timestep <- decision_timestep - 1L
+    node_col <- paste0("expanded_node_t", observed_timestep)
+    reward_col <- paste0("expanded_reward_t", observed_timestep)
+    if (all(c(node_col, reward_col) %in% names(trial_data))) {
+      node_values <- suppressWarnings(as.integer(trial_data[[node_col]]))
+      reward_values_t <- observed_actual_reward_values(trial_data, node_col, reward_col, actual_lookup)
+      path_indices <- path_id_for_node(node_values)
+      valid_obs <- !is.na(path_indices) &
+        !is.na(reward_values_t) &
+        path_indices >= 1L &
+        path_indices <= task_path_count
+      if (any(valid_obs)) {
+        idx <- cbind(row_index[valid_obs], path_indices[valid_obs])
+        path_values[idx] <- path_values[idx] + reward_values_t[valid_obs]
+        path_counts[idx] <- path_counts[idx] + 1L
+      }
+    }
+
+    stop_col <- paste0("stop_t", decision_timestep)
+    if (!stop_col %in% names(trial_data)) {
+      next
+    }
+    observed_path_values <- path_values
+    observed_path_values[path_counts <= 0L] <- -Inf
+    best_path_values <- do.call(
+      pmax,
+      c(as.data.frame(observed_path_values, check.names = FALSE), list(na.rm = FALSE))
+    )
+    stop_raw <- trial_data[[stop_col]]
+    valid_stop <- !is.na(stop_raw)
+    alive <- row_alive_before_decision(trial_data, decision_timestep)
+    observed_any <- rowSums(path_counts > 0L) > 0L
+    keep <- valid_stop & alive & observed_any & is.finite(best_path_values)
+    if (!any(keep)) {
+      next
+    }
+
+    row_data <- data.frame(
+      sigma = trial_data$sigma[keep],
+      beta = trial_data$beta[keep],
+      opportunity = trial_data$opportunity[keep],
+      decision_timestep = decision_timestep,
+      best_path_value = best_path_values[keep],
+      continue_action = as.numeric(!as_logical_col(stop_raw[keep])),
+      stringsAsFactors = FALSE
+    )
+    if (is_disjoint3x2) {
+      best_mask <- path_counts > 0L & abs(path_values - best_path_values) < 1e-12
+      complete_mask <- path_counts >= task_nodes_per_path
+      row_data$best_path_complete <- ifelse(
+        rowSums(best_mask[keep, , drop = FALSE] & complete_mask[keep, , drop = FALSE]) > 0L,
+        "complete",
+        "incomplete"
+      )
+    }
+    rows[[length(rows) + 1L]] <- row_data
+  }
+
+  if (length(rows) == 0) {
+    return(data.frame())
+  }
+  continue_data <- do.call(rbind, rows)
+  group_cols <- c("sigma", "beta", "opportunity", "decision_timestep", "best_path_value")
+  if (is_disjoint3x2 && "best_path_complete" %in% names(continue_data)) {
+    continue_data <- continue_data[!is.na(continue_data$best_path_complete), , drop = FALSE]
+    group_cols <- c(group_cols, "best_path_complete")
+  }
+  summarize_probability(
+    continue_data,
+    group_cols = group_cols,
     action_col = "continue_action",
     out_col = "p_continue"
   )
@@ -790,7 +978,7 @@ path_id_for_node <- function(node) {
   out
 }
 
-path_state_before_decision <- function(row_data, decision_timestep) {
+path_state_before_decision <- function(row_data, decision_timestep, actual_lookup = NULL) {
   values <- rep(0, task_path_count)
   counts <- rep(0L, task_path_count)
   if (decision_timestep <= 1) {
@@ -803,7 +991,7 @@ path_state_before_decision <- function(row_data, decision_timestep) {
       next
     }
     node_value <- suppressWarnings(as.integer(row_data[[node_col]][[1]]))
-    reward_value <- suppressWarnings(as.numeric(row_data[[reward_col]][[1]]))
+    reward_value <- observed_actual_reward_values(row_data, node_col, reward_col, actual_lookup)[[1]]
     path_index <- path_id_for_node(node_value)
     if (
       !is.na(path_index) && !is.na(reward_value) &&
@@ -816,7 +1004,7 @@ path_state_before_decision <- function(row_data, decision_timestep) {
   list(values = values, counts = counts)
 }
 
-path_state_after_observation <- function(row_data, observation_timestep) {
+path_state_after_observation <- function(row_data, observation_timestep, actual_lookup = NULL) {
   values <- rep(0, task_path_count)
   counts <- rep(0L, task_path_count)
   if (observation_timestep < 1) {
@@ -829,7 +1017,7 @@ path_state_after_observation <- function(row_data, observation_timestep) {
       next
     }
     node_value <- suppressWarnings(as.integer(row_data[[node_col]][[1]]))
-    reward_value <- suppressWarnings(as.numeric(row_data[[reward_col]][[1]]))
+    reward_value <- observed_actual_reward_values(row_data, node_col, reward_col, actual_lookup)[[1]]
     path_index <- path_id_for_node(node_value)
     if (
       !is.na(path_index) && !is.na(reward_value) &&
@@ -849,8 +1037,62 @@ trial_key_values <- function(dat, key_cols) {
   do.call(paste, c(lapply(key_cols, function(col) as.character(dat[[col]])), sep = "\r"))
 }
 
+build_node_actual_reward_lookup <- function(dat) {
+  key_cols <- intersect(c("sigma", "beta", "opportunity", "seed", "graph"), names(dat))
+  if (!all(c("node", "actual_reward") %in% names(dat))) {
+    return(list(key_cols = key_cols, rewards = numeric(), available = FALSE))
+  }
+  node_data <- unique(dat[, unique(c(key_cols, "node", "actual_reward")), drop = FALSE])
+  node_data$node <- suppressWarnings(as.integer(node_data$node))
+  node_data$actual_reward <- suppressWarnings(as.numeric(node_data$actual_reward))
+  node_data <- node_data[
+    !is.na(node_data$node) &
+      !is.na(node_data$actual_reward) &
+      node_data$node >= 1L &
+      node_data$node <= task_node_count,
+    ,
+    drop = FALSE
+  ]
+  if (nrow(node_data) == 0) {
+    return(list(key_cols = key_cols, rewards = numeric(), available = FALSE))
+  }
+  node_data$key <- paste(trial_key_values(node_data, key_cols), node_data$node, sep = "\r")
+  node_data <- node_data[!duplicated(node_data$key), , drop = FALSE]
+  rewards <- node_data$actual_reward
+  names(rewards) <- node_data$key
+  list(key_cols = key_cols, rewards = rewards, available = TRUE)
+}
+
+actual_reward_for_nodes <- function(trial_data, node_values, actual_lookup) {
+  out <- rep(NA_real_, length(node_values))
+  if (
+    is.null(actual_lookup) ||
+      !isTRUE(actual_lookup$available) ||
+      length(actual_lookup$rewards) == 0 ||
+      !all(actual_lookup$key_cols %in% names(trial_data))
+  ) {
+    return(out)
+  }
+  node_values <- suppressWarnings(as.integer(node_values))
+  valid_nodes <- !is.na(node_values) & node_values >= 1L & node_values <= task_node_count
+  if (!any(valid_nodes)) {
+    return(out)
+  }
+  keys <- paste(trial_key_values(trial_data, actual_lookup$key_cols), node_values, sep = "\r")
+  matched <- actual_lookup$rewards[keys]
+  out[valid_nodes] <- suppressWarnings(as.numeric(matched[valid_nodes]))
+  out
+}
+
+observed_actual_reward_values <- function(trial_data, node_col, reward_col, actual_lookup) {
+  node_values <- suppressWarnings(as.integer(trial_data[[node_col]]))
+  actual_values <- actual_reward_for_nodes(trial_data, node_values, actual_lookup)
+  fallback_values <- suppressWarnings(as.numeric(trial_data[[reward_col]]))
+  ifelse(is.finite(actual_values), actual_values, fallback_values)
+}
+
 build_trial_path_reward_lookup <- function(dat) {
-  key_cols <- intersect(c("beta", "opportunity", "seed", "graph"), names(dat))
+  key_cols <- intersect(c("sigma", "beta", "opportunity", "seed", "graph"), names(dat))
   if (!all(c("node", "actual_reward") %in% names(dat))) {
     return(list(key_cols = key_cols, rewards = list()))
   }
@@ -939,6 +1181,12 @@ build_continue_feature_summary <- function(dat, feature_type) {
   if (max_decision_timestep < 2) {
     return(data.frame())
   }
+  if (identical(feature_type, "best")) {
+    fast_summary <- build_best_continue_feature_summary_fast(dat, max_decision_timestep)
+    if (!is.null(fast_summary)) {
+      return(fast_summary)
+    }
+  }
   if (!identical(feature_type, "best") && task_path_count == 2L) {
     fast_summary <- build_difference_continue_feature_summary_fast(dat, max_decision_timestep)
     if (!is.null(fast_summary)) {
@@ -952,6 +1200,7 @@ build_continue_feature_summary <- function(dat, feature_type) {
   ))
   required_cols <- required_cols[required_cols %in% names(dat)]
   trial_data <- unique_trial_rows(dat, required_cols)
+  actual_lookup <- build_node_actual_reward_lookup(dat)
   rows <- list()
 
   for (decision_timestep in 2:max_decision_timestep) {
@@ -964,7 +1213,7 @@ build_continue_feature_summary <- function(dat, feature_type) {
       if (is.na(row_data[[stop_col]][[1]]) || !trial_alive_before_decision(row_data, decision_timestep)) {
         next
       }
-      state <- path_state_before_decision(row_data, decision_timestep)
+      state <- path_state_before_decision(row_data, decision_timestep, actual_lookup)
       if (feature_type == "best") {
         observed_values <- state$values[state$counts > 0L]
         if (length(observed_values) == 0) {
@@ -996,6 +1245,7 @@ build_continue_feature_summary <- function(dat, feature_type) {
         best_path_complete <- NA_character_
       }
       rows[[length(rows) + 1]] <- data.frame(
+        sigma = trial_data$sigma[[row_i]],
         beta = trial_data$beta[[row_i]],
         opportunity = trial_data$opportunity[[row_i]],
         decision_timestep = decision_timestep,
@@ -1013,7 +1263,7 @@ build_continue_feature_summary <- function(dat, feature_type) {
   }
   continue_data <- do.call(rbind, rows)
   feature_col <- if (feature_type == "best") "best_path_value" else "path_value_difference"
-  group_cols <- c("beta", "opportunity", "decision_timestep", feature_col)
+  group_cols <- c("sigma", "beta", "opportunity", "decision_timestep", feature_col)
   if (feature_type == "best" && is_disjoint3x2 && "best_path_complete" %in% names(continue_data)) {
     continue_data <- continue_data[!is.na(continue_data$best_path_complete), , drop = FALSE]
     group_cols <- c(group_cols, "best_path_complete")
@@ -1077,6 +1327,7 @@ build_disjoint3x2_condition_action_summary <- function(dat) {
   if (nrow(trial_data) == 0) {
     return(data.frame())
   }
+  actual_lookup <- build_node_actual_reward_lookup(dat)
 
   chosen_path_values <- if ("chosen_path" %in% names(trial_data)) {
     suppressWarnings(as.integer(trial_data$chosen_path))
@@ -1125,7 +1376,7 @@ build_disjoint3x2_condition_action_summary <- function(dat) {
     reward_col <- paste0("expanded_reward_t", observed_timestep)
     if (all(c(node_col, reward_col) %in% names(trial_data))) {
       node_values <- suppressWarnings(as.integer(trial_data[[node_col]]))
-      reward_values_t <- suppressWarnings(as.numeric(trial_data[[reward_col]]))
+      reward_values_t <- observed_actual_reward_values(trial_data, node_col, reward_col, actual_lookup)
       path_indices <- path_id_for_node(node_values)
       valid_obs <- !is.na(path_indices) &
         !is.na(reward_values_t) &
@@ -1208,6 +1459,7 @@ build_disjoint3x2_condition_action_summary <- function(dat) {
       next
     }
     rows[[length(rows) + 1L]] <- data.frame(
+      sigma = trial_data$sigma[keep],
       beta = trial_data$beta[keep],
       opportunity = trial_data$opportunity[keep],
       decision_timestep = decision_timestep,
@@ -1224,6 +1476,7 @@ build_disjoint3x2_condition_action_summary <- function(dat) {
   }
   action_data <- do.call(rbind, rows)
   group_cols <- c(
+    "sigma",
     "beta",
     "opportunity",
     "decision_timestep",
@@ -2009,7 +2262,11 @@ build_exact_trial_overlay <- function() {
     )
   )
   if (!is.null(cached)) {
-    return(cached)
+    if (any(as.character(cached$action_label) == "stop", na.rm = TRUE)) {
+      message("Cached disjoint3x2 exact condition/action summary has unlabeled stop rows; rebuilding from exact actions.")
+    } else {
+      return(cached)
+    }
   }
   if (is.null(exact_actions_task) || any(is.na(requested_time_costs))) {
     return(data.frame())
@@ -2128,7 +2385,13 @@ build_exact_continue_summary <- function(feature_type) {
 disjoint3x2_exact_action_label <- function(action, path_states, path_order) {
   action_kind <- as.character(action$action_kind[[1]])
   if (identical(action_kind, "stop")) {
-    return("stop")
+    prior_mean <- mean(reward_values)
+    posterior_values <- vapply(path_states, function(path_state) {
+      sum(as.numeric(path_state)) + (task_nodes_per_path - length(path_state)) * prior_mean
+    }, numeric(1))
+    ordered_values <- posterior_values[path_order]
+    best_rank <- which(abs(ordered_values - max(ordered_values, na.rm = TRUE)) < 1e-12)[[1]]
+    return(paste0("stop_P", best_rank))
   }
   if (!identical(action_kind, "observe")) {
     return(if (nzchar(action_kind)) action_kind else "unknown")
@@ -2419,7 +2682,7 @@ build_average_kl_reward_summary <- function(dat) {
   }
   summary_data <- aggregate_means_by(
     dat,
-    group_cols = c("beta", "opportunity"),
+    group_cols = c("sigma", "beta", "opportunity"),
     value_cols = c(
       "kl_paid_total",
       "chosen_path_reward",
@@ -2432,21 +2695,21 @@ build_average_kl_reward_summary <- function(dat) {
     )
   )
   var_data <- aggregate(
-    observations_before_stop ~ beta + opportunity,
+    observations_before_stop ~ sigma + beta + opportunity,
     data = dat,
     FUN = population_var
   )
   names(var_data)[names(var_data) == "observations_before_stop"] <- "var_observations_before_stop"
   count_data <- aggregate(
-    kl_paid_total ~ beta + opportunity,
+    kl_paid_total ~ sigma + beta + opportunity,
     data = dat,
     FUN = length
   )
   names(count_data)[names(count_data) == "kl_paid_total"] <- "n"
   merge(
-    merge(summary_data, var_data, by = c("beta", "opportunity")),
+    merge(summary_data, var_data, by = c("sigma", "beta", "opportunity")),
     count_data,
-    by = c("beta", "opportunity")
+    by = c("sigma", "beta", "opportunity")
   )
 }
 
@@ -2534,10 +2797,10 @@ plot_average_summary_scatter <- function(
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s%s.png",
       file_prefix,
       input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-      expansion_label, tree_file_label, simulation_source_suffix
+      expansion_label, tree_file_label, sigma_file_suffix, simulation_source_suffix
     )
   )
   if (include_exact && nzchar(optimal_time_cost_suffix)) {
@@ -2551,63 +2814,72 @@ plot_average_summary_scatter <- function(
       drop = FALSE
     ]
   }
-  open_panel_png(pdf_path, n_cols = 1L, n_rows = 1L)
+  n_sigma <- max(1L, length(sigma_levels))
+  open_panel_png(pdf_path, n_cols = n_sigma, n_rows = 1L)
   old_par <- par(no.readonly = TRUE)
-  par(mar = c(4.2, 4.2, 1, 1))
+  par(mfrow = c(1L, n_sigma))
+  par(mar = c(4.2, 4.2, if (n_sigma > 1L) 2.0 else 1, 1))
   apply_panel_text_style()
   has_exact_points <- include_exact &&
     nrow(exact_summary) > 0 &&
     all(c(x_col, y_col, "time_cost") %in% names(exact_summary))
-  model_x <- as.numeric(summary_data[[x_col]])
-  model_y <- as.numeric(summary_data[[y_col]])
   exact_x <- if (has_exact_points) as.numeric(exact_summary[[x_col]]) else numeric()
   exact_y <- if (has_exact_points) as.numeric(exact_summary[[y_col]]) else numeric()
-  x_values <- c(model_x, exact_x)
-  y_values <- c(model_y, exact_y)
-  if (jitter_duplicates) {
-    x_span <- diff(expand_range(x_values, pad = 0.05))
-    y_span <- diff(expand_range(y_values, pad = 0.05))
-    jittered <- jitter_duplicate_points(
-      x_values,
-      y_values,
-      x_amount = 0.012 * x_span,
-      y_amount = 0.018 * y_span
-    )
-    model_x <- jittered$x[seq_along(model_x)]
-    model_y <- jittered$y[seq_along(model_y)]
-    if (length(exact_x) > 0) {
-      exact_indices <- seq_along(exact_x) + length(summary_data[[x_col]])
-      exact_x <- jittered$x[exact_indices]
-      exact_y <- jittered$y[exact_indices]
+  global_x_values <- c(as.numeric(summary_data[[x_col]]), exact_x)
+  global_y_values <- c(as.numeric(summary_data[[y_col]]), exact_y)
+  x_limits <- expand_range(global_x_values, pad = 0.05)
+  y_limits <- expand_range(global_y_values, pad = 0.05)
+  for (sigma_value in sigma_levels) {
+    summary_piece <- filter_sigma_rows(summary_data, sigma_value)
+    model_x <- as.numeric(summary_piece[[x_col]])
+    model_y <- as.numeric(summary_piece[[y_col]])
+    panel_exact_x <- exact_x
+    panel_exact_y <- exact_y
+    if (jitter_duplicates) {
+      x_values <- c(model_x, panel_exact_x)
+      y_values <- c(model_y, panel_exact_y)
+      x_span <- diff(expand_range(global_x_values, pad = 0.05))
+      y_span <- diff(expand_range(global_y_values, pad = 0.05))
+      jittered <- jitter_duplicate_points(
+        x_values,
+        y_values,
+        x_amount = 0.012 * x_span,
+        y_amount = 0.018 * y_span
+      )
+      model_x <- jittered$x[seq_along(model_x)]
+      model_y <- jittered$y[seq_along(model_y)]
+      if (length(panel_exact_x) > 0) {
+        exact_indices <- seq_along(panel_exact_x) + nrow(summary_piece)
+        panel_exact_x <- jittered$x[exact_indices]
+        panel_exact_y <- jittered$y[exact_indices]
+      }
     }
-    x_values <- c(model_x, exact_x)
-    y_values <- c(model_y, exact_y)
-  }
-  plot(
-    NA,
-    xlim = expand_range(x_values, pad = 0.05),
-    ylim = expand_range(y_values, pad = 0.05),
-    xlab = xlab,
-    ylab = ylab,
-    main = ""
-  )
-  grid()
-  if (has_exact_points) {
+    plot(
+      NA,
+      xlim = x_limits,
+      ylim = y_limits,
+      xlab = xlab,
+      ylab = ylab,
+      main = if (n_sigma > 1L) sigma_panel_title(sigma_value) else ""
+    )
+    grid()
+    if (has_exact_points) {
+      points(
+        panel_exact_x,
+        panel_exact_y,
+        pch = 17,
+        cex = 1.35,
+        col = time_cost_color_for(exact_summary$time_cost, alpha = 0.45)
+      )
+    }
     points(
-      exact_x,
-      exact_y,
-      pch = 17,
+      model_x,
+      model_y,
+      pch = opportunity_pch[as.character(summary_piece$opportunity)],
       cex = 1.35,
-      col = time_cost_color_for(exact_summary$time_cost, alpha = 0.45)
+      col = point_color_for(summary_piece$beta, summary_piece$opportunity, alpha = 0.45)
     )
   }
-  points(
-    model_x,
-    model_y,
-    pch = opportunity_pch[as.character(summary_data$opportunity)],
-    cex = 1.35,
-    col = point_color_for(summary_data$beta, summary_data$opportunity, alpha = 0.45)
-  )
   par(old_par)
   dev.off()
   message(sprintf("Saved %s", pdf_path))
@@ -2675,9 +2947,9 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s%s.png",
       file_prefix, input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-      expansion_label, tree_file_label, simulation_source_suffix
+      expansion_label, tree_file_label, sigma_file_suffix, simulation_source_suffix
     )
   )
   if (nzchar(optimal_time_cost_suffix)) {
@@ -2700,7 +2972,7 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
   }
   model_cols_per_condition <- if (has_exact) 2L else 1L
   n_cols <- length(condition_levels) * model_cols_per_condition
-  n_rows <- max(1L, length(timesteps))
+  n_rows <- max(1L, length(timesteps) * length(sigma_levels))
   open_panel_png(
     pdf_path,
     n_cols = n_cols,
@@ -2723,17 +2995,52 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
   }
   x_limits <- expand_range(x_values, pad = 0.08)
   x_ticks <- seq(floor(x_limits[[1]]), ceiling(x_limits[[2]]), by = 1)
-  for (decision_timestep in timesteps) {
-    for (condition_value in condition_levels) {
-      model_piece_all <- summary_data[summary_data$decision_timestep == decision_timestep, , drop = FALSE]
-      if (!is.null(condition_col)) {
-        model_piece_all <- model_piece_all[as.character(model_piece_all[[condition_col]]) == condition_value, , drop = FALSE]
-      }
-      condition_title <- if (!is.null(condition_col)) paste0(" / ", condition_value) else ""
-      if (has_exact) {
-        exact_piece_all <- exact_summary[exact_summary$decision_timestep == decision_timestep, , drop = FALSE]
-        if (!is.null(condition_col) && condition_col %in% names(exact_piece_all)) {
-          exact_piece_all <- exact_piece_all[as.character(exact_piece_all[[condition_col]]) == condition_value, , drop = FALSE]
+  for (sigma_value in sigma_levels) {
+    sigma_title <- if (length(sigma_levels) > 1L) paste0(" | ", sigma_panel_title(sigma_value)) else ""
+    sigma_summary <- filter_sigma_rows(summary_data, sigma_value)
+    for (decision_timestep in timesteps) {
+      for (condition_value in condition_levels) {
+        model_piece_all <- sigma_summary[sigma_summary$decision_timestep == decision_timestep, , drop = FALSE]
+        if (!is.null(condition_col)) {
+          model_piece_all <- model_piece_all[as.character(model_piece_all[[condition_col]]) == condition_value, , drop = FALSE]
+        }
+        condition_title <- if (!is.null(condition_col)) paste0(" / ", condition_value) else ""
+        if (has_exact) {
+          exact_piece_all <- exact_summary[exact_summary$decision_timestep == decision_timestep, , drop = FALSE]
+          if (!is.null(condition_col) && condition_col %in% names(exact_piece_all)) {
+            exact_piece_all <- exact_piece_all[as.character(exact_piece_all[[condition_col]]) == condition_value, , drop = FALSE]
+          }
+          plot(
+            NA,
+            xlim = x_limits,
+            ylim = c(-0.03, 1.03),
+            xlab = xlab,
+            ylab = "P(continue)",
+            main = sprintf("Optimal%s t%d", condition_title, decision_timestep),
+            xaxt = "n"
+          )
+          axis(1, at = x_ticks)
+          grid()
+          for (time_cost in sort(unique(exact_summary$time_cost))) {
+            piece <- exact_piece_all[
+              abs(as.numeric(exact_piece_all$time_cost) - as.numeric(time_cost)) < 1e-8,
+              ,
+              drop = FALSE
+            ]
+            if (nrow(piece) == 0) {
+              next
+            }
+            piece <- piece[order(piece[[feature_col]]), , drop = FALSE]
+            lines(
+              piece[[feature_col]],
+              piece$p_continue,
+              type = "b",
+              pch = 17,
+              lty = 1,
+              lwd = 2.6,
+              col = time_cost_color_for(time_cost)
+            )
+          }
         }
         plot(
           NA,
@@ -2741,64 +3048,33 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
           ylim = c(-0.03, 1.03),
           xlab = xlab,
           ylab = "P(continue)",
-          main = sprintf("Optimal%s t%d", condition_title, decision_timestep),
+          main = sprintf("VAE%s%s t%d", condition_title, sigma_title, decision_timestep),
           xaxt = "n"
         )
         axis(1, at = x_ticks)
         grid()
-        for (time_cost in sort(unique(exact_summary$time_cost))) {
-          piece <- exact_piece_all[
-            abs(as.numeric(exact_piece_all$time_cost) - as.numeric(time_cost)) < 1e-8,
-            ,
-            drop = FALSE
-          ]
-          if (nrow(piece) == 0) {
-            next
+        for (opportunity_value in opportunity_levels) {
+          for (beta_value in beta_levels) {
+            piece <- model_piece_all[
+              model_piece_all$opportunity == opportunity_value &
+                model_piece_all$beta == beta_value,
+              ,
+              drop = FALSE
+            ]
+            if (nrow(piece) == 0) {
+              next
+            }
+            piece <- piece[order(piece[[feature_col]]), , drop = FALSE]
+            lines(
+              piece[[feature_col]],
+              piece$p_continue,
+              type = "b",
+              pch = opportunity_pch[[as.character(opportunity_value)]],
+              lty = opportunity_lty[[as.character(opportunity_value)]],
+              lwd = 1.8,
+              col = line_color_for(beta_value, opportunity_value)
+            )
           }
-          piece <- piece[order(piece[[feature_col]]), , drop = FALSE]
-          lines(
-            piece[[feature_col]],
-            piece$p_continue,
-            type = "b",
-            pch = 17,
-            lty = 1,
-            lwd = 2.6,
-            col = time_cost_color_for(time_cost)
-          )
-        }
-      }
-      plot(
-        NA,
-        xlim = x_limits,
-        ylim = c(-0.03, 1.03),
-        xlab = xlab,
-        ylab = "P(continue)",
-        main = sprintf("VAE%s t%d", condition_title, decision_timestep),
-        xaxt = "n"
-      )
-      axis(1, at = x_ticks)
-      grid()
-      for (opportunity_value in opportunity_levels) {
-        for (beta_value in beta_levels) {
-          piece <- model_piece_all[
-            model_piece_all$opportunity == opportunity_value &
-              model_piece_all$beta == beta_value,
-            ,
-            drop = FALSE
-          ]
-          if (nrow(piece) == 0) {
-            next
-          }
-          piece <- piece[order(piece[[feature_col]]), , drop = FALSE]
-          lines(
-            piece[[feature_col]],
-            piece$p_continue,
-            type = "b",
-            pch = opportunity_pch[[as.character(opportunity_value)]],
-            lty = opportunity_lty[[as.character(opportunity_value)]],
-            lwd = 1.8,
-            col = line_color_for(beta_value, opportunity_value)
-          )
         }
       }
     }
@@ -2812,6 +3088,14 @@ plot_continue_summary <- function(summary_data, exact_summary, feature_col, xlab
 condition_action_parameter_label <- function(dat, row_i, source) {
   if (identical(source, "optimal")) {
     return(sprintf("time cost %s", format_plot_values(dat$time_cost[[row_i]])))
+  }
+  if ("sigma" %in% names(dat) && length(sigma_levels) > 1L) {
+    return(sprintf(
+      "sigma %s, beta %s, opportunity %s",
+      format_plot_values(dat$sigma[[row_i]]),
+      dat$beta[[row_i]],
+      dat$opportunity[[row_i]]
+    ))
   }
   sprintf("beta %s, opportunity %s", dat$beta[[row_i]], dat$opportunity[[row_i]])
 }
@@ -2929,10 +3213,10 @@ plot_disjoint3x2_condition_action_probabilities <- function(summary_data, exact_
     pdf_path <- file.path(
       results_dir,
       sprintf(
-        "disjoint3x2_condition_action_probabilities_t%d_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+        "disjoint3x2_condition_action_probabilities_t%d_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s%s.png",
         decision_timestep,
         input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-        expansion_label, tree_file_label, simulation_source_suffix
+        expansion_label, tree_file_label, sigma_file_suffix, simulation_source_suffix
       )
     )
     if (nzchar(optimal_time_cost_suffix)) {
@@ -2973,7 +3257,7 @@ plot_disjoint3x2_condition_action_probabilities <- function(summary_data, exact_
         NA,
         xlim = x_limits,
         ylim = c(0, 1),
-        xlab = "Best path value observed so far",
+        xlab = "Best path value from actual observed rewards",
         ylab = "P(action)",
         main = sprintf(
           "%s | %s\n%s, best=%s",
@@ -3051,6 +3335,7 @@ build_kl_by_best_observed_continue_summary <- function(dat) {
   if (nrow(trial_data) == 0) {
     return(data.frame())
   }
+  actual_lookup <- build_node_actual_reward_lookup(dat)
   rows <- list()
   row_index <- seq_len(nrow(trial_data))
   path_values <- matrix(0, nrow = nrow(trial_data), ncol = task_path_count)
@@ -3067,7 +3352,7 @@ build_kl_by_best_observed_continue_summary <- function(dat) {
     }
 
     node_values <- suppressWarnings(as.integer(trial_data[[node_col]]))
-    reward_values_t <- suppressWarnings(as.numeric(trial_data[[reward_col]]))
+    reward_values_t <- observed_actual_reward_values(trial_data, node_col, reward_col, actual_lookup)
     path_indices <- path_id_for_node(node_values)
     alive_before_observation <- row_alive_before_decision(trial_data, observation_timestep + 1L)
     valid_observation <- alive_before_observation &
@@ -3112,6 +3397,7 @@ build_kl_by_best_observed_continue_summary <- function(dat) {
     }
 
     rows[[length(rows) + 1L]] <- data.frame(
+      sigma = trial_data$sigma[keep],
       beta = trial_data$beta[keep],
       opportunity = trial_data$opportunity[keep],
       observation_timestep = observation_timestep,
@@ -3129,12 +3415,12 @@ build_kl_by_best_observed_continue_summary <- function(dat) {
   }
   kl_data <- do.call(rbind, rows)
   summary_data <- aggregate(
-    kl_paid ~ beta + opportunity + observation_timestep + continue_decision_timestep + kl_payment_timestep + x_value,
+    kl_paid ~ sigma + beta + opportunity + observation_timestep + continue_decision_timestep + kl_payment_timestep + x_value,
     data = kl_data,
     FUN = mean
   )
   count_data <- aggregate(
-    kl_paid ~ beta + opportunity + observation_timestep + continue_decision_timestep + kl_payment_timestep + x_value,
+    kl_paid ~ sigma + beta + opportunity + observation_timestep + continue_decision_timestep + kl_payment_timestep + x_value,
     data = kl_data,
     FUN = length
   )
@@ -3142,7 +3428,7 @@ build_kl_by_best_observed_continue_summary <- function(dat) {
   out <- merge(
     summary_data,
     count_data,
-    by = c("beta", "opportunity", "observation_timestep", "continue_decision_timestep", "kl_payment_timestep", "x_value")
+    by = c("sigma", "beta", "opportunity", "observation_timestep", "continue_decision_timestep", "kl_payment_timestep", "x_value")
   )
   out$x_value_type <- if (use_signed_path_difference) "signed_path_difference" else "best_observed_path_value"
   out
@@ -3162,29 +3448,30 @@ plot_kl_by_best_observed_continue_summary <- function(summary_data) {
   pdf_path <- file.path(
     results_dir,
     sprintf(
-      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s.png",
+      "%s_%s_lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%s%s%s.png",
       file_prefix, input_type, lambda_label, alpha_label, beta_label, opportunity_label,
-      expansion_label, tree_file_label, simulation_source_suffix
+      expansion_label, tree_file_label, sigma_file_suffix, simulation_source_suffix
     )
   )
   timesteps <- sort(unique(summary_data$observation_timestep))
   n_rows <- max(1L, length(timesteps))
+  n_sigma <- max(1L, length(sigma_levels))
   open_panel_png(
     pdf_path,
-    n_cols = 1L,
+    n_cols = n_sigma,
     n_rows = n_rows
   )
   old_par <- par(no.readonly = TRUE)
-  par(mfrow = c(n_rows, 1L))
-  par(mar = c(4.2, 4.2, 2.0, 1))
+  par(mfrow = c(n_rows, n_sigma))
+  par(mar = c(4.2, 4.2, if (n_sigma > 1L) 2.2 else 2.0, 1))
   apply_panel_text_style()
   x_limits <- expand_range(summary_data$x_value, pad = 0.08)
   y_limits <- expand_range(summary_data$kl_paid, pad = 0.08)
   x_ticks <- seq(floor(x_limits[[1]]), ceiling(x_limits[[2]]), by = 1)
   x_label <- if (use_signed_path_difference) {
-    "Current path value - other path value"
+    "Current path value - other path value (actual rewards)"
   } else {
-    "Best observed path value so far"
+    "Best path value from actual observed rewards"
   }
   for (observation_timestep in timesteps) {
     payment_timesteps <- sort(unique(summary_data$kl_payment_timestep[
@@ -3195,44 +3482,48 @@ plot_kl_by_best_observed_continue_summary <- function(summary_data) {
     } else {
       "paid KL"
     }
-    plot(
-      NA,
-      xlim = x_limits,
-      ylim = y_limits,
-      xlab = x_label,
-      ylab = "Mean KL paid at timestep",
-      main = sprintf(
-        "VAE obs t%d, continued at decision t%d, %s",
-        observation_timestep,
-        observation_timestep + 1L,
-        payment_label
-      ),
-      xaxt = "n"
-    )
-    axis(1, at = x_ticks)
-    grid()
-    for (opportunity_value in opportunity_levels) {
-      for (beta_value in beta_levels) {
-        piece <- summary_data[
-          summary_data$observation_timestep == observation_timestep &
-            summary_data$opportunity == opportunity_value &
-            summary_data$beta == beta_value,
-          ,
-          drop = FALSE
-        ]
-        if (nrow(piece) == 0) {
-          next
+    for (sigma_value in sigma_levels) {
+      sigma_summary <- filter_sigma_rows(summary_data, sigma_value)
+      plot(
+        NA,
+        xlim = x_limits,
+        ylim = y_limits,
+        xlab = x_label,
+        ylab = "Mean KL paid at timestep",
+        main = sprintf(
+          "VAE obs t%d, continued at decision t%d, %s%s",
+          observation_timestep,
+          observation_timestep + 1L,
+          payment_label,
+          if (n_sigma > 1L) paste0("\n", sigma_panel_title(sigma_value)) else ""
+        ),
+        xaxt = "n"
+      )
+      axis(1, at = x_ticks)
+      grid()
+      for (opportunity_value in opportunity_levels) {
+        for (beta_value in beta_levels) {
+          piece <- sigma_summary[
+            sigma_summary$observation_timestep == observation_timestep &
+              sigma_summary$opportunity == opportunity_value &
+              sigma_summary$beta == beta_value,
+            ,
+            drop = FALSE
+          ]
+          if (nrow(piece) == 0) {
+            next
+          }
+          piece <- piece[order(piece$x_value), , drop = FALSE]
+          lines(
+            piece$x_value,
+            piece$kl_paid,
+            type = "b",
+            pch = opportunity_pch[[as.character(opportunity_value)]],
+            lty = opportunity_lty[[as.character(opportunity_value)]],
+            lwd = 1.8,
+            col = line_color_for(beta_value, opportunity_value)
+          )
         }
-        piece <- piece[order(piece$x_value), , drop = FALSE]
-        lines(
-          piece$x_value,
-          piece$kl_paid,
-          type = "b",
-          pch = opportunity_pch[[as.character(opportunity_value)]],
-          lty = opportunity_lty[[as.character(opportunity_value)]],
-          lwd = 1.8,
-          col = line_color_for(beta_value, opportunity_value)
-        )
       }
     }
   }
@@ -3248,7 +3539,7 @@ if (is_bandit3 || is_bandit4 || is_disjoint3x2) {
     continue_summary,
     exact_continue_summary,
     feature_col = "best_path_value",
-    xlab = "Best observed path value so far",
+    xlab = "Best path value from actual observed rewards",
     file_prefix = "p_continue_by_best_observed_path_value"
   )
 } else if (is_default2 || is_disjoint2x2) {
@@ -3258,7 +3549,7 @@ if (is_bandit3 || is_bandit4 || is_disjoint3x2) {
     continue_summary,
     exact_continue_summary,
     feature_col = "path_value_difference",
-    xlab = "Current observed path value - other path value",
+    xlab = "Current observed path value - other path value (actual rewards)",
     file_prefix = "p_continue_by_observed_path_value_difference"
   )
 } else {

@@ -17,6 +17,8 @@ if ! {
     echo "Usage legacy: $0 beta_min beta_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
     echo "Usage opp/lambda lists: $0 beta_min beta_max beta_steps alpha_min alpha_max alpha_steps opportunity_list lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
     echo "Usage beta/opp/lambda lists: $0 beta_list alpha_min alpha_max alpha_steps opportunity_list lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
+    echo "Pass --sigma VALUE or --observation-sigma VALUE in extra_jax_args to add Gaussian observation noise."
+    echo "Pass --sigma-list 0,0.25,0.5 in extra_jax_args to submit one Slurm job per sigma value."
     echo "Add --allow-node-revisit in extra_jax_args, or set ALLOW_NODE_REVISIT=1, to keep observed nodes legal."
     echo "Revisit runs default to --max-observations-before-stop 10 and --num-steps 11 unless overridden."
     exit 1
@@ -138,6 +140,41 @@ def parse_range_or_list(first, last, steps):
 def extra_has(flag):
     return any(arg == flag or str(arg).startswith(flag + "=") for arg in extra_args)
 
+def pop_extra_option(args, flags):
+    cleaned = []
+    value = None
+    i = 0
+    flags = set(flags)
+    while i < len(args):
+        text = str(args[i])
+        matched = False
+        for flag in flags:
+            if text == flag:
+                if i + 1 >= len(args):
+                    raise ValueError(f"{flag} requires a value.")
+                value = str(args[i + 1])
+                i += 2
+                matched = True
+                break
+            if text.startswith(flag + "="):
+                value = text.split("=", 1)[1]
+                i += 1
+                matched = True
+                break
+        if not matched:
+            cleaned.append(args[i])
+            i += 1
+    return value, cleaned
+
+def has_scalar_sigma_arg(args):
+    return any(
+        arg == "--sigma"
+        or arg == "--observation-sigma"
+        or str(arg).startswith("--sigma=")
+        or str(arg).startswith("--observation-sigma=")
+        for arg in args
+    )
+
 def extra_int(flag, default):
     for i, arg in enumerate(extra_args):
         text = str(arg)
@@ -152,6 +189,15 @@ alphas = list(np.linspace(float(alpha_min), float(alpha_max), int(alpha_steps)))
 opps = parse_range_or_list(opportunity_arg, opportunity_max, opportunity_steps)
 lambdas = parse_list(lambda_str)
 seeds = range(int(seed_min), int(seed_max) + 1)
+sigma_list_raw, extra_args = pop_extra_option(
+    extra_args,
+    ["--sigma-list", "--sigmas", "--observation-sigma-list"],
+)
+if sigma_list_raw is None:
+    sigma_list_raw = os.environ.get("OBSERVATION_SIGMA_LIST", "").strip() or None
+if sigma_list_raw is not None and has_scalar_sigma_arg(extra_args):
+    raise ValueError("Use either --sigma-list/OBSERVATION_SIGMA_LIST or --sigma, not both.")
+sigmas = parse_list(sigma_list_raw) if sigma_list_raw is not None else [None]
 tree_size_i = int(tree_size)
 allow_revisit = extra_has("--allow-node-revisit")
 max_observations = extra_int(
@@ -165,7 +211,8 @@ num_steps = extra_int(
 steps_per_epoch = int(num_updates) * int(num_envs) * num_steps // 120
 steps_per_epoch = max(steps_per_epoch, int(num_envs) * num_steps)
 
-for seed, beta, alpha, lambda_, opp in itertools.product(seeds, betas, alphas, lambdas, opps):
+for seed, beta, alpha, lambda_, opp, sigma in itertools.product(seeds, betas, alphas, lambdas, opps, sigmas):
+    sigma_args = [] if sigma is None else ["--sigma", str(sigma)]
     cmd = [
         "sbatch",
         "-p", "general",
@@ -181,6 +228,7 @@ for seed, beta, alpha, lambda_, opp in itertools.product(seeds, betas, alphas, l
         "--num-envs", num_envs,
         "--num-steps", str(num_steps),
         "--steps-per-epoch", str(steps_per_epoch),
+        *sigma_args,
         *extra_args,
     ]
     print(" ".join(shlex.quote(part) for part in cmd))

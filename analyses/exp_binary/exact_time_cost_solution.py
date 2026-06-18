@@ -4,8 +4,7 @@
 Assumptions:
   * rewards are sampled independently and uniformly from the requested alphabet;
   * observed rewards are remembered perfectly;
-  * the first observation is free, matching the VAE training objective;
-  * later observations cost a fixed time/opportunity cost;
+  * every observation, including the first, costs a fixed time/opportunity cost;
   * stopping commits to the path with the largest posterior expected reward.
 
 States are canonicalized by exchangeable paths and exchangeable nodes within a
@@ -224,7 +223,7 @@ class ExactTimeCostSolver:
         return observed_count(state) >= self.min_observations_before_stop
 
     def observe_cost(self, state):
-        return 0.0 if observed_count(state) == 0 else self.time_cost
+        return self.time_cost
 
     def unique_observe_actions(self, state):
         seen = set()
@@ -451,7 +450,7 @@ class GeneralNodeExactTimeCostSolver(ExactTimeCostSolver):
         return node_observed_count(state) >= self.min_observations_before_stop
 
     def observe_cost(self, state):
-        return 0.0 if node_observed_count(state) == 0 else self.time_cost
+        return self.time_cost
 
     def unique_observe_actions(self, state):
         for node, value in enumerate(state):

@@ -4,7 +4,7 @@ set -euo pipefail
 
 if [ "$#" -lt 11 ]; then
     echo "Usage: $0 lambda alpha beta model_dir sim_dir trial_n input_type seed train opportunity_cost tree_size [expansion_decision_version] [model_variant] [tree_config] [rnn_units] [latent_dim] [extra_jax_args...]"
-    echo "Example: $0 100.0 0.0 1000.0 outputs/jax_models/ outputs/jax_simulations/ 2000 uniform 31 train 0.0266666666667 3 lstm vae bandit3 32 16 --num-envs 200 --backend cpu --allow-node-revisit --max-observations-before-stop 10"
+    echo "Example: $0 100.0 0.0 1000.0 outputs/jax_models/ outputs/jax_simulations/ 2000 uniform 31 train 0.0266666666667 3 lstm vae bandit3 32 16 --num-envs 200 --backend cpu --kl-start-multiplier 5 --kl-annealing-epochs 60 --sigma 0.5 --allow-node-revisit --max-observations-before-stop 10"
     exit 1
 fi
 

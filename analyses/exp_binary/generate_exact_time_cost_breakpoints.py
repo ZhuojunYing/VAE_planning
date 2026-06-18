@@ -245,7 +245,7 @@ class PiecewiseDynamics:
         return tuple(upper_envelope(candidates))
 
     def observe_cost_slope(self, state):
-        return 0.0 if self.observed_count(state) == 0 else -1.0
+        return -1.0
 
     def combine_observe_children(self, state, child_segments, action_kind, action_detail):
         points = {0.0}

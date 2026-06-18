@@ -678,9 +678,9 @@ def train_model(
         expansion_epsilon_end = 0.0
         expansion_epsilon_annealing_epochs = 0
         expansion_entropy_start = 1.5
-        expansion_entropy_end = 0.01
-        expansion_entropy_annealing_epochs = 80
-        expansion_entropy_hold_epochs = 90
+        expansion_entropy_end = 0.0
+        expansion_entropy_annealing_epochs = 60
+        expansion_entropy_hold_epochs = 60
         forced_continue_start = 0.0
         forced_continue_end = 0.0
         forced_continue_annealing_epochs = 0
