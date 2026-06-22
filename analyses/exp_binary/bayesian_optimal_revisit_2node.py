@@ -420,6 +420,33 @@ def choose_terminal_path(decision: PolicyDecision, rng: np.random.Generator, tie
     return 1 if decision.posterior_mean_1 > decision.posterior_mean_2 else 2
 
 
+def posterior_kl_to_prior(probs: np.ndarray, prior: np.ndarray) -> float:
+    probs = np.asarray(probs, dtype=float)
+    prior = np.asarray(prior, dtype=float)
+    valid = probs > 0
+    if not np.any(valid):
+        return 0.0
+    return float(np.sum(probs[valid] * (np.log(probs[valid]) - np.log(prior[valid]))))
+
+
+def node_belief_kl(solver, n: int, s: float) -> float:
+    if n <= 0:
+        return 0.0
+    if hasattr(solver, "posterior_probs"):
+        probs = np.asarray(solver.posterior_probs(n, s), dtype=float)
+        prior = np.asarray(solver.prior_prob, dtype=float)
+        return posterior_kl_to_prior(probs, prior)
+    # With noiseless observations, one observation identifies the discrete
+    # reward exactly, so the posterior is a point mass over the prior support.
+    return math.log(len(solver.reward_values))
+
+
+def total_belief_kl(solver, n1: int, s1: float, n2: int, s2: float) -> Tuple[float, float, float]:
+    kl_1 = node_belief_kl(solver, n1, s1)
+    kl_2 = node_belief_kl(solver, n2, s2)
+    return kl_1 + kl_2, kl_1, kl_2
+
+
 def simulate_policy(
     solver,
     reward_values: Sequence[float],
@@ -447,11 +474,15 @@ def simulate_policy(
         }
         for decision_timestep in range(1, solver.max_observations + 2):
             decision = solver.decision(n1, s1, n2, s2)
+            belief_kl, belief_kl_1, belief_kl_2 = total_belief_kl(solver, n1, s1, n2, s2)
             action = sample_action(decision, rng, tie_mode)
             forced_stop = n1 + n2 >= solver.max_observations
             if forced_stop:
                 action = "stop"
             prefix = f"t{decision_timestep}"
+            row[f"belief_kl_{prefix}"] = belief_kl
+            row[f"belief_kl_node1_{prefix}"] = belief_kl_1
+            row[f"belief_kl_node2_{prefix}"] = belief_kl_2
             row[f"q_stop_{prefix}"] = decision.q_stop
             row[f"q_observe_1_{prefix}"] = decision.q_observe_1
             row[f"q_observe_2_{prefix}"] = decision.q_observe_2
@@ -463,6 +494,8 @@ def simulate_policy(
             row[f"stop_{prefix}"] = action == "stop"
             row[f"expanded_node_{prefix}"] = ""
             row[f"expanded_reward_{prefix}"] = ""
+            row[f"belief_kl_after_observation_{prefix}"] = ""
+            row[f"kl_d_{prefix}"] = ""
             if action == "stop":
                 chosen_path = choose_terminal_path(decision, rng, tie_mode)
                 stop_decision = decision_timestep
@@ -476,8 +509,13 @@ def simulate_policy(
             else:
                 n2 += 1
                 s2 += observed
+            after_kl, after_kl_1, after_kl_2 = total_belief_kl(solver, n1, s1, n2, s2)
             row[f"expanded_node_{prefix}"] = node
             row[f"expanded_reward_{prefix}"] = observed
+            row[f"belief_kl_after_observation_{prefix}"] = after_kl
+            row[f"belief_kl_node1_after_observation_{prefix}"] = after_kl_1
+            row[f"belief_kl_node2_after_observation_{prefix}"] = after_kl_2
+            row[f"kl_d_{prefix}"] = after_kl
         if chosen_path is None:
             decision = solver.decision(n1, s1, n2, s2)
             chosen_path = choose_terminal_path(decision, rng, tie_mode)
@@ -540,6 +578,7 @@ def main() -> None:
         summary_rows.append({
             "time_cost": float(time_cost),
             "sigma": float(args.sigma),
+            "seed": int(args.seed),
             "max_observations": int(args.max_observations),
             "reward_values": ",".join(fmt_num(x) for x in reward_values),
             "reward_norm": solver.reward_norm,
@@ -567,10 +606,14 @@ def main() -> None:
             )
             sim_name = (
                 f"bayesian_revisit_2node_sim_sigma_{safe_name(args.sigma)}"
-                f"_cost_{safe_name(time_cost)}_maxobs_{args.max_observations}.csv"
+                f"_cost_{safe_name(time_cost)}_maxobs_{args.max_observations}"
+                f"_seed_{args.seed}.csv"
             )
             write_csv(outdir / sim_name, sim_rows)
-    summary_name = f"bayesian_revisit_2node_summary_sigma_{safe_name(args.sigma)}_maxobs_{args.max_observations}.csv"
+    summary_name = (
+        f"bayesian_revisit_2node_summary_sigma_{safe_name(args.sigma)}"
+        f"_maxobs_{args.max_observations}_seed_{args.seed}.csv"
+    )
     write_csv(outdir / summary_name, summary_rows)
     print(f"Saved {outdir / summary_name}")
 
