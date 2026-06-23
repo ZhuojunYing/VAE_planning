@@ -2,6 +2,239 @@
 
 args <- commandArgs(trailingOnly = TRUE)
 
+script_file_arg <- grep("^--file=", commandArgs(FALSE), value = TRUE)
+script_dir <- if (length(script_file_arg) > 0L) {
+  dirname(normalizePath(sub("^--file=", "", script_file_arg[[1]]), mustWork = FALSE))
+} else {
+  "analyses/exp_binary"
+}
+
+trim_string <- function(value) {
+  trimws(as.character(value))
+}
+
+extract_named_option <- function(args, option_names, default = NULL) {
+  value <- default
+  keep <- rep(TRUE, length(args))
+  i <- 1L
+  while (i <= length(args)) {
+    arg <- args[[i]]
+    matched_name <- NA_character_
+    matched_inline <- FALSE
+    for (option_name in option_names) {
+      inline_prefix <- paste0(option_name, "=")
+      if (identical(arg, option_name)) {
+        matched_name <- option_name
+        break
+      }
+      if (startsWith(arg, inline_prefix)) {
+        matched_name <- option_name
+        matched_inline <- TRUE
+        break
+      }
+    }
+    if (is.na(matched_name)) {
+      i <- i + 1L
+      next
+    }
+    if (isTRUE(matched_inline)) {
+      value <- sub(paste0("^", matched_name, "="), "", arg)
+      keep[[i]] <- FALSE
+      i <- i + 1L
+    } else {
+      if (i == length(args)) {
+        stop(sprintf("%s requires a value.", matched_name))
+      }
+      value <- args[[i + 1L]]
+      keep[[i]] <- FALSE
+      keep[[i + 1L]] <- FALSE
+      i <- i + 2L
+    }
+  }
+  list(args = args[keep], value = value)
+}
+
+extract_flag_option <- function(args, option_names) {
+  keep <- rep(TRUE, length(args))
+  found <- FALSE
+  for (i in seq_along(args)) {
+    if (args[[i]] %in% option_names) {
+      keep[[i]] <- FALSE
+      found <- TRUE
+    }
+  }
+  list(args = args[keep], found = found)
+}
+
+parse_nonnegative_integer_option <- function(value, option_name) {
+  numeric_value <- suppressWarnings(as.numeric(value))
+  if (
+    is.na(numeric_value) ||
+      !is.finite(numeric_value) ||
+      numeric_value < 0 ||
+      abs(numeric_value - round(numeric_value)) > 1e-9
+  ) {
+    stop(sprintf("%s must be a nonnegative integer. Got %s.", option_name, value))
+  }
+  as.integer(round(numeric_value))
+}
+
+min_samples_option <- extract_named_option(
+  args,
+  c("--min-samples", "--min-sampes", "--minimum-samples", "--min-sample-count", "--min-n"),
+  default = "10"
+)
+args <- min_samples_option$args
+minimum_samples_threshold <- parse_nonnegative_integer_option(
+  min_samples_option$value,
+  "--min-samples"
+)
+selected_revisit_plots_option <- extract_flag_option(
+  args,
+  c("--selected-plots-only", "--core-plots-only", "--focused-plots-only", "--kl-entropy-core-only")
+)
+args <- selected_revisit_plots_option$args
+selected_revisit_plots_only <- selected_revisit_plots_option$found
+
+normalize_preset_tree <- function(value) {
+  key <- tolower(trim_string(value))
+  aliases <- c(
+    "2" = "default", "2n" = "default", "default" = "default", "default2" = "default",
+    "3" = "bandit3", "3n" = "bandit3", "bandit3" = "bandit3",
+    "4" = "disjoint2x2", "4n" = "disjoint2x2", "disjoint2x2" = "disjoint2x2", "2x2" = "disjoint2x2",
+    "6" = "disjoint3x2", "6n" = "disjoint3x2", "disjoint3x2" = "disjoint3x2", "3x2" = "disjoint3x2"
+  )
+  if (key %in% names(aliases)) {
+    return(unname(aliases[[key]]))
+  }
+  key
+}
+
+normalize_preset_vary <- function(value) {
+  key <- tolower(trim_string(value))
+  aliases <- c(
+    "beta" = "beta", "betas" = "beta", "memory" = "beta", "memory_cost" = "beta",
+    "opportunity" = "opportunity", "opp" = "opportunity", "opportunity_cost" = "opportunity",
+    "gamma" = "opportunity", "time" = "opportunity", "time_cost" = "opportunity"
+  )
+  if (key %in% names(aliases)) {
+    return(unname(aliases[[key]]))
+  }
+  key
+}
+
+revisit_preset_file <- file.path(script_dir, "revisit_plot_presets.csv")
+legacy_arg_columns <- c(
+  "beta_arg", "lambda_arg", "alpha_arg", "opportunity_arg",
+  "input_dir", "results_dir", "tree_size", "input_type",
+  "expansion_decision_version", "model_variant", "tree_config",
+  "seed_arg", "rnn_units_arg", "latent_dim_arg", "simulation_source_arg",
+  "max_observations_arg", "sigma_arg", "optimal_dir", "optimal_opportunity_arg"
+)
+
+read_revisit_presets <- function(path) {
+  if (!file.exists(path)) {
+    return(data.frame())
+  }
+  presets <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+  missing_columns <- setdiff(c("tree", "vary", legacy_arg_columns), names(presets))
+  if (length(missing_columns) > 0L) {
+    stop(sprintf(
+      "Preset file %s is missing required column(s): %s",
+      path,
+      paste(missing_columns, collapse = ", ")
+    ))
+  }
+  presets$tree_key <- vapply(presets$tree, normalize_preset_tree, character(1))
+  presets$vary_key <- vapply(presets$vary, normalize_preset_vary, character(1))
+  presets
+}
+
+print_revisit_preset_usage <- function(presets) {
+  message("Preset usage:")
+  message("  Rscript analyses/exp_binary/plot_revisit_policy_diagnostics.R <tree> <beta|opportunity>")
+  message("Examples:")
+  message("  Rscript analyses/exp_binary/plot_revisit_policy_diagnostics.R default beta")
+  message("  Rscript analyses/exp_binary/plot_revisit_policy_diagnostics.R bandit3 opportunity")
+  message("  Rscript analyses/exp_binary/plot_revisit_policy_diagnostics.R disjoint3x2 opportunity")
+  if (nrow(presets) > 0L) {
+    message("Available presets:")
+    for (i in seq_len(nrow(presets))) {
+      message(sprintf("  %s %s", presets$tree_key[[i]], presets$vary_key[[i]]))
+    }
+  }
+}
+
+apply_revisit_preset_args <- function(args) {
+  presets <- read_revisit_presets(revisit_preset_file)
+  if (length(args) >= 1L && tolower(args[[1]]) %in% c("--list-presets", "list-presets", "presets")) {
+    print_revisit_preset_usage(presets)
+    quit(save = "no", status = 0)
+  }
+
+  preset_offset <- 0L
+  if (length(args) >= 3L && tolower(args[[1]]) %in% c("--preset", "preset")) {
+    preset_offset <- 1L
+  } else if (length(args) >= 2L) {
+    first_numeric <- !is.na(suppressWarnings(as.numeric(args[[1]])))
+    second_vary <- normalize_preset_vary(args[[2]]) %in% c("beta", "opportunity")
+    if (!first_numeric && second_vary) {
+      preset_offset <- 0L
+    }
+  }
+
+  if (preset_offset < 0L || preset_offset == 0L && !(length(args) >= 2L && !is.na(match(normalize_preset_vary(args[[2]]), c("beta", "opportunity"))))) {
+    return(args)
+  }
+  if (preset_offset == 1L && length(args) < 3L) {
+    print_revisit_preset_usage(presets)
+    stop("--preset requires <tree> and <beta|opportunity>.")
+  }
+
+  tree_arg <- args[[preset_offset + 1L]]
+  vary_arg <- args[[preset_offset + 2L]]
+  tree_key <- normalize_preset_tree(tree_arg)
+  vary_key <- normalize_preset_vary(vary_arg)
+
+  if (nrow(presets) == 0L) {
+    stop(sprintf("No revisit preset file found at %s.", revisit_preset_file))
+  }
+
+  match_idx <- which(presets$tree_key == tree_key & presets$vary_key == vary_key)
+  if (length(match_idx) != 1L) {
+    print_revisit_preset_usage(presets)
+    stop(sprintf("No unique revisit preset found for tree=%s vary=%s.", tree_arg, vary_arg))
+  }
+
+  preset <- presets[match_idx[[1]], , drop = FALSE]
+  preset_args <- unname(vapply(legacy_arg_columns, function(col) {
+    value <- preset[[col]][[1]]
+    if (is.na(value)) "" else as.character(value)
+  }, character(1)))
+
+  extra_args <- if (length(args) > preset_offset + 2L) {
+    args[(preset_offset + 3L):length(args)]
+  } else {
+    character()
+  }
+  if (length(extra_args) > 0L) {
+    stop(sprintf(
+      "Preset mode only accepts <tree> <beta|opportunity> right now. Unexpected extra argument(s): %s",
+      paste(extra_args, collapse = " ")
+    ))
+  }
+
+  message(sprintf(
+    "Using revisit plot preset: tree=%s vary=%s from %s",
+    tree_key,
+    vary_key,
+    revisit_preset_file
+  ))
+  preset_args
+}
+
+args <- apply_revisit_preset_args(args)
+
 get_arg <- function(i, default) {
   if (length(args) >= i && nzchar(args[[i]])) args[[i]] else default
 }
@@ -88,6 +321,10 @@ if (
 base_results_dir <- results_dir
 dir.create(base_results_dir, recursive = TRUE, showWarnings = FALSE)
 message(sprintf("Using %s revisit simulation CSVs from %s", simulation_source, input_dir))
+message(sprintf("Minimum samples per plotted dot or heatmap cell: %d", minimum_samples_threshold))
+if (isTRUE(selected_revisit_plots_only)) {
+  message("Selected revisit plot mode: writing only the core KL/entropy/reward plots.")
+}
 
 tree_file_label <- paste0(tree_size, "n", if (nzchar(tree_config)) paste0("_", tree_config) else "")
 architecture_file_label <- sprintf("rnn_%s_latent_%s", rnn_units_arg, latent_dim_arg)
@@ -226,25 +463,45 @@ axis_plot_file_prefix <- function(x_col, y_col, variant = NULL) {
   prefix
 }
 
+selected_revisit_axis_plot_prefixes <- c(
+  "kl_paid_at_first_timestep_after_continue_vs_first_observed_reward_t1_sigma_panels",
+  "kl_paid_at_stop_timestep_after_first_continue_vs_absolute_first_observed_minus_mean_other_path_sigma_panels",
+  "kl_paid_at_timestep_vs_timestep_sigma_panels",
+  "terminal_binary_choice_entropy_at_timestep_vs_strict_pre_stop_timestep_sigma_panels",
+  "timestep_before_stop_vs_normalized_chosen_path_reward_sigma_panels",
+  "kl_paid_total_vs_normalized_chosen_path_reward_sigma_panels"
+)
+
+should_write_revisit_axis_plot <- function(file_prefix) {
+  !isTRUE(selected_revisit_plots_only) ||
+    axis_filename_label(file_prefix) %in% selected_revisit_axis_plot_prefixes
+}
+
 safe_png_path <- function(file_prefix, suffix = NULL, max_basename_chars = 180) {
-  basename <- sprintf("%s.png", axis_filename_label(file_prefix))
+  clean_prefix <- axis_filename_label(file_prefix)
+  basename <- sprintf("%s.png", clean_prefix)
   if (nchar(basename, type = "bytes") <= max_basename_chars) {
     return(file.path(plot_output_dir, basename))
   }
   hash <- short_string_hash(basename)
-  fixed_chars <- nchar(file_prefix, type = "bytes") +
-    nchar(hash, type = "bytes") +
-    nchar("_h.png", type = "bytes") +
-    1L
+  fixed_chars <- nchar(hash, type = "bytes") + nchar("_h.png", type = "bytes")
   keep_chars <- max(16L, max_basename_chars - fixed_chars)
-  compact_suffix <- substr(suffix, 1L, keep_chars)
-  file.path(plot_output_dir, sprintf("%s_h%s.png", substr(axis_filename_label(file_prefix), 1L, keep_chars), hash))
+  file.path(plot_output_dir, sprintf("%s_h%s.png", substr(clean_prefix, 1L, keep_chars), hash))
 }
 
 panel_width_in <- 60 / 25.4
 panel_height_in <- 60 / 25.4
 plot_font_size_pt <- 7
 legend_panel_fraction <- 0.75
+panel_left_margin_lines <- 6.8
+panel_right_gap_lines <- 4.0
+panel_bottom_margin_lines <- 5.2
+panel_top_margin_lines <- 1.4
+panel_title_margin_lines <- 2.8
+
+panel_margins <- function(top = panel_top_margin_lines, bottom = panel_bottom_margin_lines) {
+  c(bottom, panel_left_margin_lines, top, panel_right_gap_lines)
+}
 
 open_panel_png <- function(path, n_cols = 1L, n_rows = 1L, legend_fraction = 0) {
   png(
@@ -629,7 +886,8 @@ bayes_optimal_paths <- function(sigma_value, opportunity_value) {
       character(1)
     )
     seeded_paths <- seeded_paths[file.exists(seeded_paths)]
-  } else {
+  }
+  if (length(seeded_paths) == 0L) {
     pattern <- sprintf(
       "^bayesian_revisit_2node_sim_sigma_%s_cost_%s_maxobs_%s_seed_[0-9]+\\.csv$",
       bayes_safe_num_label(sigma_value),
@@ -658,6 +916,93 @@ terminal_choice_prob_from_means <- function(mean_1, mean_2) {
   out[valid & mean_1 < mean_2] <- 0
   out[ties] <- 0.5
   out
+}
+
+bayesian_reward_support <- function() {
+  if (identical(input_type, "binary")) c(0, 1) else c(-4, -3, -2, -1, 1, 2, 3, 4)
+}
+
+bayesian_posterior_probs_from_counts <- function(n, s, sigma_value, reward_support) {
+  n <- suppressWarnings(as.numeric(n))
+  s <- suppressWarnings(as.numeric(s))
+  sigma_num <- suppressWarnings(as.numeric(sigma_value))
+  reward_support <- suppressWarnings(as.numeric(reward_support))
+  out <- matrix(NA_real_, nrow = length(n), ncol = length(reward_support))
+  valid <- is.finite(n) & is.finite(s)
+  if (!any(valid)) {
+    return(out)
+  }
+  no_obs <- valid & n <= 0
+  if (any(no_obs)) {
+    out[no_obs, ] <- 1 / length(reward_support)
+  }
+  observed <- valid & n > 0
+  if (!any(observed)) {
+    return(out)
+  }
+  if (is.na(sigma_num) || sigma_num <= 0) {
+    observed_mean <- s[observed] / n[observed]
+    nearest_index <- vapply(observed_mean, function(value) {
+      which.min(abs(reward_support - value))
+    }, integer(1))
+    observed_rows <- which(observed)
+    for (i in seq_along(observed_rows)) {
+      out[observed_rows[[i]], nearest_index[[i]]] <- 1
+      out[observed_rows[[i]], -nearest_index[[i]]] <- 0
+    }
+    return(out)
+  }
+  rewards <- matrix(reward_support, nrow = sum(observed), ncol = length(reward_support), byrow = TRUE)
+  n_obs <- matrix(n[observed], nrow = sum(observed), ncol = length(reward_support))
+  s_obs <- matrix(s[observed], nrow = sum(observed), ncol = length(reward_support))
+  logp <- -(n_obs * rewards^2 - 2 * s_obs * rewards) / (2 * sigma_num^2)
+  logp <- logp - apply(logp, 1L, max, na.rm = TRUE)
+  probs <- exp(logp)
+  probs <- probs / rowSums(probs)
+  out[observed, ] <- probs
+  out
+}
+
+bayesian_best_node_probability <- function(dat, timestep, sigma_value) {
+  reward_support <- bayesian_reward_support()
+  n_rows <- nrow(dat)
+  if (n_rows == 0) {
+    return(numeric())
+  }
+  previous_timesteps <- if (timestep > 1L) seq_len(timestep - 1L) else integer()
+  if (length(previous_timesteps) == 0L) {
+    n1 <- n2 <- rep(0, n_rows)
+    s1 <- s2 <- rep(0, n_rows)
+  } else {
+    node_cols <- paste0("expanded_node_t", previous_timesteps)
+    reward_cols <- paste0("expanded_reward_t", previous_timesteps)
+    node_cols <- node_cols[node_cols %in% names(dat)]
+    reward_cols <- reward_cols[reward_cols %in% names(dat)]
+    keep_len <- min(length(node_cols), length(reward_cols))
+    if (keep_len == 0L) {
+      n1 <- n2 <- rep(0, n_rows)
+      s1 <- s2 <- rep(0, n_rows)
+    } else {
+      node_cols <- node_cols[seq_len(keep_len)]
+      reward_cols <- reward_cols[seq_len(keep_len)]
+      node_mat <- as.matrix(data.frame(lapply(dat[node_cols], function(x) suppressWarnings(as.numeric(x)))))
+      reward_mat <- as.matrix(data.frame(lapply(dat[reward_cols], function(x) suppressWarnings(as.numeric(x)))))
+      valid_reward <- is.finite(reward_mat)
+      node1_mat <- node_mat == 1 & valid_reward
+      node2_mat <- node_mat == 2 & valid_reward
+      node1_mat[is.na(node1_mat)] <- FALSE
+      node2_mat[is.na(node2_mat)] <- FALSE
+      n1 <- rowSums(node1_mat)
+      n2 <- rowSums(node2_mat)
+      s1 <- rowSums(ifelse(node1_mat, reward_mat, 0), na.rm = TRUE)
+      s2 <- rowSums(ifelse(node2_mat, reward_mat, 0), na.rm = TRUE)
+    }
+  }
+  probs1 <- bayesian_posterior_probs_from_counts(n1, s1, sigma_value, reward_support)
+  probs2 <- bayesian_posterior_probs_from_counts(n2, s2, sigma_value, reward_support)
+  greater_matrix <- outer(reward_support, reward_support, ">") * 1
+  p_gt <- rowSums((probs1 %*% greater_matrix) * probs2)
+  pmin(pmax(p_gt, 0), 1)
 }
 
 read_bayesian_optimal_file <- function(opportunity_value, sigma_value) {
@@ -702,7 +1047,12 @@ read_bayesian_optimal_file <- function(opportunity_value, sigma_value) {
   for (timestep in posterior_t) {
     mean_1_col <- paste0("posterior_mean_1_t", timestep)
     mean_2_col <- paste0("posterior_mean_2_t", timestep)
-    prob_1 <- terminal_choice_prob_from_means(dat[[mean_1_col]], dat[[mean_2_col]])
+    prob_1 <- bayesian_best_node_probability(dat, timestep, sigma_value)
+    fallback_rows <- !is.finite(prob_1)
+    if (any(fallback_rows)) {
+      fallback_prob <- terminal_choice_prob_from_means(dat[[mean_1_col]], dat[[mean_2_col]])
+      prob_1[fallback_rows] <- fallback_prob[fallback_rows]
+    }
     dat[[paste0("terminal_choice_prob_path1_t", timestep)]] <- prob_1
     dat[[paste0("terminal_choice_prob_path2_t", timestep)]] <- ifelse(is.finite(prob_1), 1 - prob_1, NA_real_)
     dat[[paste0("action_output_path1_t", timestep)]] <- dat[[paste0("terminal_choice_prob_path1_t", timestep)]]
@@ -935,6 +1285,31 @@ bin_mean_difference <- function(x, width = mean_difference_bin_width) {
   out
 }
 
+bin_nearest_integer <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  out <- rep(NA_real_, length(x))
+  finite <- is.finite(x)
+  out[finite] <- round(x[finite])
+  out
+}
+
+bin_width_two_away_from_zero <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  out <- rep(NA_real_, length(x))
+  finite <- is.finite(x)
+  out[finite] <- sign(x[finite]) * ceiling(abs(x[finite]) / 2) * 2
+  zero <- finite & abs(x) < 1e-12
+  out[zero] <- 0
+  out
+}
+
+bin_mean_other_for_default_heatmap <- function(x) {
+  if (is_bandit3 || is_disjoint3x2) {
+    return(bin_nearest_integer(x))
+  }
+  bin_mean_difference(x)
+}
+
 path_id_for_node <- function(node) {
   node_num <- suppressWarnings(as.integer(node))
   out <- rep(NA_integer_, length(node_num))
@@ -1062,6 +1437,129 @@ observed_actual_reward_values <- function(trial_data, node_col, reward_col, actu
   actual_values <- actual_reward_for_nodes(trial_data, node_values, actual_lookup)
   fallback_values <- suppressWarnings(as.numeric(trial_data[[reward_col]]))
   ifelse(is.finite(actual_values), actual_values, fallback_values)
+}
+
+actual_reward_matrix_for_trials <- function(trial_data, actual_lookup = NULL) {
+  if (nrow(trial_data) == 0) {
+    return(matrix(numeric(), nrow = 0, ncol = task_node_count))
+  }
+  if (is.null(actual_lookup)) {
+    actual_lookup <- build_node_actual_reward_lookup(all_data)
+  }
+  if (!isTRUE(actual_lookup$available)) {
+    return(matrix(NA_real_, nrow = nrow(trial_data), ncol = task_node_count))
+  }
+  actual_reward_mat <- vapply(seq_len(task_node_count), function(node_id) {
+    actual_reward_for_nodes(trial_data, rep(node_id, nrow(trial_data)), actual_lookup)
+  }, numeric(nrow(trial_data)))
+  if (is.null(dim(actual_reward_mat))) {
+    actual_reward_mat <- matrix(actual_reward_mat, nrow = nrow(trial_data), ncol = task_node_count)
+  }
+  actual_reward_mat
+}
+
+path_reward_matrix_from_node_rewards <- function(actual_reward_mat) {
+  if (nrow(actual_reward_mat) == 0) {
+    return(matrix(numeric(), nrow = 0, ncol = task_path_count))
+  }
+  path_nodes <- task_path_nodes()
+  path_reward_mat <- vapply(path_nodes, function(nodes) {
+    rowSums(actual_reward_mat[, nodes, drop = FALSE])
+  }, numeric(nrow(actual_reward_mat)))
+  if (is.null(dim(path_reward_mat))) {
+    path_reward_mat <- matrix(path_reward_mat, nrow = nrow(actual_reward_mat), ncol = task_path_count)
+  }
+  path_reward_mat
+}
+
+actual_path_reward_tie_flags <- function(trial_data, tol = 1e-8) {
+  out <- rep(FALSE, nrow(trial_data))
+  if (nrow(trial_data) == 0 || task_path_count < 2L) {
+    return(out)
+  }
+  actual_lookup <- build_node_actual_reward_lookup(all_data)
+  if (!isTRUE(actual_lookup$available)) {
+    warning("Missing node/actual_reward columns; tied actual path rewards cannot be removed from entropy plots.")
+    return(out)
+  }
+  actual_reward_mat <- actual_reward_matrix_for_trials(trial_data, actual_lookup)
+  path_reward_mat <- path_reward_matrix_from_node_rewards(actual_reward_mat)
+  finite_rows <- rowSums(is.finite(path_reward_mat)) == ncol(path_reward_mat)
+  if (!any(finite_rows)) {
+    return(out)
+  }
+  if (ncol(path_reward_mat) == 2L) {
+    out[finite_rows] <- abs(path_reward_mat[finite_rows, 1L] - path_reward_mat[finite_rows, 2L]) <= tol
+    return(out)
+  }
+  path_pairs <- utils::combn(seq_len(ncol(path_reward_mat)), 2L)
+  pairwise_ties <- abs(path_reward_mat[, path_pairs[1L, ], drop = FALSE] -
+    path_reward_mat[, path_pairs[2L, ], drop = FALSE]) <= tol
+  out[finite_rows] <- rowSums(pairwise_ties[finite_rows, , drop = FALSE], na.rm = TRUE) > 0
+  out
+}
+
+first_observed_path_context_values <- function(trial_data, node_mat) {
+  empty <- list(
+    first_reward = rep(NA_real_, nrow(trial_data)),
+    other_mean = rep(NA_real_, nrow(trial_data)),
+    signed = rep(NA_real_, nrow(trial_data)),
+    absolute = rep(NA_real_, nrow(trial_data))
+  )
+  if (nrow(trial_data) == 0 || ncol(node_mat) == 0 || task_path_count < 2L) {
+    return(empty)
+  }
+  actual_lookup <- build_node_actual_reward_lookup(all_data)
+  if (!isTRUE(actual_lookup$available)) {
+    return(empty)
+  }
+  actual_reward_mat <- actual_reward_matrix_for_trials(trial_data, actual_lookup)
+  path_reward_mat <- path_reward_matrix_from_node_rewards(actual_reward_mat)
+  path_mat <- matrix(
+    path_id_for_node(as.vector(node_mat)),
+    nrow = nrow(node_mat),
+    ncol = ncol(node_mat)
+  )
+  finite_path_mat <- is.finite(path_mat)
+  if (!any(finite_path_mat)) {
+    return(empty)
+  }
+  path_col_indices <- matrix(seq_len(ncol(path_mat)),
+    nrow = nrow(path_mat),
+    ncol = ncol(path_mat),
+    byrow = TRUE
+  )
+  first_path_col <- max.col(ifelse(finite_path_mat, ncol(path_mat) - path_col_indices + 1L, 0),
+    ties.method = "first"
+  )
+  has_path <- rowSums(finite_path_mat) > 0
+  first_path <- rep(NA_integer_, nrow(path_mat))
+  first_path[has_path] <- suppressWarnings(as.integer(path_mat[cbind(which(has_path), first_path_col[has_path])]))
+  valid_first_path <- !is.na(first_path) & first_path >= 1L & first_path <= ncol(path_reward_mat)
+  if (!any(valid_first_path)) {
+    return(empty)
+  }
+  rows <- which(valid_first_path)
+  first_reward <- rep(NA_real_, nrow(trial_data))
+  first_reward[rows] <- path_reward_mat[cbind(rows, first_path[rows])]
+  path_reward_sums <- rowSums(path_reward_mat)
+  other_mean <- rep(NA_real_, nrow(trial_data))
+  other_mean[rows] <- (path_reward_sums[rows] - first_reward[rows]) / (task_path_count - 1L)
+  signed <- first_reward - other_mean
+  list(
+    first_reward = first_reward,
+    other_mean = other_mean,
+    signed = signed,
+    absolute = abs(signed)
+  )
+}
+
+first_observed_path_difference_values <- function(trial_data, node_mat) {
+  context <- first_observed_path_context_values(trial_data, node_mat)
+  list(
+    signed = context$signed,
+    absolute = context$absolute
+  )
 }
 
 unique_trial_rows <- function(dat, required_cols) {
@@ -1211,6 +1709,34 @@ if (ncol(entropy_mat) > 0) {
 } else {
   trial_data$action_policy_entropy <- NA_real_
 }
+trial_data$actual_path_reward_tied <- actual_path_reward_tie_flags(trial_data)
+num_tied_actual_path_reward_trials <- sum(as_logical_col(trial_data$actual_path_reward_tied), na.rm = TRUE)
+if (num_tied_actual_path_reward_trials > 0L) {
+  message(sprintf(
+    "Excluding %d trial(s) with tied actual path rewards from terminal-choice entropy/probability plots.",
+    num_tied_actual_path_reward_trials
+  ))
+}
+
+max_observations_before_stop_num <- suppressWarnings(as.numeric(max_observations_arg))
+max_entropy_observation_timestep <- if (is.finite(max_observations_before_stop_num)) {
+  max_observations_before_stop_num
+} else {
+  Inf
+}
+max_entropy_terminal_timestep <- max_entropy_observation_timestep
+cap_terminal_entropy_timestep <- function(timestep) {
+  timestep <- suppressWarnings(as.integer(timestep))
+  if (is.finite(max_entropy_terminal_timestep)) {
+    return(as.integer(pmin(timestep, max_entropy_terminal_timestep)))
+  }
+  timestep
+}
+include_entropy_observation_timestep <- function(timestep) {
+  timestep <- suppressWarnings(as.numeric(timestep))
+  is.finite(timestep) & timestep > 0 & timestep < max_entropy_observation_timestep
+}
+
 trial_data$terminal_choice_entropy <- NA_real_
 terminal_choice_entropy_for_timestep <- function(timestep) {
   prob_cols <- terminal_prob_cols_for_timestep(timestep)
@@ -1230,6 +1756,9 @@ terminal_choice_entropy_for_timestep <- function(timestep) {
       0
     ))
   }
+  tied_rows <- "actual_path_reward_tied" %in% names(trial_data) &
+    as_logical_col(trial_data$actual_path_reward_tied)
+  entropy[tied_rows] <- NA_real_
   entropy
 }
 
@@ -1252,7 +1781,38 @@ terminal_binary_choice_entropy_for_timestep <- function(timestep) {
       0
     ))
   }
+  tied_rows <- "actual_path_reward_tied" %in% names(trial_data) &
+    as_logical_col(trial_data$actual_path_reward_tied)
+  entropy[tied_rows] <- NA_real_
   entropy
+}
+
+terminal_binary_choice_prob_extrema_for_timestep <- function(timestep) {
+  prob_cols <- terminal_prob_cols_for_timestep(timestep)
+  empty <- list(
+    max_prob = rep(NA_real_, nrow(trial_data)),
+    min_prob = rep(NA_real_, nrow(trial_data))
+  )
+  if (length(prob_cols) < 2L) {
+    return(empty)
+  }
+  prob_cols <- prob_cols[seq_len(2L)]
+  prob_mat <- numeric_matrix_from_cols(trial_data, prob_cols)
+  prob_mat[!is.finite(prob_mat) | prob_mat <= 0] <- 0
+  prob_sums <- rowSums(prob_mat)
+  valid_rows <- is.finite(prob_sums) & prob_sums > 0
+  max_prob <- rep(NA_real_, nrow(prob_mat))
+  min_prob <- rep(NA_real_, nrow(prob_mat))
+  if (any(valid_rows)) {
+    normalized_prob_mat <- prob_mat[valid_rows, , drop = FALSE] / prob_sums[valid_rows]
+    max_prob[valid_rows] <- pmax(normalized_prob_mat[, 1L], normalized_prob_mat[, 2L])
+    min_prob[valid_rows] <- pmin(normalized_prob_mat[, 1L], normalized_prob_mat[, 2L])
+  }
+  tied_rows <- "actual_path_reward_tied" %in% names(trial_data) &
+    as_logical_col(trial_data$actual_path_reward_tied)
+  max_prob[tied_rows] <- NA_real_
+  min_prob[tied_rows] <- NA_real_
+  list(max_prob = max_prob, min_prob = min_prob)
 }
 
 terminal_prob_timesteps <- terminal_prob_timesteps[is.finite(terminal_prob_timesteps)]
@@ -1262,13 +1822,13 @@ if (length(terminal_prob_timesteps) > 0) {
     if (ncol(stop_mat) == 0 || !stop_col %in% names(trial_data)) {
       next
     }
-    entropy_t <- terminal_choice_entropy_for_timestep(timestep)
+    entropy_t <- terminal_choice_entropy_for_timestep(cap_terminal_entropy_timestep(timestep))
     stopped_t <- as_logical_col(trial_data[[stop_col]])
     fill_rows <- stopped_t & !is.finite(trial_data$terminal_choice_entropy)
     trial_data$terminal_choice_entropy[fill_rows] <- entropy_t[fill_rows]
   }
   last_terminal_timestep <- max(terminal_prob_timesteps, na.rm = TRUE)
-  last_entropy <- terminal_choice_entropy_for_timestep(last_terminal_timestep)
+  last_entropy <- terminal_choice_entropy_for_timestep(cap_terminal_entropy_timestep(last_terminal_timestep))
   fill_last_rows <- !has_explicit_stop & !is.finite(trial_data$terminal_choice_entropy)
   trial_data$terminal_choice_entropy[fill_last_rows] <- last_entropy[fill_last_rows]
 }
@@ -1280,6 +1840,17 @@ kl_mat <- kl_mat[keep_trial_rows, , drop = FALSE]
 stop_mat <- stop_mat[keep_trial_rows, , drop = FALSE]
 entropy_mat <- entropy_mat[keep_trial_rows, , drop = FALSE]
 has_explicit_stop <- has_explicit_stop[keep_trial_rows]
+first_observed_path_context <- first_observed_path_context_values(trial_data, node_mat)
+trial_data$first_observed_path_actual_reward_raw <- first_observed_path_context$first_reward
+trial_data$mean_other_path_actual_reward_raw <- first_observed_path_context$other_mean
+trial_data$first_observed_path_actual_reward <- bin_mean_difference(first_observed_path_context$first_reward)
+trial_data$mean_other_path_actual_reward <- bin_mean_other_for_default_heatmap(first_observed_path_context$other_mean)
+trial_data$first_observed_path_actual_reward_integer <- bin_nearest_integer(first_observed_path_context$first_reward)
+trial_data$mean_other_path_actual_reward_integer <- bin_nearest_integer(first_observed_path_context$other_mean)
+trial_data$first_observed_path_actual_reward_bin2 <- bin_width_two_away_from_zero(first_observed_path_context$first_reward)
+trial_data$mean_other_path_actual_reward_bin2 <- bin_width_two_away_from_zero(first_observed_path_context$other_mean)
+trial_data$first_observed_minus_mean_other_path <- bin_mean_difference(first_observed_path_context$signed)
+trial_data$absolute_first_observed_minus_mean_other_path <- bin_mean_difference(first_observed_path_context$absolute)
 
 mean_or_na <- function(x) {
   x <- suppressWarnings(as.numeric(x))
@@ -1287,10 +1858,10 @@ mean_or_na <- function(x) {
   if (length(x) == 0) NA_real_ else mean(x)
 }
 
-sd_or_na <- function(x) {
+sem_or_na <- function(x) {
   x <- suppressWarnings(as.numeric(x))
   x <- x[is.finite(x)]
-  if (length(x) < 2L) NA_real_ else stats::sd(x)
+  if (length(x) < 2L) NA_real_ else stats::sd(x) / sqrt(length(x))
 }
 
 build_pre_stop_timestep_data <- function() {
@@ -1306,14 +1877,23 @@ build_pre_stop_timestep_data <- function() {
     if (!any(before_stop)) {
       next
     }
-    decision_timestep <- observation_timestep + 1L
-    kl_col <- paste0("kl_d_t", observation_timestep)
+    # terminal_choice_prob_path*_t is post-observation for observe actions,
+    # while kl_d_t+1 is the carried-forward KL paid if the trial continues.
+    decision_timestep <- observation_timestep
+    kl_col <- paste0("kl_d_t", observation_timestep + 1L)
     kl_values <- if (kl_col %in% names(trial_data)) {
       suppressWarnings(as.numeric(trial_data[[kl_col]]))
     } else {
       rep(NA_real_, nrow(trial_data))
     }
+    kl_values <- ifelse(
+      suppressWarnings(as.numeric(trial_data$timestep_before_stop)) > observation_timestep,
+      kl_values,
+      NA_real_
+    )
     entropy_values <- terminal_binary_choice_entropy_for_timestep(decision_timestep)
+    full_entropy_values <- terminal_choice_entropy_for_timestep(decision_timestep)
+    prob_extrema <- terminal_binary_choice_prob_extrema_for_timestep(decision_timestep)
     rows[[length(rows) + 1L]] <- data.frame(
       model = trial_data$model[before_stop],
       sigma = trial_data$sigma[before_stop],
@@ -1322,8 +1902,22 @@ build_pre_stop_timestep_data <- function() {
       seed = trial_data$seed[before_stop],
       timestep = observation_timestep,
       decision_timestep = decision_timestep,
+      timestep_before_stop = trial_data$timestep_before_stop[before_stop],
+      first_observed_path_actual_reward = trial_data$first_observed_path_actual_reward[before_stop],
+      mean_other_path_actual_reward = trial_data$mean_other_path_actual_reward[before_stop],
+      first_observed_path_actual_reward_raw = trial_data$first_observed_path_actual_reward_raw[before_stop],
+      mean_other_path_actual_reward_raw = trial_data$mean_other_path_actual_reward_raw[before_stop],
+      first_observed_path_actual_reward_integer = trial_data$first_observed_path_actual_reward_integer[before_stop],
+      mean_other_path_actual_reward_integer = trial_data$mean_other_path_actual_reward_integer[before_stop],
+      first_observed_path_actual_reward_bin2 = trial_data$first_observed_path_actual_reward_bin2[before_stop],
+      mean_other_path_actual_reward_bin2 = trial_data$mean_other_path_actual_reward_bin2[before_stop],
+      absolute_first_observed_minus_mean_other_path = trial_data$absolute_first_observed_minus_mean_other_path[before_stop],
+      actual_path_reward_tied = trial_data$actual_path_reward_tied[before_stop],
       kl_paid_at_timestep = kl_values[before_stop],
+      terminal_choice_entropy_at_timestep = full_entropy_values[before_stop],
       terminal_binary_choice_entropy_at_timestep = entropy_values[before_stop],
+      terminal_choice_prob_max_at_timestep = prob_extrema$max_prob[before_stop],
+      terminal_choice_prob_min_at_timestep = prob_extrema$min_prob[before_stop],
       stringsAsFactors = FALSE
     )
   }
@@ -1352,7 +1946,7 @@ aggregate_means_by <- function(dat, group_cols, value_cols) {
   Reduce(function(left, right) merge(left, right, by = group_cols, all = TRUE), pieces)
 }
 
-add_seed_sd_by <- function(summary_data, dat, group_cols, value_cols) {
+add_seed_sem_by <- function(summary_data, dat, group_cols, value_cols) {
   group_cols <- group_cols[group_cols %in% names(dat)]
   value_cols <- value_cols[value_cols %in% names(dat)]
   if (nrow(summary_data) == 0 || length(value_cols) == 0 || !"seed" %in% names(dat)) {
@@ -1365,17 +1959,17 @@ add_seed_sd_by <- function(summary_data, dat, group_cols, value_cols) {
   }
   if (requireNamespace("data.table", quietly = TRUE)) {
     dt <- data.table::as.data.table(seed_means)
-    sd_data <- dt[, lapply(.SD, sd_or_na), by = group_cols, .SDcols = value_cols]
+    sd_data <- dt[, lapply(.SD, sem_or_na), by = group_cols, .SDcols = value_cols]
     sd_data <- as.data.frame(sd_data)
   } else {
     pieces <- lapply(value_cols, function(value_col) {
-      out <- aggregate(seed_means[[value_col]], by = seed_means[, group_cols, drop = FALSE], FUN = sd_or_na)
+      out <- aggregate(seed_means[[value_col]], by = seed_means[, group_cols, drop = FALSE], FUN = sem_or_na)
       names(out)[names(out) == "x"] <- value_col
       out
     })
     sd_data <- Reduce(function(left, right) merge(left, right, by = group_cols, all = TRUE), pieces)
   }
-  names(sd_data)[names(sd_data) %in% value_cols] <- paste0(names(sd_data)[names(sd_data) %in% value_cols], "_seed_sd")
+  names(sd_data)[names(sd_data) %in% value_cols] <- paste0(names(sd_data)[names(sd_data) %in% value_cols], "_seed_sem")
   merge(summary_data, sd_data, by = group_cols, all.x = TRUE)
 }
 
@@ -1403,13 +1997,16 @@ count_rows_by <- function(dat, group_cols, count_name = "n") {
 
 pre_stop_timestep_data <- build_pre_stop_timestep_data()
 if (nrow(pre_stop_timestep_data) > 0) {
+  pre_stop_timestep_value_cols <- c(
+    "kl_paid_at_timestep",
+    "terminal_binary_choice_entropy_at_timestep",
+    "terminal_choice_prob_max_at_timestep",
+    "terminal_choice_prob_min_at_timestep"
+  )
   pre_stop_timestep_summary <- aggregate_means_by(
     pre_stop_timestep_data,
     group_cols = c("model", "sigma", "beta", "opportunity", "timestep"),
-    value_cols = c(
-      "kl_paid_at_timestep",
-      "terminal_binary_choice_entropy_at_timestep"
-    )
+    value_cols = pre_stop_timestep_value_cols
   )
   pre_stop_timestep_count <- count_rows_by(
     pre_stop_timestep_data,
@@ -1421,37 +2018,375 @@ if (nrow(pre_stop_timestep_data) > 0) {
     by = c("model", "sigma", "beta", "opportunity", "timestep"),
     all.x = TRUE
   )
+  pre_stop_timestep_summary <- add_seed_sem_by(
+    pre_stop_timestep_summary,
+    pre_stop_timestep_data,
+    group_cols = c("model", "sigma", "beta", "opportunity", "timestep"),
+    value_cols = pre_stop_timestep_value_cols
+  )
 } else {
   pre_stop_timestep_summary <- data.frame()
 }
-if (nrow(pre_stop_timestep_data) > 0) {
+pre_stop_timestep_entropy_data <- if (nrow(pre_stop_timestep_data) > 0 && "actual_path_reward_tied" %in% names(pre_stop_timestep_data)) {
+  pre_stop_timestep_data[!as_logical_col(pre_stop_timestep_data$actual_path_reward_tied), , drop = FALSE]
+} else {
+  pre_stop_timestep_data
+}
+if (nrow(pre_stop_timestep_entropy_data) > 0 && "timestep" %in% names(pre_stop_timestep_entropy_data)) {
+  pre_stop_timestep_entropy_data <- pre_stop_timestep_entropy_data[
+    include_entropy_observation_timestep(pre_stop_timestep_entropy_data$timestep),
+    ,
+    drop = FALSE
+  ]
+}
+pre_stop_terminal_combo_value_cols <- c(
+  "terminal_binary_choice_entropy_at_timestep",
+  "terminal_choice_prob_max_at_timestep",
+  "terminal_choice_prob_min_at_timestep"
+)
+if (nrow(pre_stop_timestep_entropy_data) > 0) {
+  pre_stop_timestep_entropy_summary <- aggregate_means_by(
+    pre_stop_timestep_entropy_data,
+    group_cols = c("model", "sigma", "beta", "opportunity", "timestep"),
+    value_cols = pre_stop_terminal_combo_value_cols
+  )
+  pre_stop_timestep_entropy_count <- count_rows_by(
+    pre_stop_timestep_entropy_data,
+    c("model", "sigma", "beta", "opportunity", "timestep")
+  )
+  pre_stop_timestep_entropy_summary <- merge(
+    pre_stop_timestep_entropy_summary,
+    pre_stop_timestep_entropy_count,
+    by = c("model", "sigma", "beta", "opportunity", "timestep"),
+    all.x = TRUE
+  )
+  pre_stop_timestep_entropy_summary <- add_seed_sem_by(
+    pre_stop_timestep_entropy_summary,
+    pre_stop_timestep_entropy_data,
+    group_cols = c("model", "sigma", "beta", "opportunity", "timestep"),
+    value_cols = pre_stop_terminal_combo_value_cols
+  )
   pre_stop_entropy_combo_summary <- aggregate_means_by(
-    pre_stop_timestep_data,
+    pre_stop_timestep_entropy_data,
     group_cols = c("model", "sigma", "beta", "opportunity"),
-    value_cols = c("terminal_binary_choice_entropy_at_timestep")
+    value_cols = pre_stop_terminal_combo_value_cols
+  )
+  pre_stop_entropy_combo_count <- count_rows_by(
+    pre_stop_timestep_entropy_data,
+    c("model", "sigma", "beta", "opportunity")
+  )
+  pre_stop_entropy_combo_summary <- merge(
+    pre_stop_entropy_combo_summary,
+    pre_stop_entropy_combo_count,
+    by = c("model", "sigma", "beta", "opportunity"),
+    all.x = TRUE
   )
   names(pre_stop_entropy_combo_summary)[
     names(pre_stop_entropy_combo_summary) == "terminal_binary_choice_entropy_at_timestep"
   ] <- "terminal_choice_entropy_combined_reached"
+  names(pre_stop_entropy_combo_summary)[
+    names(pre_stop_entropy_combo_summary) == "terminal_choice_prob_max_at_timestep"
+  ] <- "terminal_choice_prob_max_combined_reached"
+  names(pre_stop_entropy_combo_summary)[
+    names(pre_stop_entropy_combo_summary) == "terminal_choice_prob_min_at_timestep"
+  ] <- "terminal_choice_prob_min_combined_reached"
+  pre_stop_entropy_combo_summary <- add_seed_sem_by(
+    pre_stop_entropy_combo_summary,
+    pre_stop_timestep_entropy_data,
+    group_cols = c("model", "sigma", "beta", "opportunity"),
+    value_cols = pre_stop_terminal_combo_value_cols
+  )
+  names(pre_stop_entropy_combo_summary)[
+    names(pre_stop_entropy_combo_summary) == "terminal_binary_choice_entropy_at_timestep_seed_sem"
+  ] <- "terminal_choice_entropy_combined_reached_seed_sem"
+  names(pre_stop_entropy_combo_summary)[
+    names(pre_stop_entropy_combo_summary) == "terminal_choice_prob_max_at_timestep_seed_sem"
+  ] <- "terminal_choice_prob_max_combined_reached_seed_sem"
+  names(pre_stop_entropy_combo_summary)[
+    names(pre_stop_entropy_combo_summary) == "terminal_choice_prob_min_at_timestep_seed_sem"
+  ] <- "terminal_choice_prob_min_combined_reached_seed_sem"
 } else {
+  pre_stop_timestep_entropy_summary <- data.frame()
   pre_stop_entropy_combo_summary <- data.frame()
 }
+pre_stop_timestep_entropy_strict_data <- if (
+  nrow(pre_stop_timestep_entropy_data) > 0 &&
+    all(c("timestep", "timestep_before_stop") %in% names(pre_stop_timestep_entropy_data))
+) {
+  pre_stop_timestep_entropy_data[
+    suppressWarnings(as.numeric(pre_stop_timestep_entropy_data$timestep)) <
+      suppressWarnings(as.numeric(pre_stop_timestep_entropy_data$timestep_before_stop)),
+    ,
+    drop = FALSE
+  ]
+} else {
+  data.frame()
+}
+if (nrow(pre_stop_timestep_entropy_strict_data) > 0) {
+  pre_stop_timestep_entropy_strict_summary <- aggregate_means_by(
+    pre_stop_timestep_entropy_strict_data,
+    group_cols = c("model", "sigma", "beta", "opportunity", "timestep"),
+    value_cols = pre_stop_terminal_combo_value_cols
+  )
+  pre_stop_timestep_entropy_strict_count <- count_rows_by(
+    pre_stop_timestep_entropy_strict_data,
+    c("model", "sigma", "beta", "opportunity", "timestep")
+  )
+  pre_stop_timestep_entropy_strict_summary <- merge(
+    pre_stop_timestep_entropy_strict_summary,
+    pre_stop_timestep_entropy_strict_count,
+    by = c("model", "sigma", "beta", "opportunity", "timestep"),
+    all.x = TRUE
+  )
+  pre_stop_timestep_entropy_strict_summary <- add_seed_sem_by(
+    pre_stop_timestep_entropy_strict_summary,
+    pre_stop_timestep_entropy_strict_data,
+    group_cols = c("model", "sigma", "beta", "opportunity", "timestep"),
+    value_cols = pre_stop_terminal_combo_value_cols
+  )
+} else {
+  pre_stop_timestep_entropy_strict_summary <- data.frame()
+}
+pre_stop_timestep_entropy_strict_by_absdiff_data <- if (
+  nrow(pre_stop_timestep_entropy_strict_data) > 0 &&
+    "absolute_first_observed_minus_mean_other_path" %in% names(pre_stop_timestep_entropy_strict_data)
+) {
+  pre_stop_timestep_entropy_strict_data[
+    is.finite(suppressWarnings(as.numeric(pre_stop_timestep_entropy_strict_data$absolute_first_observed_minus_mean_other_path))),
+    ,
+    drop = FALSE
+  ]
+} else {
+  data.frame()
+}
+if (nrow(pre_stop_timestep_entropy_strict_by_absdiff_data) > 0) {
+  pre_stop_timestep_strict_by_absdiff_value_cols <- unique(c(
+    "kl_paid_at_timestep",
+    pre_stop_terminal_combo_value_cols
+  ))
+  pre_stop_timestep_entropy_strict_by_absdiff_summary <- aggregate_means_by(
+    pre_stop_timestep_entropy_strict_by_absdiff_data,
+    group_cols = c(
+      "model", "sigma", "beta", "opportunity", "timestep",
+      "absolute_first_observed_minus_mean_other_path"
+    ),
+    value_cols = pre_stop_timestep_strict_by_absdiff_value_cols
+  )
+  pre_stop_timestep_entropy_strict_by_absdiff_count <- count_rows_by(
+    pre_stop_timestep_entropy_strict_by_absdiff_data,
+    c(
+      "model", "sigma", "beta", "opportunity", "timestep",
+      "absolute_first_observed_minus_mean_other_path"
+    )
+  )
+  pre_stop_timestep_entropy_strict_by_absdiff_summary <- merge(
+    pre_stop_timestep_entropy_strict_by_absdiff_summary,
+    pre_stop_timestep_entropy_strict_by_absdiff_count,
+    by = c(
+      "model", "sigma", "beta", "opportunity", "timestep",
+      "absolute_first_observed_minus_mean_other_path"
+    ),
+    all.x = TRUE
+  )
+  pre_stop_timestep_entropy_strict_by_absdiff_summary <- add_seed_sem_by(
+    pre_stop_timestep_entropy_strict_by_absdiff_summary,
+    pre_stop_timestep_entropy_strict_by_absdiff_data,
+    group_cols = c(
+      "model", "sigma", "beta", "opportunity", "timestep",
+      "absolute_first_observed_minus_mean_other_path"
+    ),
+    value_cols = pre_stop_timestep_strict_by_absdiff_value_cols
+  )
+} else {
+  pre_stop_timestep_entropy_strict_by_absdiff_summary <- data.frame()
+}
 
+summarize_heatmap_cells <- function(
+  dat,
+  value_col,
+  include_timestep = TRUE,
+  y_coord_col = "first_observed_path_actual_reward",
+  x_coord_col = "mean_other_path_actual_reward"
+) {
+  coord_cols <- c("first_observed_path_actual_reward", "mean_other_path_actual_reward")
+  required_cols <- unique(c(
+    "model", "sigma", "beta", "opportunity", y_coord_col, x_coord_col, value_col,
+    if (isTRUE(include_timestep)) "timestep" else character()
+  ))
+  if (nrow(dat) == 0 || !all(required_cols %in% names(dat))) {
+    return(data.frame())
+  }
+  work <- dat
+  work$first_observed_path_actual_reward <- suppressWarnings(as.numeric(work[[y_coord_col]]))
+  work$mean_other_path_actual_reward <- suppressWarnings(as.numeric(work[[x_coord_col]]))
+  for (coord_col in coord_cols) {
+    work[[coord_col]] <- suppressWarnings(as.numeric(work[[coord_col]]))
+  }
+  work[[value_col]] <- suppressWarnings(as.numeric(work[[value_col]]))
+  keep <- is.finite(work[[value_col]]) &
+    is.finite(work$first_observed_path_actual_reward) &
+    is.finite(work$mean_other_path_actual_reward)
+  if (isTRUE(include_timestep)) {
+    work$timestep <- suppressWarnings(as.numeric(work$timestep))
+    keep <- keep & is.finite(work$timestep)
+  }
+  work <- work[keep, , drop = FALSE]
+  if (nrow(work) == 0) {
+    return(data.frame())
+  }
+  group_cols <- c("model", "sigma", "beta", "opportunity")
+  if (isTRUE(include_timestep)) {
+    group_cols <- c(group_cols, "timestep")
+  }
+  group_cols <- c(group_cols, coord_cols)
+  out <- aggregate_means_by(
+    work,
+    group_cols = group_cols,
+    value_cols = value_col
+  )
+  value_count <- count_rows_by(
+    work,
+    group_cols,
+    count_name = paste0(value_col, "_n")
+  )
+  merge(out, value_count, by = group_cols, all.x = TRUE)
+}
+
+build_heatmap_summary_set <- function(
+  y_coord_col = "first_observed_path_actual_reward",
+  x_coord_col = "mean_other_path_actual_reward"
+) {
+  list(
+    terminal_entropy = summarize_heatmap_cells(
+      pre_stop_timestep_entropy_strict_data,
+      "terminal_choice_entropy_at_timestep",
+      include_timestep = TRUE,
+      y_coord_col = y_coord_col,
+      x_coord_col = x_coord_col
+    ),
+    kl_timestep = summarize_heatmap_cells(
+      pre_stop_timestep_data,
+      "kl_paid_at_timestep",
+      include_timestep = TRUE,
+      y_coord_col = y_coord_col,
+      x_coord_col = x_coord_col
+    ),
+    timestep_before_stop = summarize_heatmap_cells(
+      trial_data,
+      "timestep_before_stop",
+      include_timestep = FALSE,
+      y_coord_col = y_coord_col,
+      x_coord_col = x_coord_col
+    )
+  )
+}
+
+if (isTRUE(selected_revisit_plots_only)) {
+  default_heatmap_summaries <- list(
+    terminal_entropy = data.frame(),
+    kl_timestep = data.frame(),
+    timestep_before_stop = data.frame()
+  )
+  disjoint_integer_heatmap_summaries <- NULL
+  disjoint_bin2_heatmap_summaries <- NULL
+} else {
+  default_heatmap_summaries <- build_heatmap_summary_set()
+  disjoint_integer_heatmap_summaries <- if (is_disjoint2x2 || is_disjoint3x2) {
+    build_heatmap_summary_set(
+      y_coord_col = "first_observed_path_actual_reward_raw",
+      x_coord_col = "mean_other_path_actual_reward_integer"
+    )
+  } else {
+    NULL
+  }
+  disjoint_bin2_heatmap_summaries <- if (is_disjoint2x2 || is_disjoint3x2) {
+    build_heatmap_summary_set(
+      y_coord_col = "first_observed_path_actual_reward_bin2",
+      x_coord_col = "mean_other_path_actual_reward_bin2"
+    )
+  } else {
+    NULL
+  }
+}
+terminal_entropy_heatmap_summary <- default_heatmap_summaries$terminal_entropy
+kl_timestep_heatmap_summary <- default_heatmap_summaries$kl_timestep
+timestep_before_stop_heatmap_summary <- default_heatmap_summaries$timestep_before_stop
+
+build_first_timestep_kl_after_continue_summary <- function() {
+  required_cols <- c("expanded_node_t1", "expanded_reward_t1", "kl_d_t2", "timestep_before_stop")
+  if (!all(required_cols %in% names(trial_data))) {
+    return(data.frame())
+  }
+  continued_after_first_reward <- is.finite(suppressWarnings(as.numeric(trial_data$timestep_before_stop))) &
+    suppressWarnings(as.numeric(trial_data$timestep_before_stop)) > 1
+  first_reward <- observed_actual_reward_values(
+    trial_data,
+    node_col = "expanded_node_t1",
+    reward_col = "expanded_reward_t1",
+    actual_lookup = build_node_actual_reward_lookup(all_data)
+  )
+  kl_first <- suppressWarnings(as.numeric(trial_data$kl_d_t2))
+  keep <- continued_after_first_reward & is.finite(first_reward) & is.finite(kl_first)
+  if (!any(keep)) {
+    return(data.frame())
+  }
+  first_kl_data <- data.frame(
+    model = trial_data$model[keep],
+    sigma = trial_data$sigma[keep],
+    beta = trial_data$beta[keep],
+    opportunity = trial_data$opportunity[keep],
+    seed = trial_data$seed[keep],
+    first_observed_reward_t1 = bin_mean_difference(first_reward[keep]),
+    kl_paid_at_first_timestep_after_continue = kl_first[keep],
+    stringsAsFactors = FALSE
+  )
+  group_cols <- c("model", "sigma", "beta", "opportunity", "first_observed_reward_t1")
+  value_cols <- c("kl_paid_at_first_timestep_after_continue")
+  out <- aggregate_means_by(
+    first_kl_data,
+    group_cols = group_cols,
+    value_cols = value_cols
+  )
+  count_data <- count_rows_by(first_kl_data, group_cols)
+  out <- merge(out, count_data, by = group_cols, all.x = TRUE)
+  value_count_data <- count_rows_by(
+    first_kl_data[is.finite(first_kl_data$kl_paid_at_first_timestep_after_continue), , drop = FALSE],
+    group_cols,
+    count_name = "kl_paid_at_first_timestep_after_continue_n"
+  )
+  out <- merge(out, value_count_data, by = group_cols, all.x = TRUE)
+  add_seed_sem_by(
+    out,
+    first_kl_data,
+    group_cols = group_cols,
+    value_cols = value_cols
+  )
+}
+
+first_timestep_kl_after_continue_summary <- build_first_timestep_kl_after_continue_summary()
+
+average_value_cols <- c(
+  "normalized_chosen_path_reward",
+  "observations_before_stop",
+  "stop_decision_timestep",
+  "timestep_before_stop",
+  "unique_nodes_visited",
+  "kl_paid_total",
+  "terminal_choice_entropy"
+)
 average_summary <- aggregate_means_by(
   trial_data,
   group_cols = c("model", "sigma", "beta", "opportunity"),
-  value_cols = c(
-    "normalized_chosen_path_reward",
-    "observations_before_stop",
-    "stop_decision_timestep",
-    "timestep_before_stop",
-    "unique_nodes_visited",
-    "kl_paid_total",
-    "terminal_choice_entropy"
-  )
+  value_cols = average_value_cols
 )
 count_data <- count_rows_by(trial_data, c("model", "sigma", "beta", "opportunity"))
 average_summary <- merge(average_summary, count_data, by = c("model", "sigma", "beta", "opportunity"), all.x = TRUE)
+average_summary <- add_seed_sem_by(
+  average_summary,
+  trial_data,
+  group_cols = c("model", "sigma", "beta", "opportunity"),
+  value_cols = average_value_cols
+)
 if (nrow(pre_stop_entropy_combo_summary) > 0) {
   average_summary <- merge(
     average_summary,
@@ -1459,6 +2394,51 @@ if (nrow(pre_stop_entropy_combo_summary) > 0) {
     by = c("model", "sigma", "beta", "opportunity"),
     all.x = TRUE
   )
+}
+
+entropy_trial_data <- if ("actual_path_reward_tied" %in% names(trial_data)) {
+  trial_data[!as_logical_col(trial_data$actual_path_reward_tied), , drop = FALSE]
+} else {
+  trial_data
+}
+entropy_average_value_cols <- c(
+  "kl_paid_total",
+  "timestep_before_stop",
+  "terminal_choice_entropy"
+)
+if (nrow(entropy_trial_data) > 0) {
+  entropy_average_summary <- aggregate_means_by(
+    entropy_trial_data,
+    group_cols = c("model", "sigma", "beta", "opportunity"),
+    value_cols = entropy_average_value_cols
+  )
+  entropy_count_data <- count_rows_by(entropy_trial_data, c("model", "sigma", "beta", "opportunity"))
+  entropy_average_summary <- merge(
+    entropy_average_summary,
+    entropy_count_data,
+    by = c("model", "sigma", "beta", "opportunity"),
+    all.x = TRUE
+  )
+  entropy_average_summary <- add_seed_sem_by(
+    entropy_average_summary,
+    entropy_trial_data,
+    group_cols = c("model", "sigma", "beta", "opportunity"),
+    value_cols = entropy_average_value_cols
+  )
+  if (nrow(pre_stop_entropy_combo_summary) > 0) {
+    entropy_average_summary <- merge(
+      entropy_average_summary,
+      pre_stop_entropy_combo_summary,
+      by = c("model", "sigma", "beta", "opportunity"),
+      all.x = TRUE,
+      suffixes = c("", "_pre_stop")
+    )
+    if ("n_pre_stop" %in% names(entropy_average_summary)) {
+      entropy_average_summary$n_pre_stop <- NULL
+    }
+  }
+} else {
+  entropy_average_summary <- data.frame()
 }
 
 parameter_value_matches <- function(values, target, tol = 1e-8) {
@@ -1719,6 +2699,19 @@ log_arg_for_axes <- function(log_x = FALSE, log_y = FALSE) {
   paste0(if (isTRUE(log_x)) "x" else "", if (isTRUE(log_y)) "y" else "")
 }
 
+passes_min_sample_threshold <- function(dat, n_col) {
+  if (is.null(dat) || nrow(dat) == 0 || is.na(n_col) || !n_col %in% names(dat)) {
+    return(rep(TRUE, if (is.null(dat)) 0L else nrow(dat)))
+  }
+  sample_n <- suppressWarnings(as.numeric(dat[[n_col]]))
+  optimal_rows <- if ("model" %in% names(dat)) {
+    as.character(dat$model) == "Optimal"
+  } else {
+    rep(FALSE, nrow(dat))
+  }
+  optimal_rows | (is.finite(sample_n) & sample_n >= minimum_samples_threshold)
+}
+
 filter_plot_data <- function(dat, x_col, y_col, log_x = FALSE, log_y = FALSE, file_prefix = "plot") {
   if (is.null(dat) || nrow(dat) == 0 || !all(c(x_col, y_col) %in% names(dat))) {
     warning(sprintf("Missing data or columns for %s; skipping.", file_prefix))
@@ -1733,6 +2726,17 @@ filter_plot_data <- function(dat, x_col, y_col, log_x = FALSE, log_y = FALSE, fi
   if (isTRUE(log_y)) {
     keep <- keep & y > 0
   }
+  metric_n_col <- paste0(y_col, "_n")
+  n_col <- if (metric_n_col %in% names(dat)) {
+    metric_n_col
+  } else if ("n" %in% names(dat)) {
+    "n"
+  } else {
+    NA_character_
+  }
+  if (!is.na(n_col)) {
+    keep <- keep & passes_min_sample_threshold(dat, n_col)
+  }
   out <- dat[keep, , drop = FALSE]
   if (nrow(out) == 0) {
     warning(sprintf("No finite%s%s points for %s; skipping.",
@@ -1742,6 +2746,62 @@ filter_plot_data <- function(dat, x_col, y_col, log_x = FALSE, log_y = FALSE, fi
     ))
   }
   out
+}
+
+seed_sem_col_for <- function(y_col, dat) {
+  candidate <- paste0(y_col, "_seed_sem")
+  legacy_candidate <- paste0(y_col, "_seed_sd")
+  if (!is.null(dat) && candidate %in% names(dat)) {
+    candidate
+  } else if (!is.null(dat) && legacy_candidate %in% names(dat)) {
+    legacy_candidate
+  } else {
+    NA_character_
+  }
+}
+
+y_values_with_seed_sem <- function(dat, y_col, log_y = FALSE) {
+  y <- suppressWarnings(as.numeric(dat[[y_col]]))
+  sem_col <- seed_sem_col_for(y_col, dat)
+  if (!is.na(sem_col)) {
+    sem_values <- suppressWarnings(as.numeric(dat[[sem_col]]))
+    finite_sem <- is.finite(sem_values) & sem_values >= 0
+    lows <- y[finite_sem] - sem_values[finite_sem]
+    highs <- y[finite_sem] + sem_values[finite_sem]
+    if (isTRUE(log_y)) {
+      lows <- lows[lows > 0]
+      highs <- highs[highs > 0]
+    }
+    y <- c(y, lows, highs)
+  }
+  y
+}
+
+draw_seed_error_bars <- function(x, y, sem_values, cols, log_y = FALSE) {
+  x <- suppressWarnings(as.numeric(x))
+  y <- suppressWarnings(as.numeric(y))
+  sem_values <- suppressWarnings(as.numeric(sem_values))
+  keep <- is.finite(x) & is.finite(y) & is.finite(sem_values) & sem_values > 0
+  if (isTRUE(log_y)) {
+    keep <- keep & (y - sem_values) > 0
+  }
+  if (!any(keep)) {
+    return(invisible(NULL))
+  }
+  low <- y[keep] - sem_values[keep]
+  high <- y[keep] + sem_values[keep]
+  arrows(
+    x0 = x[keep],
+    y0 = low,
+    x1 = x[keep],
+    y1 = high,
+    code = 3,
+    angle = 90,
+    length = 0.025,
+    col = grDevices::adjustcolor(cols[keep], alpha.f = 0.65),
+    lwd = 0.8
+  )
+  invisible(NULL)
 }
 
 plot_summary_scatter <- function(
@@ -1759,7 +2819,18 @@ plot_summary_scatter <- function(
 ) {
   color_mode <- match.arg(color_mode)
   model_layout <- match.arg(model_layout)
-  path <- safe_png_path(file_prefix, file_suffix)
+  plot_variant <- if (identical(color_mode, "sigma")) {
+    "sigma_color"
+  } else if (isTRUE(facet_sigma)) {
+    "sigma_panels"
+  } else {
+    "all_sigmas"
+  }
+  axis_prefix <- axis_plot_file_prefix(x_col, y_col, plot_variant)
+  if (!should_write_revisit_axis_plot(axis_prefix)) {
+    return(invisible(NULL))
+  }
+  path <- safe_png_path(axis_prefix)
   if (identical(model_layout, "vae_only") && "model" %in% names(summary_data)) {
     summary_data <- filter_model_rows(summary_data, "VAE")
   }
@@ -1792,7 +2863,7 @@ plot_summary_scatter <- function(
   layout(cbind(panel_matrix, rep(n_panels * n_models + 1L, n_models)),
     widths = c(rep(1, n_panels), legend_panel_fraction)
   )
-  par(mar = c(4.2, 4.2, if (isTRUE(facet_sigma) && n_panels > 1L) 2 else 1, 1))
+  par(mar = panel_margins(top = if (isTRUE(facet_sigma) && n_panels > 1L) panel_title_margin_lines else panel_top_margin_lines))
   apply_panel_text_style()
   x_limits <- if (isTRUE(log_x)) {
     expand_log_range(plot_data[[x_col]], pad = 0.05)
@@ -1800,9 +2871,9 @@ plot_summary_scatter <- function(
     expand_range(plot_data[[x_col]], pad = 0.05)
   }
   y_limits <- if (isTRUE(log_y)) {
-    expand_log_range(plot_data[[y_col]], pad = 0.05)
+    expand_log_range(y_values_with_seed_sem(plot_data, y_col, log_y = TRUE), pad = 0.05)
   } else {
-    expand_range(plot_data[[y_col]], pad = 0.05)
+    expand_range(y_values_with_seed_sem(plot_data, y_col, log_y = FALSE), pad = 0.05)
   }
   for (model_value in model_levels) {
     model_data <- if (!identical(model_value, "all") && "model" %in% names(plot_data)) {
@@ -1834,6 +2905,16 @@ plot_summary_scatter <- function(
         log = log_arg_for_axes(log_x, log_y)
       )
       grid()
+      sem_col <- seed_sem_col_for(y_col, piece)
+      if (!is.na(sem_col)) {
+        draw_seed_error_bars(
+          piece[[x_col]],
+          piece[[y_col]],
+          piece[[sem_col]],
+          point_cols,
+          log_y = log_y
+        )
+      }
       draw_model_points(
         piece[[x_col]],
         piece[[y_col]],
@@ -1863,7 +2944,11 @@ plot_metric_by_difference <- function(
   xlab = "Node 1 actual reward - node 2 actual reward",
   log_y = FALSE
 ) {
-  path <- safe_png_path(file_prefix, file_suffix)
+  axis_prefix <- axis_plot_file_prefix(x_col, y_col, "sigma_panels")
+  if (!should_write_revisit_axis_plot(axis_prefix)) {
+    return(invisible(NULL))
+  }
+  path <- safe_png_path(axis_prefix)
   plot_data <- filter_plot_data(summary_data, x_col, y_col, log_x = FALSE, log_y = log_y, file_prefix = file_prefix)
   axis_spec <- reward_difference_axis(x_col)
   if (!is.null(axis_spec)) {
@@ -1886,7 +2971,7 @@ plot_metric_by_difference <- function(
   layout(cbind(panel_matrix, rep(n_sigma * n_models + 1L, n_models)),
     widths = c(rep(1, n_sigma), legend_panel_fraction)
   )
-  par(mar = c(4.2, 4.2, if (n_sigma > 1L) 2 else 1, 1))
+  par(mar = panel_margins(top = if (n_sigma > 1L) panel_title_margin_lines else panel_top_margin_lines))
   apply_panel_text_style()
   x_limits <- if (!is.null(axis_spec)) {
     axis_spec$limits
@@ -1894,9 +2979,9 @@ plot_metric_by_difference <- function(
     expand_range(plot_data[[x_col]], pad = 0.06)
   }
   y_limits <- if (isTRUE(log_y)) {
-    expand_log_range(plot_data[[y_col]], pad = 0.06)
+    expand_log_range(y_values_with_seed_sem(plot_data, y_col, log_y = TRUE), pad = 0.06)
   } else {
-    expand_range(plot_data[[y_col]], pad = 0.06)
+    expand_range(y_values_with_seed_sem(plot_data, y_col, log_y = FALSE), pad = 0.06)
   }
   x_ticks <- if (!is.null(axis_spec)) {
     axis_spec$ticks
@@ -1939,6 +3024,16 @@ plot_metric_by_difference <- function(
             lwd = 1.4,
             col = piece_col
           )
+          sem_col <- seed_sem_col_for(y_col, piece)
+          if (!is.na(sem_col)) {
+            draw_seed_error_bars(
+              piece[[x_col]],
+              piece[[y_col]],
+              piece[[sem_col]],
+              rep(piece_col, nrow(piece)),
+              log_y = log_y
+            )
+          }
           draw_model_points(
             piece[[x_col]],
             piece[[y_col]],
@@ -1962,9 +3057,14 @@ plot_metric_by_timestep <- function(
   y_col,
   ylab,
   file_prefix,
-  log_y = FALSE
+  log_y = FALSE,
+  x_file_col = "timestep"
 ) {
-  path <- safe_png_path(file_prefix, file_suffix)
+  axis_prefix <- axis_plot_file_prefix(x_file_col, y_col, "sigma_panels")
+  if (!should_write_revisit_axis_plot(axis_prefix)) {
+    return(invisible(NULL))
+  }
+  path <- safe_png_path(axis_prefix)
   plot_data <- filter_plot_data(summary_data, "timestep", y_col, log_x = FALSE, log_y = log_y, file_prefix = file_prefix)
   if (nrow(plot_data) == 0) {
     return(invisible(NULL))
@@ -1978,15 +3078,15 @@ plot_metric_by_timestep <- function(
   layout(cbind(panel_matrix, rep(n_sigma * n_models + 1L, n_models)),
     widths = c(rep(1, n_sigma), legend_panel_fraction)
   )
-  par(mar = c(4.2, 4.2, if (n_sigma > 1L) 2 else 1, 1))
+  par(mar = panel_margins(top = if (n_sigma > 1L) panel_title_margin_lines else panel_top_margin_lines))
   apply_panel_text_style()
   x_values <- suppressWarnings(as.numeric(plot_data$timestep))
   x_limits <- expand_range(x_values, pad = 0.08)
   x_ticks <- seq(floor(min(x_values, na.rm = TRUE)), ceiling(max(x_values, na.rm = TRUE)), by = 1)
   y_limits <- if (isTRUE(log_y)) {
-    expand_log_range(plot_data[[y_col]], pad = 0.06)
+    expand_log_range(y_values_with_seed_sem(plot_data, y_col, log_y = TRUE), pad = 0.06)
   } else {
-    expand_range(plot_data[[y_col]], pad = 0.06)
+    expand_range(y_values_with_seed_sem(plot_data, y_col, log_y = FALSE), pad = 0.06)
   }
   for (model_value in model_levels) {
     model_data <- if ("model" %in% names(plot_data)) filter_model_rows(plot_data, model_value) else plot_data
@@ -2024,6 +3124,16 @@ plot_metric_by_timestep <- function(
             lwd = 1.4,
             col = piece_col
           )
+          sem_col <- seed_sem_col_for(y_col, piece)
+          if (!is.na(sem_col)) {
+            draw_seed_error_bars(
+              piece$timestep,
+              piece[[y_col]],
+              piece[[sem_col]],
+              rep(piece_col, nrow(piece)),
+              log_y = log_y
+            )
+          }
           draw_model_points(
             piece$timestep,
             piece[[y_col]],
@@ -2040,6 +3150,244 @@ plot_metric_by_timestep <- function(
   par(old_par)
   dev.off()
   message(sprintf("Saved %s", path))
+}
+
+heatmap_half_width <- function(values, default = 0.5) {
+  values <- sort(unique(suppressWarnings(as.numeric(values))))
+  values <- values[is.finite(values)]
+  if (length(values) < 2L) {
+    return(default)
+  }
+  diffs <- diff(values)
+  diffs <- diffs[is.finite(diffs) & diffs > 0]
+  if (length(diffs) == 0) {
+    return(default)
+  }
+  min(diffs) / 2
+}
+
+heatmap_color_for <- function(z, zlim, palette_cols) {
+  z <- suppressWarnings(as.numeric(z))
+  out <- rep(NA_character_, length(z))
+  keep <- is.finite(z)
+  if (!any(keep)) {
+    return(out)
+  }
+  if (!all(is.finite(zlim)) || abs(diff(zlim)) < 1e-12) {
+    idx <- rep(ceiling(length(palette_cols) / 2), sum(keep))
+  } else {
+    scaled <- (z[keep] - zlim[[1]]) / diff(zlim)
+    idx <- pmax(1L, pmin(length(palette_cols), floor(scaled * (length(palette_cols) - 1L)) + 1L))
+  }
+  out[keep] <- palette_cols[idx]
+  out
+}
+
+draw_heatmap_legend <- function(zlim, palette_cols, label) {
+  plot.new()
+  plot.window(xlim = c(0, 1), ylim = zlim)
+  n <- length(palette_cols)
+  y_edges <- seq(zlim[[1]], zlim[[2]], length.out = n + 1L)
+  for (i in seq_len(n)) {
+    rect(0.2, y_edges[[i]], 0.6, y_edges[[i + 1L]], col = palette_cols[[i]], border = NA)
+  }
+  axis(4, las = 1, cex.axis = 0.85)
+  mtext(label, side = 4, line = 2.4, cex = 0.85)
+}
+
+draw_reward_context_heatmap_panel <- function(
+  panel_data,
+  value_col,
+  zlim,
+  palette_cols,
+  main = "",
+  x_values = NULL,
+  y_values = NULL
+) {
+  x <- suppressWarnings(as.numeric(panel_data$mean_other_path_actual_reward))
+  y <- suppressWarnings(as.numeric(panel_data$first_observed_path_actual_reward))
+  z <- suppressWarnings(as.numeric(panel_data[[value_col]]))
+  if (is.null(x_values)) {
+    x_values <- sort(unique(x[is.finite(x)]))
+  } else {
+    x_values <- sort(unique(suppressWarnings(as.numeric(x_values))))
+    x_values <- x_values[is.finite(x_values)]
+  }
+  if (is.null(y_values)) {
+    y_values <- sort(unique(y[is.finite(y)]))
+  } else {
+    y_values <- sort(unique(suppressWarnings(as.numeric(y_values))))
+    y_values <- y_values[is.finite(y_values)]
+  }
+  xlim <- if (length(x_values) > 0L) {
+    range(x_values) + c(-1, 1) * heatmap_half_width(x_values)
+  } else {
+    c(-1, 1)
+  }
+  ylim <- if (length(y_values) > 0L) {
+    range(y_values) + c(-1, 1) * heatmap_half_width(y_values)
+  } else {
+    c(-1, 1)
+  }
+  plot(
+    NA,
+    xlim = xlim,
+    ylim = ylim,
+    xlab = "Mean actual reward of other paths",
+    ylab = "Actual reward of first observed path",
+    xaxt = "n",
+    yaxt = "n",
+    main = main
+  )
+  if (length(x_values) > 0L) {
+    axis(1, at = x_values, labels = format_plot_values(x_values), las = 2, cex.axis = 0.75)
+  }
+  if (length(y_values) > 0L) {
+    axis(2, at = y_values, labels = format_plot_values(y_values), las = 1, cex.axis = 0.75)
+  }
+  grid()
+  if (nrow(panel_data) == 0) {
+    return(invisible(NULL))
+  }
+  x_half <- heatmap_half_width(x_values)
+  y_half <- heatmap_half_width(y_values)
+  cols <- heatmap_color_for(z, zlim, palette_cols)
+  keep <- is.finite(x) & is.finite(y) & is.finite(z) & !is.na(cols)
+  if (any(keep)) {
+    rect(
+      xleft = x[keep] - x_half,
+      ybottom = y[keep] - y_half,
+      xright = x[keep] + x_half,
+      ytop = y[keep] + y_half,
+      col = cols[keep],
+      border = "white",
+      lwd = 0.35
+    )
+  }
+  invisible(NULL)
+}
+
+heatmap_combo_title <- function(combo) {
+  sprintf(
+    "%s | sigma %s\nbeta %s | opp %s",
+    as.character(combo$model[[1]]),
+    format_plot_values(combo$sigma[[1]]),
+    format_plot_values(combo$beta[[1]]),
+    format_plot_values(combo$opportunity[[1]])
+  )
+}
+
+plot_reward_context_heatmaps <- function(
+  summary_data,
+  value_col,
+  value_label,
+  file_prefix,
+  include_timestep = TRUE,
+  palette = "Viridis"
+) {
+  if (isTRUE(selected_revisit_plots_only)) {
+    return(invisible(NULL))
+  }
+  if (is.null(summary_data) || nrow(summary_data) == 0 || !value_col %in% names(summary_data)) {
+    warning(sprintf("Missing heatmap data for %s; skipping.", file_prefix))
+    return(invisible(NULL))
+  }
+  count_col <- paste0(value_col, "_n")
+  if (!count_col %in% names(summary_data)) {
+    count_col <- if ("n" %in% names(summary_data)) "n" else NA_character_
+  }
+  plot_data <- summary_data
+  plot_data[[value_col]] <- suppressWarnings(as.numeric(plot_data[[value_col]]))
+  keep <- is.finite(plot_data[[value_col]])
+  if (!is.na(count_col)) {
+    keep <- keep & passes_min_sample_threshold(plot_data, count_col)
+  }
+  plot_data <- plot_data[keep, , drop = FALSE]
+  if (nrow(plot_data) == 0) {
+    warning(sprintf(
+      "No heatmap cells remained after finite-value and VAE minimum-sample filtering for %s; skipping.",
+      file_prefix
+    ))
+    return(invisible(NULL))
+  }
+  zlim <- range(plot_data[[value_col]], na.rm = TRUE)
+  if (!all(is.finite(zlim)) || abs(diff(zlim)) < 1e-12) {
+    zlim <- zlim + c(-0.5, 0.5)
+  }
+  palette_cols <- grDevices::hcl.colors(96, palette = palette)
+  combo_cols <- c("model", "sigma", "beta", "opportunity")
+  combos <- unique(plot_data[, combo_cols, drop = FALSE])
+  combos <- combos[order(combos$model, suppressWarnings(as.numeric(combos$sigma)), suppressWarnings(as.numeric(combos$beta)), suppressWarnings(as.numeric(combos$opportunity))), , drop = FALSE]
+  x_values_all <- sort(unique(suppressWarnings(as.numeric(plot_data$mean_other_path_actual_reward))))
+  x_values_all <- x_values_all[is.finite(x_values_all)]
+  y_values_all <- sort(unique(suppressWarnings(as.numeric(plot_data$first_observed_path_actual_reward))))
+  y_values_all <- y_values_all[is.finite(y_values_all)]
+  timestep_levels <- if (isTRUE(include_timestep) && "timestep" %in% names(plot_data)) {
+    sort(unique(suppressWarnings(as.numeric(plot_data$timestep))))
+  } else {
+    NA_real_
+  }
+  timestep_levels <- timestep_levels[is.finite(timestep_levels) | is.na(timestep_levels)]
+  if (length(timestep_levels) == 0L) {
+    warning(sprintf("No timestep levels for %s; skipping.", file_prefix))
+    return(invisible(NULL))
+  }
+  n_combos <- nrow(combos)
+  n_cols <- max(1L, min(5L, ceiling(sqrt(n_combos))))
+  n_rows <- ceiling(n_combos / n_cols)
+  for (timestep_value in timestep_levels) {
+    timestep_suffix <- if (isTRUE(include_timestep) && is.finite(timestep_value)) {
+      paste0("timestep_", short_num_label(timestep_value))
+    } else {
+      "all_param_combos"
+    }
+    path <- safe_png_path(axis_plot_file_prefix(
+      "mean_other_path_actual_reward",
+      value_col,
+      paste(file_prefix, timestep_suffix, sep = "_")
+    ))
+    open_panel_png(path, n_cols = n_cols, n_rows = n_rows, legend_fraction = 0.45)
+    old_par <- par(no.readonly = TRUE)
+    panel_ids <- matrix(seq_len(n_rows * n_cols), nrow = n_rows, ncol = n_cols, byrow = TRUE)
+    layout(cbind(panel_ids, rep(n_rows * n_cols + 1L, n_rows)), widths = c(rep(1, n_cols), 0.45))
+    par(mar = panel_margins(top = 3.2, bottom = 4.8))
+    apply_panel_text_style()
+    for (combo_i in seq_len(n_rows * n_cols)) {
+      if (combo_i > nrow(combos)) {
+        plot.new()
+        next
+      }
+      combo <- combos[combo_i, , drop = FALSE]
+      combo_data <- plot_data[
+        as.character(plot_data$model) == as.character(combo$model[[1]]) &
+          sigma_value_matches(plot_data$sigma, combo$sigma[[1]]) &
+          parameter_value_matches(plot_data$beta, combo$beta[[1]]) &
+          parameter_value_matches(plot_data$opportunity, combo$opportunity[[1]]),
+        ,
+        drop = FALSE
+      ]
+      panel_data <- if (isTRUE(include_timestep) && is.finite(timestep_value)) {
+        combo_data[abs(suppressWarnings(as.numeric(combo_data$timestep)) - timestep_value) < 1e-8, , drop = FALSE]
+      } else {
+        combo_data
+      }
+      draw_reward_context_heatmap_panel(
+        panel_data,
+        value_col,
+        zlim,
+        palette_cols,
+        main = heatmap_combo_title(combo),
+        x_values = x_values_all,
+        y_values = y_values_all
+      )
+    }
+    par(mar = c(4.8, 0.2, 3.2, 3.8))
+    draw_heatmap_legend(zlim, palette_cols, value_label)
+    par(old_par)
+    dev.off()
+    message(sprintf("Saved %s", path))
+  }
+  invisible(NULL)
 }
 
 coerce_chosen_path_to_one_based <- function(chosen_path, model = NULL) {
@@ -2076,12 +3424,7 @@ build_node_difference_trial_metrics <- function(trial_data, node_mat) {
     warning("Missing node/actual_reward columns; skipping path-difference revisit plots.")
     return(data.frame())
   }
-  actual_reward_mat <- sapply(seq_len(task_node_count), function(node_id) {
-    actual_reward_for_nodes(trial_data, rep(node_id, nrow(trial_data)), actual_lookup)
-  })
-  if (is.null(dim(actual_reward_mat))) {
-    actual_reward_mat <- matrix(actual_reward_mat, nrow = nrow(trial_data), ncol = task_node_count)
-  }
+  actual_reward_mat <- actual_reward_matrix_for_trials(trial_data, actual_lookup)
   valid_actual_reward_mat <- matrix(
     is_valid_task_reward(as.vector(actual_reward_mat)),
     nrow = nrow(actual_reward_mat),
@@ -2095,13 +3438,7 @@ build_node_difference_trial_metrics <- function(trial_data, node_mat) {
     ))
     actual_reward_mat[!valid_actual_rewards, ] <- NA_real_
   }
-  path_nodes <- task_path_nodes()
-  path_reward_mat <- sapply(path_nodes, function(nodes) {
-    rowSums(actual_reward_mat[, nodes, drop = FALSE])
-  })
-  if (is.null(dim(path_reward_mat))) {
-    path_reward_mat <- matrix(path_reward_mat, nrow = nrow(trial_data), ncol = task_path_count)
-  }
+  path_reward_mat <- path_reward_matrix_from_node_rewards(actual_reward_mat)
   stop_timestep <- suppressWarnings(as.numeric(trial_data$stop_decision_timestep))
   timestep_before_stop <- suppressWarnings(as.numeric(trial_data$timestep_before_stop))
   path_mat <- if (ncol(node_mat) > 0L) {
@@ -2127,18 +3464,33 @@ build_node_difference_trial_metrics <- function(trial_data, node_mat) {
   }
   observations <- rowSums(is.finite(path_mat) & pre_stop_observation_mat, na.rm = TRUE)
   path_1_visits <- rowSums((path_mat == 1) & pre_stop_observation_mat, na.rm = TRUE)
+  kl_paid_at_stop_timestep <- rep(NA_real_, nrow(trial_data))
+  stop_observation_timestep <- suppressWarnings(as.integer(round(timestep_before_stop)))
+  if (
+    exists("kl_mat", inherits = TRUE) &&
+      exists("kl_timesteps", inherits = TRUE) &&
+      nrow(kl_mat) == nrow(trial_data) &&
+      length(kl_timesteps) > 0L
+  ) {
+    stop_kl_col <- match(stop_observation_timestep, kl_timesteps)
+    valid_stop_kl <- !is.na(stop_kl_col) &
+      is.finite(timestep_before_stop) &
+      timestep_before_stop > 0
+    if (any(valid_stop_kl)) {
+      stop_kl_rows <- which(valid_stop_kl)
+      kl_paid_at_stop_timestep[stop_kl_rows] <- kl_mat[cbind(stop_kl_rows, stop_kl_col[stop_kl_rows])]
+    }
+  }
 
   row_mean_excluding_path <- function(reward_matrix, exclude_path) {
     out <- rep(NA_real_, nrow(reward_matrix))
     exclude_path <- suppressWarnings(as.integer(exclude_path))
     valid <- !is.na(exclude_path) & exclude_path >= 1L & exclude_path <= ncol(reward_matrix)
-    for (path_id in seq_len(ncol(reward_matrix))) {
-      rows <- valid & exclude_path == path_id
-      if (!any(rows)) {
-        next
-      }
-      other_cols <- setdiff(seq_len(ncol(reward_matrix)), path_id)
-      out[rows] <- rowMeans(reward_matrix[rows, other_cols, drop = FALSE])
+    if (any(valid)) {
+      valid_rows <- which(valid)
+      excluded_rewards <- reward_matrix[cbind(valid_rows, exclude_path[valid_rows])]
+      out[valid_rows] <- (rowSums(reward_matrix[valid_rows, , drop = FALSE]) - excluded_rewards) /
+        (ncol(reward_matrix) - 1L)
     }
     out
   }
@@ -2153,47 +3505,82 @@ build_node_difference_trial_metrics <- function(trial_data, node_mat) {
       ncol = ncol(path_mat),
       byrow = TRUE
     )
+    first_path_col <- max.col(ifelse(finite_path_mat, ncol(path_mat) - path_col_indices + 1L, 0),
+      ties.method = "first"
+    )
     last_path_col <- max.col(ifelse(finite_path_mat, path_col_indices, 0), ties.method = "first")
     has_path <- rowSums(finite_path_mat) > 0
+    first_path <- rep(NA_real_, nrow(path_mat))
     last_path <- rep(NA_real_, nrow(path_mat))
+    first_path[has_path] <- path_mat[cbind(which(has_path), first_path_col[has_path])]
     last_path[has_path] <- path_mat[cbind(which(has_path), last_path_col[has_path])]
   } else {
+    first_path <- rep(NA_real_, nrow(trial_data))
     last_path <- rep(NA_real_, nrow(trial_data))
   }
+  first_path_int <- suppressWarnings(as.integer(first_path))
   last_path_int <- suppressWarnings(as.integer(last_path))
+  first_observed_path_reward <- rep(NA_real_, nrow(trial_data))
+  valid_first_path <- !is.na(first_path_int) & first_path_int >= 1L & first_path_int <= ncol(path_reward_mat)
+  if (any(valid_first_path)) {
+    first_rows <- which(valid_first_path)
+    first_observed_path_reward[first_rows] <- path_reward_mat[cbind(first_rows, first_path_int[first_rows])]
+  }
   last_visited_path_reward <- rep(NA_real_, nrow(trial_data))
   valid_last_path <- !is.na(last_path_int) & last_path_int >= 1L & last_path_int <= ncol(path_reward_mat)
   if (any(valid_last_path)) {
     last_rows <- which(valid_last_path)
     last_visited_path_reward[last_rows] <- path_reward_mat[cbind(last_rows, last_path_int[last_rows])]
   }
+  other_mean_after_first_observation <- row_mean_excluding_path(path_reward_mat, first_path_int)
   other_mean_after_last_visit <- row_mean_excluding_path(path_reward_mat, last_path_int)
   path_1_minus_mean_other_path_raw <- path_1_reward - path_1_mean_other_reward
+  first_observed_minus_mean_other_path_raw <- first_observed_path_reward - other_mean_after_first_observation
   last_visited_minus_mean_other_path_raw <- last_visited_path_reward - other_mean_after_last_visit
+  first_path_visit_mat <- if (ncol(path_mat) > 0L) {
+    first_path_matrix <- matrix(first_path, nrow = nrow(path_mat), ncol = ncol(path_mat))
+    (path_mat == first_path_matrix) & pre_stop_observation_mat
+  } else {
+    matrix(FALSE, nrow = nrow(trial_data), ncol = 0L)
+  }
+  first_observed_path_visits <- rowSums(first_path_visit_mat, na.rm = TRUE)
   chosen_path <- coerce_chosen_path_to_one_based(trial_data$chosen_path, trial_data$model)
   trial_metrics <- data.frame(
     model = trial_data$model,
     sigma = trial_data$sigma,
     beta = trial_data$beta,
     opportunity = trial_data$opportunity,
+    seed = trial_data$seed,
     path_reward_difference = path_1_minus_mean_other_path_raw,
     absolute_path_reward_difference = abs(path_1_minus_mean_other_path_raw),
+    first_observed_path_reward_difference = first_observed_minus_mean_other_path_raw,
+    absolute_first_observed_path_reward_difference = abs(first_observed_minus_mean_other_path_raw),
     last_visited_path_reward_difference = last_visited_minus_mean_other_path_raw,
     path_1_minus_mean_other_path = bin_mean_difference(path_1_minus_mean_other_path_raw),
     absolute_path_1_minus_mean_other_path = bin_mean_difference(abs(path_1_minus_mean_other_path_raw)),
+    first_observed_minus_mean_other_path = bin_mean_difference(first_observed_minus_mean_other_path_raw),
+    absolute_first_observed_minus_mean_other_path = bin_mean_difference(abs(first_observed_minus_mean_other_path_raw)),
     last_visited_minus_mean_other_path = bin_mean_difference(last_visited_minus_mean_other_path_raw),
     proportion_timesteps_path1 = ifelse(observations > 0, path_1_visits / observations, NA_real_),
+    proportion_timesteps_first_observed_path = ifelse(observations > 0, first_observed_path_visits / observations, NA_real_),
     last_visited_path_chosen = ifelse(is.finite(last_path) & !is.na(chosen_path), as.numeric(last_path == chosen_path), NA_real_),
     choose_path1 = ifelse(!is.na(chosen_path), as.numeric(chosen_path == 1L), NA_real_),
+    choose_first_observed_path = ifelse(is.finite(first_path) & !is.na(chosen_path), as.numeric(first_path == chosen_path), NA_real_),
     node_reward_difference = path_1_minus_mean_other_path_raw,
     absolute_node_reward_difference = abs(path_1_minus_mean_other_path_raw),
+    first_observed_node_reward_difference = first_observed_minus_mean_other_path_raw,
+    absolute_first_observed_node_reward_difference = abs(first_observed_minus_mean_other_path_raw),
     last_visited_reward_difference = last_visited_minus_mean_other_path_raw,
     node_1_minus_mean_other_node = bin_mean_difference(path_1_minus_mean_other_path_raw),
     absolute_node_1_minus_mean_other_node = bin_mean_difference(abs(path_1_minus_mean_other_path_raw)),
+    first_observed_minus_mean_other_node = bin_mean_difference(first_observed_minus_mean_other_path_raw),
+    absolute_first_observed_minus_mean_other_node = bin_mean_difference(abs(first_observed_minus_mean_other_path_raw)),
     last_visited_minus_mean_other_node = bin_mean_difference(last_visited_minus_mean_other_path_raw),
     proportion_timesteps_node1 = ifelse(observations > 0, path_1_visits / observations, NA_real_),
+    proportion_timesteps_first_observed_node = ifelse(observations > 0, first_observed_path_visits / observations, NA_real_),
     last_visited_node_chosen = ifelse(is.finite(last_path) & !is.na(chosen_path), as.numeric(last_path == chosen_path), NA_real_),
     choose_node1 = ifelse(!is.na(chosen_path), as.numeric(chosen_path == 1L), NA_real_),
+    choose_first_observed_node = ifelse(is.finite(first_path) & !is.na(chosen_path), as.numeric(first_path == chosen_path), NA_real_),
     observations_before_stop = observations,
     stop_decision_timestep = stop_timestep,
     timestep_before_stop = timestep_before_stop,
@@ -2203,14 +3590,29 @@ build_node_difference_trial_metrics <- function(trial_data, node_mat) {
       suppressWarnings(as.numeric(trial_data$kl_paid_total)) / timestep_before_stop,
       NA_real_
     ),
+    kl_paid_per_pre_stop_timestep = ifelse(
+      is.finite(observations) & observations > 1,
+      suppressWarnings(as.numeric(trial_data$kl_paid_total)) / (observations - 1),
+      NA_real_
+    ),
+    kl_paid_at_stop_timestep = kl_paid_at_stop_timestep,
+    kl_paid_at_stop_timestep_after_first_continue = ifelse(
+      is.finite(observations) & observations > 1,
+      kl_paid_at_stop_timestep,
+      NA_real_
+    ),
     stringsAsFactors = FALSE
   )
   trial_metrics[
     is.finite(trial_metrics$path_1_minus_mean_other_path) |
       is.finite(trial_metrics$absolute_path_1_minus_mean_other_path) |
+      is.finite(trial_metrics$first_observed_minus_mean_other_path) |
+      is.finite(trial_metrics$absolute_first_observed_minus_mean_other_path) |
       is.finite(trial_metrics$last_visited_minus_mean_other_path) |
       is.finite(trial_metrics$node_reward_difference) |
       is.finite(trial_metrics$absolute_node_reward_difference) |
+      is.finite(trial_metrics$first_observed_node_reward_difference) |
+      is.finite(trial_metrics$absolute_first_observed_node_reward_difference) |
       is.finite(trial_metrics$last_visited_reward_difference),
     ,
     drop = FALSE
@@ -2226,22 +3628,46 @@ summarize_difference_metrics <- function(trial_metrics, difference_col) {
     return(data.frame())
   }
   group_cols <- c("model", "sigma", "beta", "opportunity", difference_col)
+  difference_value_cols <- c(
+    "proportion_timesteps_path1",
+    "proportion_timesteps_first_observed_path",
+    "last_visited_path_chosen",
+    "choose_path1",
+    "choose_first_observed_path",
+    "observations_before_stop",
+    "stop_decision_timestep",
+    "timestep_before_stop",
+    "kl_paid_total",
+    "kl_paid_per_stop_timestep",
+    "kl_paid_per_pre_stop_timestep",
+    "kl_paid_at_stop_timestep",
+    "kl_paid_at_stop_timestep_after_first_continue"
+  )
   out <- aggregate_means_by(
     trial_metrics,
     group_cols = group_cols,
-    value_cols = c(
-      "proportion_timesteps_path1",
-      "last_visited_path_chosen",
-      "choose_path1",
-      "observations_before_stop",
-      "stop_decision_timestep",
-      "timestep_before_stop",
-      "kl_paid_total",
-      "kl_paid_per_stop_timestep"
-    )
+    value_cols = difference_value_cols
   )
   count_data <- count_rows_by(trial_metrics, group_cols)
-  merge(out, count_data, by = group_cols, all.x = TRUE)
+  out <- merge(out, count_data, by = group_cols, all.x = TRUE)
+  for (value_col in difference_value_cols) {
+    finite_rows <- is.finite(suppressWarnings(as.numeric(trial_metrics[[value_col]])))
+    if (!any(finite_rows)) {
+      next
+    }
+    value_count_data <- count_rows_by(
+      trial_metrics[finite_rows, , drop = FALSE],
+      group_cols,
+      count_name = paste0(value_col, "_n")
+    )
+    out <- merge(out, value_count_data, by = group_cols, all.x = TRUE)
+  }
+  add_seed_sem_by(
+    out,
+    trial_metrics,
+    group_cols = group_cols,
+    value_cols = difference_value_cols
+  )
 }
 
 plot_summary_scatter(
@@ -2317,26 +3743,26 @@ plot_summary_scatter(
 )
 
 entropy_summary_col <- if (
-  "terminal_choice_entropy_combined_reached" %in% names(average_summary) &&
-    any(is.finite(suppressWarnings(as.numeric(average_summary$terminal_choice_entropy_combined_reached))))
+  "terminal_choice_entropy_combined_reached" %in% names(entropy_average_summary) &&
+    any(is.finite(suppressWarnings(as.numeric(entropy_average_summary$terminal_choice_entropy_combined_reached))))
 ) {
   "terminal_choice_entropy_combined_reached"
 } else {
   "terminal_choice_entropy"
 }
 entropy_summary_label <- if (identical(entropy_summary_col, "terminal_choice_entropy_combined_reached")) {
-  "Average stop-choice entropy across reached timesteps"
+  "Average stop-choice entropy\nacross reached timesteps"
 } else {
-  "Average terminal choice entropy at stop"
+  "Average terminal choice\nentropy at stop"
 }
-has_entropy_data <- entropy_summary_col %in% names(average_summary) &&
-  any(is.finite(suppressWarnings(as.numeric(average_summary[[entropy_summary_col]]))))
+has_entropy_data <- entropy_summary_col %in% names(entropy_average_summary) &&
+  any(is.finite(suppressWarnings(as.numeric(entropy_average_summary[[entropy_summary_col]]))))
 if (has_entropy_data) {
   plot_summary_scatter(
-    average_summary,
+    entropy_average_summary,
     x_col = "kl_paid_total",
     y_col = entropy_summary_col,
-    xlab = "Average KL paid across timesteps (log)",
+    xlab = "Average KL paid\nacross timesteps (log)",
     ylab = entropy_summary_label,
     file_prefix = "revisit_average_terminal_choice_entropy_vs_log_kl_paid_by_sigma",
     log_x = TRUE,
@@ -2345,7 +3771,7 @@ if (has_entropy_data) {
     model_layout = "overlay"
   )
   plot_summary_scatter(
-    average_summary,
+    entropy_average_summary,
     x_col = "timestep_before_stop",
     y_col = entropy_summary_col,
     xlab = "Average timestep before stopping",
@@ -2356,10 +3782,10 @@ if (has_entropy_data) {
     model_layout = "overlay"
   )
   plot_summary_scatter(
-    average_summary,
+    entropy_average_summary,
     x_col = "kl_paid_total",
     y_col = entropy_summary_col,
-    xlab = "Average KL paid across timesteps (log)",
+    xlab = "Average KL paid\nacross timesteps (log)",
     ylab = entropy_summary_label,
     file_prefix = "revisit_average_terminal_choice_entropy_vs_log_kl_paid_sigma_color",
     log_x = TRUE,
@@ -2368,7 +3794,7 @@ if (has_entropy_data) {
     model_layout = "overlay"
   )
   plot_summary_scatter(
-    average_summary,
+    entropy_average_summary,
     x_col = "timestep_before_stop",
     y_col = entropy_summary_col,
     xlab = "Average timestep before stopping",
@@ -2384,20 +3810,68 @@ if (has_entropy_data) {
   )
 }
 
+is_default_two_node_tree <- tree_size == 2L && !nzchar(tree_config)
+if (is_default_two_node_tree) {
+  has_max_terminal_prob_data <- "terminal_choice_prob_max_combined_reached" %in% names(entropy_average_summary) &&
+    any(is.finite(suppressWarnings(as.numeric(entropy_average_summary$terminal_choice_prob_max_combined_reached))))
+  if (has_max_terminal_prob_data) {
+    plot_summary_scatter(
+      entropy_average_summary,
+      x_col = "timestep_before_stop",
+      y_col = "terminal_choice_prob_max_combined_reached",
+      xlab = "Average timestep before stopping",
+      ylab = "Average max P(choose path 1, path 2)\nacross reached timesteps",
+      file_prefix = "revisit_average_terminal_choice_max_probability_vs_average_timestep_before_stop_by_sigma",
+      facet_sigma = TRUE,
+      color_mode = "parameter",
+      model_layout = "overlay"
+    )
+  }
+  has_min_terminal_prob_data <- "terminal_choice_prob_min_combined_reached" %in% names(entropy_average_summary) &&
+    any(is.finite(suppressWarnings(as.numeric(entropy_average_summary$terminal_choice_prob_min_combined_reached))))
+  if (has_min_terminal_prob_data) {
+    plot_summary_scatter(
+      entropy_average_summary,
+      x_col = "timestep_before_stop",
+      y_col = "terminal_choice_prob_min_combined_reached",
+      xlab = "Average timestep before stopping",
+      ylab = "Average min P(choose path 1, path 2)\nacross reached timesteps",
+      file_prefix = "revisit_average_terminal_choice_min_probability_vs_average_timestep_before_stop_by_sigma",
+      facet_sigma = TRUE,
+      color_mode = "parameter",
+      model_layout = "overlay"
+    )
+  }
+}
+
 plot_metric_by_timestep(
   pre_stop_timestep_summary,
   y_col = "kl_paid_at_timestep",
-  ylab = "Average KL paid at timestep",
+  ylab = "Average carried-forward KL\nafter timestep",
   file_prefix = "revisit_pre_stop_timestep_vs_kl_paid_at_timestep_by_sigma"
 )
-has_pre_stop_entropy_data <- nrow(pre_stop_timestep_summary) > 0 &&
-  "terminal_binary_choice_entropy_at_timestep" %in% names(pre_stop_timestep_summary) &&
-  any(is.finite(suppressWarnings(as.numeric(pre_stop_timestep_summary$terminal_binary_choice_entropy_at_timestep))))
+if (nrow(first_timestep_kl_after_continue_summary) > 0) {
+  plot_metric_by_difference(
+    first_timestep_kl_after_continue_summary,
+    y_col = "kl_paid_at_first_timestep_after_continue",
+    ylab = "Average KL after first reward\ncontinued to another observation",
+    file_prefix = "revisit_first_observed_reward_vs_kl_paid_at_first_timestep_after_continue_by_sigma",
+    x_col = "first_observed_reward_t1",
+    xlab = "Actual reward of first observed node"
+  )
+} else {
+  warning(
+    "No first-timestep KL rows where the model continued after the first reward; skipping first-reward KL plot."
+  )
+}
+has_pre_stop_entropy_data <- nrow(pre_stop_timestep_entropy_summary) > 0 &&
+  "terminal_binary_choice_entropy_at_timestep" %in% names(pre_stop_timestep_entropy_summary) &&
+  any(is.finite(suppressWarnings(as.numeric(pre_stop_timestep_entropy_summary$terminal_binary_choice_entropy_at_timestep))))
 if (has_pre_stop_entropy_data) {
   plot_metric_by_timestep(
-    pre_stop_timestep_summary,
+    pre_stop_timestep_entropy_summary,
     y_col = "terminal_binary_choice_entropy_at_timestep",
-    ylab = "Average stop-choice entropy, path 1 vs path 2",
+    ylab = "Average stop-choice entropy\npath 1 vs path 2",
     file_prefix = "revisit_pre_stop_timestep_vs_terminal_choice_entropy_at_timestep_by_sigma"
   )
 } else {
@@ -2405,12 +3879,74 @@ if (has_pre_stop_entropy_data) {
     "No terminal choice probability columns found at pre-stop timesteps; skipping pre-stop terminal-choice entropy plot."
   )
 }
+has_strict_pre_stop_entropy_data <- nrow(pre_stop_timestep_entropy_strict_summary) > 0 &&
+  "terminal_binary_choice_entropy_at_timestep" %in% names(pre_stop_timestep_entropy_strict_summary) &&
+  any(is.finite(suppressWarnings(as.numeric(pre_stop_timestep_entropy_strict_summary$terminal_binary_choice_entropy_at_timestep))))
+if (has_strict_pre_stop_entropy_data) {
+  plot_metric_by_timestep(
+    pre_stop_timestep_entropy_strict_summary,
+    y_col = "terminal_binary_choice_entropy_at_timestep",
+    ylab = "Average stop-choice entropy\nbefore stopping\npath 1 vs path 2",
+    file_prefix = "revisit_strict_pre_stop_timestep_vs_terminal_choice_entropy_at_timestep_by_sigma",
+    x_file_col = "strict_pre_stop_timestep"
+  )
+} else {
+  warning(
+    "No terminal choice probability columns found strictly before stopping; skipping strict pre-stop terminal-choice entropy plot."
+  )
+}
+plot_heatmap_summary_set <- function(summary_set, prefix_suffix = "") {
+  if (is.null(summary_set)) {
+    return(invisible(NULL))
+  }
+  plot_reward_context_heatmaps(
+    summary_set$terminal_entropy,
+    value_col = "terminal_choice_entropy_at_timestep",
+    value_label = "Terminal action-policy entropy",
+    file_prefix = paste0(
+      "terminal_action_policy_entropy_by_first_observed_and_mean_other_reward_heatmap",
+      prefix_suffix
+    ),
+    include_timestep = TRUE,
+    palette = "Viridis"
+  )
+  plot_reward_context_heatmaps(
+    summary_set$kl_timestep,
+    value_col = "kl_paid_at_timestep",
+    value_label = "KL paid after continuing",
+    file_prefix = paste0(
+      "kl_paid_by_first_observed_and_mean_other_reward_heatmap",
+      prefix_suffix
+    ),
+    include_timestep = TRUE,
+    palette = "Plasma"
+  )
+  plot_reward_context_heatmaps(
+    summary_set$timestep_before_stop,
+    value_col = "timestep_before_stop",
+    value_label = "Timestep before stopping",
+    file_prefix = paste0(
+      "timestep_before_stop_by_first_observed_and_mean_other_reward_heatmap",
+      prefix_suffix
+    ),
+    include_timestep = FALSE,
+    palette = "YlGnBu"
+  )
+  invisible(NULL)
+}
+
+plot_heatmap_summary_set(default_heatmap_summaries)
+plot_heatmap_summary_set(disjoint_integer_heatmap_summaries, "_path_value_mean_other_integer")
+plot_heatmap_summary_set(disjoint_bin2_heatmap_summaries, "_path_value_bin2")
 
 node_difference_trial_metrics <- build_node_difference_trial_metrics(trial_data, node_mat)
 if (nrow(node_difference_trial_metrics) > 0) {
+  first_minus_other_path_label <- "First observed path reward\n- mean other path reward"
+  abs_first_minus_other_path_label <- "|First observed path reward\n- mean other path reward|"
+  last_minus_other_path_label <- "Last visited path reward\n- mean other path reward"
   node_difference_summary <- summarize_difference_metrics(
     node_difference_trial_metrics,
-    "path_1_minus_mean_other_path"
+    "first_observed_minus_mean_other_path"
   )
   last_visited_difference_summary <- summarize_difference_metrics(
     node_difference_trial_metrics,
@@ -2418,15 +3954,15 @@ if (nrow(node_difference_trial_metrics) > 0) {
   )
   absolute_node_difference_summary <- summarize_difference_metrics(
     node_difference_trial_metrics,
-    "absolute_path_1_minus_mean_other_path"
+    "absolute_first_observed_minus_mean_other_path"
   )
   plot_metric_by_difference(
     node_difference_summary,
-    y_col = "proportion_timesteps_path1",
-    ylab = "Proportion of pre-stop timesteps visiting path 1",
-    file_prefix = "revisit_path1_minus_mean_other_path_reward_vs_proportion_path1_visits_by_sigma",
-    x_col = "path_1_minus_mean_other_path",
-    xlab = "Path 1 actual reward - mean actual other path(s)"
+    y_col = "proportion_timesteps_first_observed_path",
+    ylab = "Proportion pre-stop timesteps\nvisiting first observed path",
+    file_prefix = "revisit_first_observed_minus_mean_other_path_reward_vs_proportion_first_observed_path_visits_by_sigma",
+    x_col = "first_observed_minus_mean_other_path",
+    xlab = first_minus_other_path_label
   )
   plot_metric_by_difference(
     last_visited_difference_summary,
@@ -2434,38 +3970,62 @@ if (nrow(node_difference_trial_metrics) > 0) {
     ylab = "P(last visited path is chosen)",
     file_prefix = "revisit_last_visited_minus_mean_other_path_reward_vs_last_visited_path_chosen_by_sigma",
     x_col = "last_visited_minus_mean_other_path",
-    xlab = "Last visited path actual reward - mean actual other path(s)"
+    xlab = last_minus_other_path_label
   )
   plot_metric_by_difference(
     node_difference_summary,
-    y_col = "choose_path1",
-    ylab = "P(choose path 1)",
-    file_prefix = "revisit_path1_minus_mean_other_path_reward_vs_probability_choose_path1_by_sigma",
-    x_col = "path_1_minus_mean_other_path",
-    xlab = "Path 1 actual reward - mean actual other path(s)"
+    y_col = "choose_first_observed_path",
+    ylab = "P(choose first observed path)",
+    file_prefix = "revisit_first_observed_minus_mean_other_path_reward_vs_probability_choose_first_observed_path_by_sigma",
+    x_col = "first_observed_minus_mean_other_path",
+    xlab = first_minus_other_path_label
   )
   plot_metric_by_difference(
     absolute_node_difference_summary,
     y_col = "timestep_before_stop",
     ylab = "Average timestep before stopping",
-    file_prefix = "revisit_abs_path1_minus_mean_other_path_reward_vs_average_timestep_before_stop_by_sigma",
-    x_col = "absolute_path_1_minus_mean_other_path",
-    xlab = "|path 1 actual reward - mean actual other path(s)|"
+    file_prefix = "revisit_abs_first_observed_minus_mean_other_path_reward_vs_average_timestep_before_stop_by_sigma",
+    x_col = "absolute_first_observed_minus_mean_other_path",
+    xlab = abs_first_minus_other_path_label
   )
   plot_metric_by_difference(
     absolute_node_difference_summary,
     y_col = "kl_paid_total",
     ylab = "Average KL paid across timesteps",
-    file_prefix = "revisit_abs_path1_minus_mean_other_path_reward_vs_average_kl_paid_by_sigma",
-    x_col = "absolute_path_1_minus_mean_other_path",
-    xlab = "|path 1 actual reward - mean actual other path(s)|"
+    file_prefix = "revisit_abs_first_observed_minus_mean_other_path_reward_vs_average_kl_paid_by_sigma",
+    x_col = "absolute_first_observed_minus_mean_other_path",
+    xlab = abs_first_minus_other_path_label
   )
   plot_metric_by_difference(
     absolute_node_difference_summary,
     y_col = "kl_paid_per_stop_timestep",
-    ylab = "Average KL paid per stop timestep",
-    file_prefix = "revisit_abs_path1_minus_mean_other_path_reward_vs_average_kl_paid_per_timestep_before_stop_by_sigma",
-    x_col = "absolute_path_1_minus_mean_other_path",
-    xlab = "|path 1 actual reward - mean actual other path(s)|"
+    ylab = "Average KL paid\nper stop timestep",
+    file_prefix = "revisit_abs_first_observed_minus_mean_other_path_reward_vs_average_kl_paid_per_timestep_before_stop_by_sigma",
+    x_col = "absolute_first_observed_minus_mean_other_path",
+    xlab = abs_first_minus_other_path_label
+  )
+  plot_metric_by_difference(
+    absolute_node_difference_summary,
+    y_col = "kl_paid_per_pre_stop_timestep",
+    ylab = "Average KL paid /\n(observed rewards before stop - 1)",
+    file_prefix = "revisit_abs_first_observed_minus_mean_other_path_reward_vs_average_kl_paid_per_pre_stop_timestep_by_sigma",
+    x_col = "absolute_first_observed_minus_mean_other_path",
+    xlab = abs_first_minus_other_path_label
+  )
+  plot_metric_by_difference(
+    absolute_node_difference_summary,
+    y_col = "kl_paid_at_stop_timestep",
+    ylab = "Average KL paid\nat stopping timestep",
+    file_prefix = "revisit_abs_first_observed_minus_mean_other_path_reward_vs_kl_paid_at_stop_timestep_by_sigma",
+    x_col = "absolute_first_observed_minus_mean_other_path",
+    xlab = abs_first_minus_other_path_label
+  )
+  plot_metric_by_difference(
+    absolute_node_difference_summary,
+    y_col = "kl_paid_at_stop_timestep_after_first_continue",
+    ylab = "Last carried-forward KL\nbefore stopping\ncontinued after first reward",
+    file_prefix = "revisit_abs_first_observed_minus_mean_other_path_reward_vs_kl_paid_at_stop_timestep_after_first_continue_by_sigma",
+    x_col = "absolute_first_observed_minus_mean_other_path",
+    xlab = abs_first_minus_other_path_label
   )
 }
