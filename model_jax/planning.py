@@ -445,7 +445,25 @@ def scalar_to_onehot(values: jax.Array) -> jax.Array:
 
 
 def reward_feature_dim_for_sigma(observation_sigma: float) -> int:
-    return 1 if abs(float(observation_sigma)) > 1e-12 else 9
+    return 1
+
+
+def infer_reward_feature_dim_from_checkpoint(checkpoint_path: Path | str, time_steps: int) -> int:
+    try:
+        restored = serialization.msgpack_restore(Path(checkpoint_path).read_bytes())
+        kernel = restored.get("lstm_kernel") if isinstance(restored, dict) else None
+        if kernel is None and hasattr(restored, "__getitem__"):
+            try:
+                kernel = restored["lstm_kernel"]
+            except Exception:
+                kernel = None
+        if kernel is None:
+            return 0
+        input_dim = int(np.asarray(kernel).shape[0])
+        reward_dim = input_dim - int(time_steps) - 1
+        return int(reward_dim) if reward_dim > 0 else 0
+    except Exception:
+        return 0
 
 
 def sample_reward_matrix(
@@ -475,7 +493,7 @@ def initial_carry(
     num_envs: int,
     task: TaskSpec,
     rnn_units: int,
-    reward_feature_dim: int = 9,
+    reward_feature_dim: int = 1,
 ) -> RunnerCarry:
     return RunnerCarry(
         rewards=jnp.zeros((num_envs, task.num_nodes), dtype=jnp.float32),
@@ -565,8 +583,11 @@ class PlanningVAE(nn.Module):
     lambda_: float
     alpha: float
     beta: float
+    reward_feature_dim_override: int = 0
 
     def reward_feature_dim(self) -> int:
+        if int(self.reward_feature_dim_override) > 0:
+            return int(self.reward_feature_dim_override)
         return reward_feature_dim_for_sigma(self.observation_sigma)
 
     def reward_features(self, values: jax.Array) -> jax.Array:
@@ -2473,6 +2494,12 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
 def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, object]:
     path_tuple = tuple(tuple(float(v) for v in row) for row in task.path_map)
     reward_tuple = tuple(float(v) for v in task.reward_values)
+    weights_path = Path(config.model_dir) / f"{model_name_for(config, task)}.msgpack"
+    checkpoint_reward_dim = (
+        infer_reward_feature_dim_from_checkpoint(weights_path, task.num_nodes)
+        if weights_path.exists()
+        else 0
+    )
     model = PlanningVAE(
         rnn_units=config.rnn_units,
         latent_dim=config.latent_dim,
@@ -2492,13 +2519,17 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
         lambda_=config.lambda_,
         alpha=config.alpha,
         beta=config.beta,
+        reward_feature_dim_override=int(checkpoint_reward_dim),
     )
     rng = jax.random.PRNGKey(config.seed)
-    reward_feature_dim = reward_feature_dim_for_sigma(config.observation_sigma)
+    reward_feature_dim = (
+        int(checkpoint_reward_dim)
+        if int(checkpoint_reward_dim) > 0
+        else reward_feature_dim_for_sigma(config.observation_sigma)
+    )
     dummy = initial_carry(1, task, config.rnn_units, reward_feature_dim)
     sched = ScheduleValues(1.0, 1.0 / config.beta, 0.0, 0.0, 0.0, 0.0, 0.3)
     params = model.init(rng, dummy, rng, sched, None, False)["params"]
-    weights_path = Path(config.model_dir) / f"{model_name_for(config, task)}.msgpack"
     if weights_path.exists():
         params = serialization.from_bytes(params, weights_path.read_bytes())
     else:

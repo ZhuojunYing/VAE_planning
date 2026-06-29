@@ -79,6 +79,18 @@ parse_nonnegative_integer_option <- function(value, option_name) {
   as.integer(round(numeric_value))
 }
 
+parse_positive_numeric_option <- function(value, option_name) {
+  numeric_value <- suppressWarnings(as.numeric(value))
+  if (
+    is.na(numeric_value) ||
+      !is.finite(numeric_value) ||
+      numeric_value <= 0
+  ) {
+    stop(sprintf("%s must be a positive number. Got %s.", option_name, value))
+  }
+  numeric_value
+}
+
 min_samples_option <- extract_named_option(
   args,
   c("--min-samples", "--min-sampes", "--minimum-samples", "--min-sample-count", "--min-n"),
@@ -88,6 +100,16 @@ args <- min_samples_option$args
 minimum_samples_threshold <- parse_nonnegative_integer_option(
   min_samples_option$value,
   "--min-samples"
+)
+log_axis_floor_option <- extract_named_option(
+  args,
+  c("--log-axis-floor", "--log-floor", "--kl-log-floor"),
+  default = "1e-8"
+)
+args <- log_axis_floor_option$args
+log_axis_floor <- parse_positive_numeric_option(
+  log_axis_floor_option$value,
+  "--log-axis-floor"
 )
 selected_revisit_plots_option <- extract_flag_option(
   args,
@@ -322,6 +344,7 @@ base_results_dir <- results_dir
 dir.create(base_results_dir, recursive = TRUE, showWarnings = FALSE)
 message(sprintf("Using %s revisit simulation CSVs from %s", simulation_source, input_dir))
 message(sprintf("Minimum samples per plotted dot or heatmap cell: %d", minimum_samples_threshold))
+message(sprintf("Log-axis display floor: %g", log_axis_floor))
 if (isTRUE(selected_revisit_plots_only)) {
   message("Selected revisit plot mode: writing only the core KL/entropy/reward plots.")
 }
@@ -489,9 +512,10 @@ safe_png_path <- function(file_prefix, suffix = NULL, max_basename_chars = 180) 
   file.path(plot_output_dir, sprintf("%s_h%s.png", substr(clean_prefix, 1L, keep_chars), hash))
 }
 
-panel_width_in <- 60 / 25.4
-panel_height_in <- 60 / 25.4
 plot_font_size_pt <- 7
+panel_plot_width_in <- 33 / 25.4
+panel_plot_height_in <- 33 / 25.4
+panel_margin_line_height_in <- plot_font_size_pt * 1.2 / 72
 legend_panel_fraction <- 0.75
 panel_left_margin_lines <- 6.8
 panel_right_gap_lines <- 4.0
@@ -503,11 +527,21 @@ panel_margins <- function(top = panel_top_margin_lines, bottom = panel_bottom_ma
   c(bottom, panel_left_margin_lines, top, panel_right_gap_lines)
 }
 
+panel_cell_width_in <- function() {
+  panel_plot_width_in + (panel_left_margin_lines + panel_right_gap_lines) * panel_margin_line_height_in
+}
+
+panel_cell_height_in <- function(top = panel_top_margin_lines, bottom = panel_bottom_margin_lines) {
+  panel_plot_height_in + (top + bottom) * panel_margin_line_height_in
+}
+
 open_panel_png <- function(path, n_cols = 1L, n_rows = 1L, legend_fraction = 0) {
+  cell_width <- panel_cell_width_in()
+  cell_height <- panel_cell_height_in()
   png(
     path,
-    width = panel_width_in * (n_cols + legend_fraction),
-    height = panel_height_in * n_rows,
+    width = cell_width * n_cols + panel_plot_width_in * legend_fraction,
+    height = cell_height * n_rows,
     units = "in",
     res = 300,
     pointsize = plot_font_size_pt
@@ -1864,6 +1898,15 @@ sem_or_na <- function(x) {
   if (length(x) < 2L) NA_real_ else stats::sd(x) / sqrt(length(x))
 }
 
+log10_sem_or_na <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x <- x[is.finite(x) & x > 0]
+  if (length(x) < 2L) {
+    return(NA_real_)
+  }
+  stats::sd(log10(pmax(x, log_axis_floor))) / sqrt(length(x))
+}
+
 build_pre_stop_timestep_data <- function() {
   candidate_timesteps <- sort(unique(c(reward_timesteps, node_timesteps, kl_timesteps)))
   candidate_timesteps <- candidate_timesteps[is.finite(candidate_timesteps) & candidate_timesteps > 0]
@@ -1961,6 +2004,8 @@ add_seed_sem_by <- function(summary_data, dat, group_cols, value_cols) {
     dt <- data.table::as.data.table(seed_means)
     sd_data <- dt[, lapply(.SD, sem_or_na), by = group_cols, .SDcols = value_cols]
     sd_data <- as.data.frame(sd_data)
+    log_sem_data <- dt[, lapply(.SD, log10_sem_or_na), by = group_cols, .SDcols = value_cols]
+    log_sem_data <- as.data.frame(log_sem_data)
   } else {
     pieces <- lapply(value_cols, function(value_col) {
       out <- aggregate(seed_means[[value_col]], by = seed_means[, group_cols, drop = FALSE], FUN = sem_or_na)
@@ -1968,9 +2013,20 @@ add_seed_sem_by <- function(summary_data, dat, group_cols, value_cols) {
       out
     })
     sd_data <- Reduce(function(left, right) merge(left, right, by = group_cols, all = TRUE), pieces)
+    log_pieces <- lapply(value_cols, function(value_col) {
+      out <- aggregate(seed_means[[value_col]], by = seed_means[, group_cols, drop = FALSE], FUN = log10_sem_or_na)
+      names(out)[names(out) == "x"] <- value_col
+      out
+    })
+    log_sem_data <- Reduce(function(left, right) merge(left, right, by = group_cols, all = TRUE), log_pieces)
   }
   names(sd_data)[names(sd_data) %in% value_cols] <- paste0(names(sd_data)[names(sd_data) %in% value_cols], "_seed_sem")
-  merge(summary_data, sd_data, by = group_cols, all.x = TRUE)
+  names(log_sem_data)[names(log_sem_data) %in% value_cols] <- paste0(
+    names(log_sem_data)[names(log_sem_data) %in% value_cols],
+    "_seed_log10_sem"
+  )
+  summary_data <- merge(summary_data, sd_data, by = group_cols, all.x = TRUE)
+  merge(summary_data, log_sem_data, by = group_cols, all.x = TRUE)
 }
 
 count_rows_by <- function(dat, group_cols, count_name = "n") {
@@ -2613,6 +2669,27 @@ expand_range <- function(x, pad = 0.05, default = c(0, 1)) {
   rng + c(-1, 1) * diff(rng) * pad
 }
 
+is_timestep_axis_col <- function(x_col) {
+  x_col %in% c("timestep", "strict_pre_stop_timestep", "timestep_before_stop")
+}
+
+timestep_x_limits <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x <- x[is.finite(x)]
+  if (length(x) == 0L) {
+    return(c(1, 2))
+  }
+  max_tick <- max(1L, ceiling(max(x)))
+  c(1, if (max_tick <= 1L) 2 else max_tick)
+}
+
+timestep_x_ticks <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x <- x[is.finite(x)]
+  max_tick <- if (length(x) == 0L) 1L else max(1L, ceiling(max(x)))
+  seq.int(1L, max_tick)
+}
+
 expand_log_range <- function(x, pad = 0.05, default = c(1e-3, 1)) {
   x <- suppressWarnings(as.numeric(x))
   x <- x[is.finite(x) & x > 0]
@@ -2654,7 +2731,7 @@ plot_parameter_legend <- function(active_models = model_levels_all) {
     pch = legend_pch,
     lty = legend_lty,
     bty = "n",
-    cex = 0.78
+    cex = 1
   )
 }
 
@@ -2691,7 +2768,7 @@ plot_sigma_legend <- function(active_models = model_levels_all) {
     pch = legend_pch,
     lty = legend_lty,
     bty = "n",
-    cex = 0.8
+    cex = 1
   )
 }
 
@@ -2760,36 +2837,90 @@ seed_sem_col_for <- function(y_col, dat) {
   }
 }
 
+seed_log10_sem_col_for <- function(y_col, dat) {
+  candidate <- paste0(y_col, "_seed_log10_sem")
+  if (!is.null(dat) && candidate %in% names(dat)) {
+    candidate
+  } else {
+    NA_character_
+  }
+}
+
+log_display_values <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  ifelse(is.finite(x) & x > 0, pmax(x, log_axis_floor), x)
+}
+
 y_values_with_seed_sem <- function(dat, y_col, log_y = FALSE) {
   y <- suppressWarnings(as.numeric(dat[[y_col]]))
+  if (isTRUE(log_y)) {
+    y <- log_display_values(y)
+  }
   sem_col <- seed_sem_col_for(y_col, dat)
   if (!is.na(sem_col)) {
+    if (isTRUE(log_y)) {
+      log_sem_col <- seed_log10_sem_col_for(y_col, dat)
+      if (!is.na(log_sem_col)) {
+        log_sem_values <- suppressWarnings(as.numeric(dat[[log_sem_col]]))
+        finite_sem <- is.finite(y) & y > 0 & is.finite(log_sem_values) & log_sem_values >= 0
+        lows <- 10 ^ (log10(y[finite_sem]) - log_sem_values[finite_sem])
+        highs <- 10 ^ (log10(y[finite_sem]) + log_sem_values[finite_sem])
+        y <- c(y, lows, highs)
+        return(y)
+      }
+    }
     sem_values <- suppressWarnings(as.numeric(dat[[sem_col]]))
     finite_sem <- is.finite(sem_values) & sem_values >= 0
     lows <- y[finite_sem] - sem_values[finite_sem]
     highs <- y[finite_sem] + sem_values[finite_sem]
     if (isTRUE(log_y)) {
-      lows <- lows[lows > 0]
-      highs <- highs[highs > 0]
+      lows <- pmax(lows[lows > 0], log_axis_floor)
+      highs <- pmax(highs[highs > 0], log_axis_floor)
     }
     y <- c(y, lows, highs)
   }
   y
 }
 
-draw_seed_error_bars <- function(x, y, sem_values, cols, log_y = FALSE) {
+draw_seed_error_bars <- function(x, y, sem_values, cols, log_y = FALSE, log_sem_values = NULL) {
   x <- suppressWarnings(as.numeric(x))
   y <- suppressWarnings(as.numeric(y))
   sem_values <- suppressWarnings(as.numeric(sem_values))
   keep <- is.finite(x) & is.finite(y) & is.finite(sem_values) & sem_values > 0
   if (isTRUE(log_y)) {
-    keep <- keep & (y - sem_values) > 0
+    y <- log_display_values(y)
+    if (!is.null(log_sem_values)) {
+      log_sem_values <- suppressWarnings(as.numeric(log_sem_values))
+      keep <- is.finite(x) & is.finite(y) & y > 0 &
+        is.finite(log_sem_values) & log_sem_values > 0
+      if (!any(keep)) {
+        return(invisible(NULL))
+      }
+      low <- 10 ^ (log10(y[keep]) - log_sem_values[keep])
+      high <- 10 ^ (log10(y[keep]) + log_sem_values[keep])
+      arrows(
+        x0 = x[keep],
+        y0 = low,
+        x1 = x[keep],
+        y1 = high,
+        code = 3,
+        angle = 90,
+        length = 0.025,
+        col = grDevices::adjustcolor(cols[keep], alpha.f = 0.65),
+        lwd = 0.8
+      )
+      return(invisible(NULL))
+    }
   }
   if (!any(keep)) {
     return(invisible(NULL))
   }
   low <- y[keep] - sem_values[keep]
   high <- y[keep] + sem_values[keep]
+  if (isTRUE(log_y)) {
+    low <- pmax(low, log_axis_floor)
+    high <- pmax(high, log_axis_floor)
+  }
   arrows(
     x0 = x[keep],
     y0 = low,
@@ -2865,8 +2996,11 @@ plot_summary_scatter <- function(
   )
   par(mar = panel_margins(top = if (isTRUE(facet_sigma) && n_panels > 1L) panel_title_margin_lines else panel_top_margin_lines))
   apply_panel_text_style()
-  x_limits <- if (isTRUE(log_x)) {
-    expand_log_range(plot_data[[x_col]], pad = 0.05)
+  x_is_timestep <- is_timestep_axis_col(x_col) && !isTRUE(log_x)
+  x_limits <- if (isTRUE(x_is_timestep)) {
+    timestep_x_limits(plot_data[[x_col]])
+  } else if (isTRUE(log_x)) {
+    expand_log_range(log_display_values(plot_data[[x_col]]), pad = 0.05)
   } else {
     expand_range(plot_data[[x_col]], pad = 0.05)
   }
@@ -2891,6 +3025,8 @@ plot_summary_scatter <- function(
           point_color_for(piece$beta, piece$opportunity, piece$model, alpha = 0.62)
         }
       }
+      piece_x <- if (isTRUE(log_x)) log_display_values(piece[[x_col]]) else piece[[x_col]]
+      piece_y <- if (isTRUE(log_y)) log_display_values(piece[[y_col]]) else piece[[y_col]]
       plot(
         NA,
         xlim = x_limits,
@@ -2902,22 +3038,28 @@ plot_summary_scatter <- function(
         } else {
           model_panel_title(model_value, panel_value, facet_sigma = isTRUE(facet_sigma) && n_panels > 1L)
         },
+        xaxt = if (isTRUE(x_is_timestep)) "n" else "s",
         log = log_arg_for_axes(log_x, log_y)
       )
+      if (isTRUE(x_is_timestep)) {
+        axis(1, at = timestep_x_ticks(plot_data[[x_col]]))
+      }
       grid()
       sem_col <- seed_sem_col_for(y_col, piece)
       if (!is.na(sem_col)) {
+        log_sem_col <- if (isTRUE(log_y)) seed_log10_sem_col_for(y_col, piece) else NA_character_
         draw_seed_error_bars(
-          piece[[x_col]],
-          piece[[y_col]],
+          piece_x,
+          piece_y,
           piece[[sem_col]],
           point_cols,
-          log_y = log_y
+          log_y = log_y,
+          log_sem_values = if (!is.na(log_sem_col)) piece[[log_sem_col]] else NULL
         )
       }
       draw_model_points(
-        piece[[x_col]],
-        piece[[y_col]],
+        piece_x,
+        piece_y,
         if ("model" %in% names(piece)) piece$model else NULL,
         point_cols,
         cex = 1.35
@@ -3017,29 +3159,32 @@ plot_metric_by_difference <- function(
           }
           piece <- piece[order(piece[[x_col]]), , drop = FALSE]
           piece_col <- line_color_for(beta_value, opportunity_value, model_value)
+          piece_y <- if (isTRUE(log_y)) log_display_values(piece[[y_col]]) else piece[[y_col]]
           lines(
             piece[[x_col]],
-            piece[[y_col]],
+            piece_y,
             type = "l",
             lwd = 1.4,
             col = piece_col
           )
           sem_col <- seed_sem_col_for(y_col, piece)
           if (!is.na(sem_col)) {
+            log_sem_col <- if (isTRUE(log_y)) seed_log10_sem_col_for(y_col, piece) else NA_character_
             draw_seed_error_bars(
               piece[[x_col]],
-              piece[[y_col]],
+              piece_y,
               piece[[sem_col]],
               rep(piece_col, nrow(piece)),
-              log_y = log_y
+              log_y = log_y,
+              log_sem_values = if (!is.na(log_sem_col)) piece[[log_sem_col]] else NULL
             )
           }
           draw_model_points(
             piece[[x_col]],
-            piece[[y_col]],
+            piece_y,
             rep(model_value, nrow(piece)),
             rep(piece_col, nrow(piece)),
-            cex = 0.85
+            cex = 1
           )
         }
       }
@@ -3081,8 +3226,8 @@ plot_metric_by_timestep <- function(
   par(mar = panel_margins(top = if (n_sigma > 1L) panel_title_margin_lines else panel_top_margin_lines))
   apply_panel_text_style()
   x_values <- suppressWarnings(as.numeric(plot_data$timestep))
-  x_limits <- expand_range(x_values, pad = 0.08)
-  x_ticks <- seq(floor(min(x_values, na.rm = TRUE)), ceiling(max(x_values, na.rm = TRUE)), by = 1)
+  x_limits <- timestep_x_limits(x_values)
+  x_ticks <- timestep_x_ticks(x_values)
   y_limits <- if (isTRUE(log_y)) {
     expand_log_range(y_values_with_seed_sem(plot_data, y_col, log_y = TRUE), pad = 0.06)
   } else {
@@ -3117,29 +3262,32 @@ plot_metric_by_timestep <- function(
           }
           piece <- piece[order(piece$timestep), , drop = FALSE]
           piece_col <- line_color_for(beta_value, opportunity_value, model_value)
+          piece_y <- if (isTRUE(log_y)) log_display_values(piece[[y_col]]) else piece[[y_col]]
           lines(
             piece$timestep,
-            piece[[y_col]],
+            piece_y,
             type = "l",
             lwd = 1.4,
             col = piece_col
           )
           sem_col <- seed_sem_col_for(y_col, piece)
           if (!is.na(sem_col)) {
+            log_sem_col <- if (isTRUE(log_y)) seed_log10_sem_col_for(y_col, piece) else NA_character_
             draw_seed_error_bars(
               piece$timestep,
-              piece[[y_col]],
+              piece_y,
               piece[[sem_col]],
               rep(piece_col, nrow(piece)),
-              log_y = log_y
+              log_y = log_y,
+              log_sem_values = if (!is.na(log_sem_col)) piece[[log_sem_col]] else NULL
             )
           }
           draw_model_points(
             piece$timestep,
-            piece[[y_col]],
+            piece_y,
             rep(model_value, nrow(piece)),
             rep(piece_col, nrow(piece)),
-            cex = 0.85
+            cex = 1
           )
         }
       }
@@ -3191,8 +3339,8 @@ draw_heatmap_legend <- function(zlim, palette_cols, label) {
   for (i in seq_len(n)) {
     rect(0.2, y_edges[[i]], 0.6, y_edges[[i + 1L]], col = palette_cols[[i]], border = NA)
   }
-  axis(4, las = 1, cex.axis = 0.85)
-  mtext(label, side = 4, line = 2.4, cex = 0.85)
+  axis(4, las = 1, cex.axis = 1)
+  mtext(label, side = 4, line = 2.4, cex = 1)
 }
 
 draw_reward_context_heatmap_panel <- function(
@@ -3240,10 +3388,10 @@ draw_reward_context_heatmap_panel <- function(
     main = main
   )
   if (length(x_values) > 0L) {
-    axis(1, at = x_values, labels = format_plot_values(x_values), las = 2, cex.axis = 0.75)
+    axis(1, at = x_values, labels = format_plot_values(x_values), las = 2, cex.axis = 1)
   }
   if (length(y_values) > 0L) {
-    axis(2, at = y_values, labels = format_plot_values(y_values), las = 1, cex.axis = 0.75)
+    axis(2, at = y_values, labels = format_plot_values(y_values), las = 1, cex.axis = 1)
   }
   grid()
   if (nrow(panel_data) == 0) {
@@ -3698,9 +3846,8 @@ plot_summary_scatter(
   x_col = "normalized_chosen_path_reward",
   y_col = "kl_paid_total",
   xlab = "Average normalized chosen path reward",
-  ylab = "Average KL paid across timesteps (log)",
-  file_prefix = "revisit_log_kl_paid_vs_average_normalized_chosen_path_reward_by_sigma",
-  log_y = TRUE,
+  ylab = "Average KL paid across timesteps",
+  file_prefix = "revisit_kl_paid_vs_average_normalized_chosen_path_reward_by_sigma",
   facet_sigma = TRUE,
   color_mode = "parameter",
   model_layout = "overlay"
