@@ -27,6 +27,9 @@ usage <- function() {
     "  --seeds LIST                Override seed values.\n",
     "  --output-root DIR           Override output root. Default is preset results_dir.\n",
     "  --input-dir DIR             Override simulation input dir.\n",
+    "  --sampled-lambda-critic q|value\n",
+    "                              Simulation filename mode. q is default and matches legacy files without _vcritic.\n",
+    "                              value/v matches files with the _vcritic suffix. Aliases: --critic, --critic-type.\n",
     "  --min-samples N             Drop dots with fewer than N trial/event samples. Default 10.\n",
     "  --help                      Show this message.\n\n",
     "Example:\n",
@@ -131,6 +134,12 @@ output_root_option <- extract_named_option(args, c("--output-root", "--results-d
 args <- output_root_option$args
 input_dir_option <- extract_named_option(args, c("--input-dir"), default = NULL)
 args <- input_dir_option$args
+critic_option <- extract_named_option(
+  args,
+  c("--sampled-lambda-critic", "--critic", "--critic-type", "--critic-mode"),
+  default = "q"
+)
+args <- critic_option$args
 
 if (length(args) != 1L) {
   usage()
@@ -163,6 +172,30 @@ num_tokens <- function(value) {
   unique(tokens[nzchar(tokens)])
 }
 
+normalize_sampled_lambda_critic <- function(value) {
+  key <- tolower(trim_string(value))
+  aliases <- c(
+    "q" = "q", "action_q" = "q", "action-q" = "q", "qcritic" = "q",
+    "legacy" = "q", "old" = "q", "none" = "q",
+    "v" = "value", "value" = "value", "scalar" = "value",
+    "scalar_v" = "value", "scalar-v" = "value", "vcritic" = "value"
+  )
+  if (!key %in% names(aliases)) {
+    stop(sprintf("--sampled-lambda-critic must be q or value/v. Got %s.", value))
+  }
+  unname(aliases[[key]])
+}
+
+sampled_lambda_critic <- normalize_sampled_lambda_critic(critic_option$value)
+
+sampled_lambda_critic_file_suffixes <- function() {
+  if (identical(sampled_lambda_critic, "value")) "_vcritic" else c("", "_qcritic")
+}
+
+visited_lstm_suffix_variants <- function(suffixes) {
+  unique(c(suffixes, paste0(suffixes, "_visitedidx")))
+}
+
 parsed_revisit_file_index <- NULL
 
 parse_revisit_filename_index <- function() {
@@ -174,7 +207,8 @@ parse_revisit_filename_index <- function() {
   pattern <- paste0(
     "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)",
     "_expansion_([^_]+)_variant_([^_]+)_seed_([0-9]+)_(.+)_rnn_([^_]+)_latent_([^_]+)",
-    "_revisit_maxobs_([0-9]+)(?:_obs_sigma_([^_]+))?_uniform\\.csv$"
+    "_revisit_maxobs_([0-9]+)(?:_obs_sigma_([^_]+))?",
+    "(?:_klstart_[^_]+_klanneal_[^_]+)?(_(?:q|v)critic)?(?:_visitedidx)?_uniform\\.csv$"
   )
   matches <- regexec(pattern, basenames, perl = TRUE)
   parts <- regmatches(basenames, matches)
@@ -191,6 +225,7 @@ parse_revisit_filename_index <- function() {
   }
   sigma_token <- part_at(13L)
   sigma_token[!nzchar(sigma_token)] <- "0"
+  critic_token <- part_at(14L)
   out <- data.frame(
     file = files,
     lambda = suppressWarnings(as.numeric(part_at(2L))),
@@ -205,6 +240,7 @@ parse_revisit_filename_index <- function() {
     latent_dim = part_at(11L),
     max_observations = part_at(12L),
     sigma = suppressWarnings(as.numeric(sigma_token)),
+    critic = ifelse(grepl("vcritic", critic_token, fixed = TRUE), "value", "q"),
     stringsAsFactors = FALSE
   )
   out
@@ -318,6 +354,11 @@ output_root <- if (!is.null(output_root_option$value)) output_root_option$value 
 if (!dir.exists(input_dir)) {
   stop(sprintf("Simulation input directory not found: %s", input_dir))
 }
+message(sprintf(
+  "Sampled-lambda critic file mode: %s%s",
+  sampled_lambda_critic,
+  if (identical(sampled_lambda_critic, "q")) " (legacy/no _vcritic suffix)" else " (_vcritic suffix)"
+))
 
 tree_label <- if (tree_config %in% c("", "default")) {
   sprintf("%dn", tree_size)
@@ -411,6 +452,22 @@ path_reward_matrix_from_node_rewards <- function(actual_reward_mat) {
     out <- matrix(out, nrow = nrow(actual_reward_mat), ncol = task_path_count)
   }
   out
+}
+
+realized_reward_denominator <- function(path_reward_mat) {
+  if (nrow(path_reward_mat) == 0L || ncol(path_reward_mat) == 0L) {
+    return(task_reward_norm)
+  }
+  finite_rows <- rowSums(is.finite(path_reward_mat)) == ncol(path_reward_mat)
+  if (!any(finite_rows)) {
+    return(task_reward_norm)
+  }
+  denom <- mean(apply(path_reward_mat[finite_rows, , drop = FALSE], 1L, max), na.rm = TRUE)
+  if (is.finite(denom) && abs(denom) > 1e-12) {
+    denom
+  } else {
+    task_reward_norm
+  }
 }
 
 actual_path_reward_tie_flags <- function(path_reward_mat, tol = 1e-8) {
@@ -535,16 +592,19 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
               max_observations
             )
             sigma_num <- suppressWarnings(as.numeric(sigma_value))
-            if (is.finite(sigma_num) && abs(sigma_num) < 1e-12) {
-              candidates <- c(
-                candidates,
-                file.path(input_dir, paste0(base, "_", input_type, ".csv")),
-                file.path(input_dir, paste0(base, "_obs_sigma_0_", input_type, ".csv")),
-                file.path(input_dir, paste0(base, "_obs_sigma_0.0_", input_type, ".csv"))
-              )
-            } else {
-              for (sigma_token in sigma_tokens) {
-                candidates <- c(candidates, file.path(input_dir, paste0(base, "_obs_sigma_", sigma_token, "_", input_type, ".csv")))
+            for (critic_suffix in sampled_lambda_critic_file_suffixes()) {
+              if (is.finite(sigma_num) && abs(sigma_num) < 1e-12) {
+                suffixes <- visited_lstm_suffix_variants(c(
+                  critic_suffix,
+                  paste0("_obs_sigma_0", critic_suffix),
+                  paste0("_obs_sigma_0.0", critic_suffix)
+                ))
+                candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
+              } else {
+                for (sigma_token in sigma_tokens) {
+                  suffixes <- visited_lstm_suffix_variants(paste0("_obs_sigma_", sigma_token, critic_suffix))
+                  candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
+                }
               }
             }
           }
@@ -577,7 +637,8 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
       index$tree_label == tree_label &
       index$rnn_units == rnn_units &
       index$latent_dim == latent_dim &
-      index$max_observations == max_observations
+      index$max_observations == max_observations &
+      index$critic == sampled_lambda_critic
     if (any(matches)) {
       return(index$file[which(matches)[[1L]]])
     }
@@ -720,7 +781,8 @@ process_simulation_file <- function(path, meta) {
   timestep_before_stop <- pmax(stop_decision_timestep - 1, 0)
   observations_before_stop <- rowSums(is.finite(reward_mat))
   chosen_path_reward <- suppressWarnings(as.numeric(trial_data$V))
-  normalized_reward <- chosen_path_reward / task_reward_norm
+  reward_norm_denominator <- realized_reward_denominator(path_reward_mat)
+  normalized_reward <- chosen_path_reward / reward_norm_denominator
   kl_paid_total <- rowSums(kl_mat)
 
   first_node_col <- first_finite_col(node_mat)
@@ -812,6 +874,7 @@ process_simulation_file <- function(path, meta) {
       sigma = meta$sigma,
       seed = meta$seed,
       timestep = timestep,
+      timestep_before_stop = timestep_before_stop[keep],
       strict_pre_stop_timestep = timestep,
       kl_paid_at_timestep = kl_values[keep],
       terminal_binary_choice_entropy_at_timestep = ifelse(strict_pre_stop[keep], entropy_values[keep], NA_real_),
@@ -939,6 +1002,11 @@ kl_timestep_summary <- summarize_metric(
   c("family", "parameter_value", "parameter_label", "sigma", "timestep"),
   "kl_paid_at_timestep"
 )
+kl_timestep_by_total_summary <- summarize_metric(
+  pre_stop_data,
+  c("family", "parameter_value", "parameter_label", "sigma", "timestep_before_stop", "timestep"),
+  "kl_paid_at_timestep"
+)
 entropy_timestep_summary <- summarize_metric(
   pre_stop_data,
   c("family", "parameter_value", "parameter_label", "sigma", "strict_pre_stop_timestep"),
@@ -996,6 +1064,21 @@ kl_timestep_sigma_summary <- summarize_metric(
   c("family", "parameter_value", "parameter_label", "sigma"),
   "kl_paid_at_timestep"
 )
+pre_stop_data_after_first_paid_kl <- pre_stop_data
+if (nrow(pre_stop_data_after_first_paid_kl) > 0L && "timestep" %in% names(pre_stop_data_after_first_paid_kl)) {
+  pre_stop_data_after_first_paid_kl$timestep <- suppressWarnings(as.numeric(pre_stop_data_after_first_paid_kl$timestep))
+  pre_stop_data_after_first_paid_kl <- pre_stop_data_after_first_paid_kl[
+    is.finite(pre_stop_data_after_first_paid_kl$timestep) &
+      pre_stop_data_after_first_paid_kl$timestep > 1,
+    ,
+    drop = FALSE
+  ]
+}
+kl_timestep_except_first_sigma_summary <- summarize_metric(
+  pre_stop_data_after_first_paid_kl,
+  c("family", "parameter_value", "parameter_label", "sigma"),
+  "kl_paid_at_timestep"
+)
 stop_kl_sigma_summary <- summarize_metric(
   stop_kl_data,
   c("family", "parameter_value", "parameter_label", "sigma"),
@@ -1003,8 +1086,9 @@ stop_kl_sigma_summary <- summarize_metric(
 )
 
 run_folder <- sprintf(
-  "%s_beta_vs_opportunity_%s",
+  "%s_beta_vs_opportunity%s_%s",
   tree_label,
+  if (identical(sampled_lambda_critic, "value")) "_vcritic" else "",
   format(Sys.time(), "%Y%m%d_%H%M%S")
 )
 plot_output_dir <- file.path(output_root, "revisit_compare", run_folder)
@@ -1262,7 +1346,168 @@ plot_sigma_panel_lines <- function(summary_data, x_col, y_col, file_name, xlab, 
   }
   mtext(xlab, side = 1, outer = TRUE, line = 1.6, cex = 1, adj = panel_center_adj(panel_widths))
   mtext(ylab, side = 2, outer = TRUE, line = comparison_y_label_line, cex = 1)
-  par(old_par)
+  invisible(try(par(old_par), silent = TRUE))
+  grDevices::dev.off()
+  message(sprintf("Saved %s", path))
+  invisible(path)
+}
+
+plot_sigma_panel_lines_by_total_timestep <- function(summary_data, x_col, y_col, file_name, xlab, ylab) {
+  required <- c(x_col, y_col, "timestep_before_stop")
+  if (nrow(summary_data) == 0L || !all(required %in% names(summary_data))) {
+    warning(sprintf("No data for %s; skipping.", file_name))
+    return(invisible(NULL))
+  }
+  summary_data <- summary_data[
+    is.finite(suppressWarnings(as.numeric(summary_data$timestep_before_stop))),
+    ,
+    drop = FALSE
+  ]
+  if (nrow(summary_data) == 0L) {
+    warning(sprintf("No finite total-timestep data for %s; skipping.", file_name))
+    return(invisible(NULL))
+  }
+  sem_col <- paste0(y_col, "_seed_sem")
+  sigma_levels <- sort(unique(suppressWarnings(as.numeric(summary_data$sigma))))
+  sigma_levels <- sigma_levels[is.finite(sigma_levels)]
+  total_levels <- sort(unique(suppressWarnings(as.numeric(summary_data$timestep_before_stop))))
+  total_levels <- total_levels[is.finite(total_levels)]
+  family_levels <- c("beta", "opportunity")
+  if (length(sigma_levels) == 0L || length(total_levels) == 0L) {
+    warning(sprintf("No finite sigma/total-timestep levels for %s; skipping.", file_name))
+    return(invisible(NULL))
+  }
+  n_plot_panels <- length(family_levels) * length(sigma_levels)
+  n_rows <- length(total_levels)
+  path <- file.path(plot_output_dir, file_name)
+  panel_widths <- numeric()
+  for (sigma_i in seq_along(sigma_levels)) {
+    for (family_i in seq_along(family_levels)) {
+      show_y_axis <- sigma_i == 1L && family_i == 1L
+      panel_widths <- c(panel_widths, comparison_panel_cell_width_in(comparison_panel_margins_for(show_y_axis)))
+    }
+    if (sigma_i < length(sigma_levels)) {
+      panel_widths <- c(panel_widths, comparison_sigma_gap_width_in)
+    }
+  }
+  row_layouts <- vector("list", n_rows)
+  panel_id <- 0L
+  for (row_i in seq_len(n_rows)) {
+    row_layout <- integer()
+    for (sigma_i in seq_along(sigma_levels)) {
+      for (family_i_unused in seq_along(family_levels)) {
+        panel_id <- panel_id + 1L
+        row_layout <- c(row_layout, panel_id)
+      }
+      if (sigma_i < length(sigma_levels)) {
+        row_layout <- c(row_layout, 0L)
+      }
+    }
+    row_layouts[[row_i]] <- row_layout
+  }
+  panel_matrix <- do.call(rbind, row_layouts)
+  legend_id <- panel_id + 1L
+  open_comparison_png(path, n_cols = n_plot_panels, n_rows = n_rows, layout_widths = panel_widths)
+  layout(cbind(panel_matrix, rep(legend_id, n_rows)),
+    widths = c(panel_widths, comparison_legend_width_in)
+  )
+  old_par <- par(no.readonly = TRUE)
+  par(cex = 1, cex.axis = 1, cex.lab = 1, cex.main = 1, oma = comparison_outer_margins)
+  y_lim <- safe_ylim(summary_data[[y_col]], if (sem_col %in% names(summary_data)) summary_data[[sem_col]] else NULL)
+  x_is_timestep <- is_timestep_x_col(x_col)
+  x_lim <- safe_xlim(summary_data[[x_col]], start_at_one = x_is_timestep)
+  for (row_i in seq_along(total_levels)) {
+    total_value <- total_levels[[row_i]]
+    row_data <- summary_data[
+      parameter_equal(summary_data$timestep_before_stop, total_value),
+      ,
+      drop = FALSE
+    ]
+    panel_i <- 0L
+    for (sigma_i in seq_along(sigma_levels)) {
+      sigma_value <- sigma_levels[[sigma_i]]
+      for (family_i in seq_along(family_levels)) {
+        family <- family_levels[[family_i]]
+        panel_i <- panel_i + 1L
+        panel_data <- row_data[
+          row_data$family == family &
+            parameter_equal(row_data$sigma, sigma_value),
+          ,
+          drop = FALSE
+        ]
+        show_y_axis <- sigma_i == 1L && family_i == 1L
+        par(mar = comparison_panel_margins_for(show_y_axis = show_y_axis))
+        title_parts <- c()
+        if (row_i == 1L && identical(family, family_levels[[1L]])) {
+          title_parts <- c(title_parts, sprintf("sigma = %s", num_label(sigma_value)))
+        }
+        if (family_i == 1L) {
+          title_parts <- c(title_parts, sprintf("total t = %s", num_label(total_value)))
+        }
+        plot(NA,
+          xlim = x_lim,
+          ylim = y_lim,
+          xlab = "",
+          ylab = "",
+          main = paste(title_parts, collapse = "\n"),
+          xaxt = if (x_is_timestep) "n" else "s",
+          yaxt = if (show_y_axis) "s" else "n",
+          cex.lab = 1,
+          cex.axis = 1,
+          cex.main = 1
+        )
+        if (x_is_timestep) {
+          draw_timestep_x_axis(summary_data[[x_col]])
+        }
+        grid(col = "grey90")
+        params <- sort(unique(suppressWarnings(as.numeric(panel_data$parameter_value))))
+        for (param in params) {
+          line_data <- panel_data[parameter_equal(panel_data$parameter_value, param), , drop = FALSE]
+          line_data <- line_data[order(suppressWarnings(as.numeric(line_data[[x_col]]))), , drop = FALSE]
+          if (nrow(line_data) == 0L) {
+            next
+          }
+          x <- suppressWarnings(as.numeric(line_data[[x_col]]))
+          y <- suppressWarnings(as.numeric(line_data[[y_col]]))
+          col <- series_color(family, param)
+          pch <- series_pch(family)
+          lines(x, y, col = col, lwd = 1.2)
+          points(x, y, col = col, pch = pch, cex = 0.65)
+          if (sem_col %in% names(line_data)) {
+            draw_error_bars(x, y, suppressWarnings(as.numeric(line_data[[sem_col]])), col)
+          }
+        }
+      }
+    }
+  }
+  par(mar = c(4.6, 0.2, 3.1, 0.2))
+  plot.new()
+  legend_items <- list()
+  for (family in family_levels) {
+    params <- if (identical(family, "beta")) as_num(beta_values) else as_num(opportunity_values)
+    params <- sort(unique(params[is.finite(params)]))
+    for (param in params) {
+      legend_items[[length(legend_items) + 1L]] <- list(
+        label = if (identical(family, "beta")) paste0("beta ", num_label(param)) else paste0("opp ", num_label(param)),
+        col = series_color(family, param),
+        pch = series_pch(family)
+      )
+    }
+  }
+  if (length(legend_items) > 0L) {
+    graphics::legend(
+      "center",
+      legend = vapply(legend_items, `[[`, character(1), "label"),
+      col = vapply(legend_items, `[[`, character(1), "col"),
+      pch = vapply(legend_items, `[[`, numeric(1), "pch"),
+      lwd = 1.3,
+      bty = "n",
+      cex = 1
+    )
+  }
+  mtext(xlab, side = 1, outer = TRUE, line = 1.6, cex = 1, adj = panel_center_adj(panel_widths))
+  mtext(ylab, side = 2, outer = TRUE, line = comparison_y_label_line, cex = 1)
+  invisible(try(par(old_par), silent = TRUE))
   grDevices::dev.off()
   message(sprintf("Saved %s", path))
   invisible(path)
@@ -1346,7 +1591,7 @@ plot_sigma_summary <- function(summary_data, y_col, file_name, ylab) {
   }
   mtext("Observation noise sigma", side = 1, outer = TRUE, line = 1.6, cex = 1, adj = panel_center_adj(panel_widths))
   mtext(ylab, side = 2, outer = TRUE, line = comparison_y_label_line, cex = 1)
-  par(old_par)
+  invisible(try(par(old_par), silent = TRUE))
   grDevices::dev.off()
   message(sprintf("Saved %s", path))
   invisible(path)
@@ -1375,6 +1620,15 @@ plot_sigma_panel_lines(
   "timestep",
   "kl_paid_at_timestep",
   "kl_paid_at_timestep_vs_timestep_sigma_panels.png",
+  "Observation timestep",
+  "KL paid at timestep"
+)
+
+plot_sigma_panel_lines_by_total_timestep(
+  kl_timestep_by_total_summary,
+  "timestep",
+  "kl_paid_at_timestep",
+  "kl_paid_at_timestep_vs_timestep_by_total_timestep_sigma_panels.png",
   "Observation timestep",
   "KL paid at timestep"
 )
@@ -1418,6 +1672,13 @@ plot_sigma_summary(
   "kl_paid_at_timestep",
   "summary_kl_paid_at_timestep_vs_sigma.png",
   "KL paid at timestep"
+)
+
+plot_sigma_summary(
+  kl_timestep_except_first_sigma_summary,
+  "kl_paid_at_timestep",
+  "summary_kl_paid_at_timestep_except_first_paid_kl_vs_sigma.png",
+  "KL paid at timestep\nexcluding first paid KL"
 )
 
 plot_sigma_summary(

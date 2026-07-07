@@ -104,6 +104,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--analysis-seed-offset", type=int, default=300_000)
     parser.add_argument("--kl-start-multiplier", type=float, default=None)
     parser.add_argument("--kl-annealing-epochs", type=int, default=None)
+    parser.add_argument(
+        "--force-first-observe-node",
+        type=int,
+        default=1,
+        help=(
+            "Force the first action to observe this 1-indexed node, then sample "
+            "subsequent actions from the policy. Use 0 to leave the first action sampled."
+        ),
+    )
     parser.add_argument("--device", default="cpu", help="Accepted for CLI symmetry; plotting uses JAX default device.")
     parser.add_argument(
         "--min-density-samples",
@@ -152,6 +161,22 @@ def validate_mu_sigma(mu: np.ndarray, sigma: np.ndarray) -> Tuple[np.ndarray, np
     if mu.ndim != 2:
         raise ValueError(f"mu and sigma must be [N, latent_dim], got {mu.shape}")
     return mu, sigma
+
+
+def prior_normalize_gaussian(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    prior_mu: np.ndarray,
+    prior_sigma: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    mu = finite_float_array(mu, "mu")
+    sigma = finite_float_array(sigma, "sigma")
+    prior_mu = finite_float_array(prior_mu, "prior_mu")
+    prior_sigma = finite_float_array(prior_sigma, "prior_sigma")
+    denom = np.maximum(prior_sigma, SIGMA_EPS)
+    normalized_mu = (mu - prior_mu) / denom
+    normalized_sigma = np.maximum(sigma / denom, SIGMA_EPS)
+    return validate_mu_sigma(normalized_mu, normalized_sigma)
 
 
 def lorentz_dot(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -641,6 +666,7 @@ def rollout_revisit_posterior_states(
     seed: int,
     beta: float,
     max_observations_before_stop: int,
+    force_first_observe_node: int = 1,
 ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rows = []
     mu_rows = []
@@ -659,6 +685,7 @@ def rollout_revisit_posterior_states(
         current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+        node_coverage_aux_coef=jnp.asarray(0.0, dtype=jnp.float32),
         forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
     )
@@ -667,7 +694,13 @@ def rollout_revisit_posterior_states(
         batch_rewards = rewards[start : start + batch_size]
         path_rewards = batch_rewards @ path_map.T
         path_reward_sums = np.sum(path_rewards, axis=1)
-        carry = jp.initial_carry(batch_rewards.shape[0], task, model.rnn_units, reward_feature_dim)
+        carry = jp.initial_carry(
+            batch_rewards.shape[0],
+            task,
+            model.rnn_units,
+            reward_feature_dim,
+            jp.visited_lstm_feature_dim_for_task(task),
+        )
         carry = jp.reset_done_envs(carry, jnp.asarray(batch_rewards, dtype=jnp.float32))
         rng_key = jax.random.PRNGKey(seed + batch_i)
         stopped = np.zeros(batch_rewards.shape[0], dtype=bool)
@@ -681,12 +714,19 @@ def rollout_revisit_posterior_states(
         for step_i in range(num_steps):
             timestep = int(step_i + 1)
             rng_key, step_rng = jax.random.split(rng_key)
+            forced_action = None
+            if step_i == 0 and 1 <= int(force_first_observe_node) <= int(task.num_nodes):
+                forced_action = jnp.full(
+                    (batch_rewards.shape[0],),
+                    int(force_first_observe_node) - 1,
+                    dtype=jnp.int32,
+                )
             carry, trans = model.apply(
                 {"params": params},
                 carry,
                 step_rng,
                 schedule,
-                None,
+                forced_action,
                 True,
                 False,
                 False,
@@ -941,13 +981,20 @@ def plot_pga_score_reward_grid_distributions(
     *,
     combo_label: str,
     scope_suffix: str,
+    coordinate_x_col: str = "pga_score_0",
+    coordinate_y_col: str = "pga_score_1",
+    output_prefix: str = "revisit_pga_scores_density",
+    x_axis_label: str = "PGA score 0",
+    y_axis_label: str = "PGA score 1",
+    density_uses_posterior: bool = False,
+    use_global_z_limits: bool = False,
     grid_n: int = 120,
     max_density_points: int = 1500,
     min_density_samples: int = 1,
 ) -> None:
     required = {
-        "pga_score_0",
-        "pga_score_1",
+        coordinate_x_col,
+        coordinate_y_col,
         "observed_path_actual_reward",
         "mean_other_observed_path_actual_reward",
         "timestep",
@@ -965,8 +1012,8 @@ def plot_pga_score_reward_grid_distributions(
     from matplotlib.colors import Normalize
 
     plot_df = df.copy()
-    plot_df["z_mu_0"] = pd.to_numeric(plot_df["pga_score_0"], errors="coerce")
-    plot_df["z_mu_1"] = pd.to_numeric(plot_df["pga_score_1"], errors="coerce")
+    plot_df["z_mu_0"] = pd.to_numeric(plot_df[coordinate_x_col], errors="coerce")
+    plot_df["z_mu_1"] = pd.to_numeric(plot_df[coordinate_y_col], errors="coerce")
     reward_y_col = "observed_path_actual_reward"
     reward_x_col = "mean_other_observed_path_actual_reward"
     reward_y_label = "R(observed path)"
@@ -998,28 +1045,24 @@ def plot_pga_score_reward_grid_distributions(
     limits = base.axis_limits(plot_df)
     if reward_y_values is None or reward_x_values is None or limits is None:
         return
-    xlim, ylim = base.square_axis_limits(*limits)
+    if use_global_z_limits:
+        xlim, ylim = base.GLOBAL_Z0_Z1_LIMITS
+    else:
+        xlim, ylim = base.zero_centered_square_axis_limits(*limits)
     x_grid = np.linspace(xlim[0], xlim[1], max(40, min(int(grid_n), 250)))
     y_grid = np.linspace(ylim[0], ylim[1], max(40, min(int(grid_n), 250)))
 
-    color_values = sorted(plot_df["timestep"].dropna().unique())
-    if len(color_values) == 0:
-        return
-    color_min = float(min(color_values))
-    color_max = float(max(color_values))
-    if math.isclose(color_min, color_max):
-        color_min -= 0.5
-        color_max += 0.5
-    color_norm = Normalize(vmin=color_min, vmax=color_max)
     color_cmap = plt.get_cmap("plasma")
+    density_fn = base.posterior_z_mixture_density if density_uses_posterior else base.empirical_mu_kde_density
 
     scope_part = scope_suffix if scope_suffix else ""
     figdir.mkdir(parents=True, exist_ok=True)
-    for old_plot in figdir.glob(f"revisit_pga_scores_density_by_node1_node2_reward_*{scope_part}.png"):
-        old_plot.unlink()
-    for old_plot in figdir.glob(f"revisit_pga_scores_density_by_first_observed_and_mean_other_path_*{scope_part}.png"):
-        old_plot.unlink()
-    for old_plot in figdir.glob(f"revisit_pga_scores_density_by_observed_and_mean_other_path_*{scope_part}.png"):
+    if output_prefix == "revisit_pga_scores_density":
+        for old_plot in figdir.glob(f"revisit_pga_scores_density_by_node1_node2_reward_*{scope_part}.png"):
+            old_plot.unlink()
+        for old_plot in figdir.glob(f"revisit_pga_scores_density_by_first_observed_and_mean_other_path_*{scope_part}.png"):
+            old_plot.unlink()
+    for old_plot in figdir.glob(f"{output_prefix}_by_observed_and_mean_other_path_*{scope_part}.png"):
         old_plot.unlink()
     split_col, order_unit = base.observed_index_split(plot_df)
     split_values = sorted(
@@ -1031,6 +1074,20 @@ def plot_pga_score_reward_grid_distributions(
         split_df = plot_df[np.isclose(plot_df[split_col], split_value)].copy()
         if split_df.empty:
             continue
+        color_values = base.plottable_group_values(
+            split_df,
+            "timestep",
+            min_density_samples,
+            extra_group_cols=(reward_y_col, reward_x_col),
+        )
+        if len(color_values) == 0:
+            continue
+        color_min = float(np.nanmin(color_values))
+        color_max = float(np.nanmax(color_values))
+        if math.isclose(color_min, color_max):
+            color_min -= 0.5
+            color_max += 0.5
+        color_norm = Normalize(vmin=color_min, vmax=color_max)
         split_stub = f"observed_{order_unit}_{split_value}"
         split_label = f"observed {order_unit} {split_value}"
 
@@ -1061,7 +1118,7 @@ def plot_pga_score_reward_grid_distributions(
                     if timestep_df.empty:
                         continue
                     color = color_cmap(color_norm(float(timestep)))
-                    density = base.empirical_mu_kde_density(
+                    density = density_fn(
                         timestep_df,
                         x_grid,
                         y_grid,
@@ -1085,8 +1142,8 @@ def plot_pga_score_reward_grid_distributions(
                                 linewidths=0.65,
                                 alpha=0.85,
                             )
-                    z0 = pd.to_numeric(timestep_df["pga_score_0"], errors="coerce")
-                    z1 = pd.to_numeric(timestep_df["pga_score_1"], errors="coerce")
+                    z0 = pd.to_numeric(timestep_df["z_mu_0"], errors="coerce")
+                    z1 = pd.to_numeric(timestep_df["z_mu_1"], errors="coerce")
                     finite = np.isfinite(z0) & np.isfinite(z1)
                     if int(np.sum(finite)) >= max(1, int(min_density_samples)):
                         ax.scatter(
@@ -1109,7 +1166,7 @@ def plot_pga_score_reward_grid_distributions(
                 else:
                     ax.set_ylabel("")
                 if row_i == n_rows - 1:
-                    ax.set_xlabel("PGA score 0", fontsize=5)
+                    ax.set_xlabel(x_axis_label, fontsize=5)
                 else:
                     ax.set_xlabel("")
 
@@ -1123,14 +1180,386 @@ def plot_pga_score_reward_grid_distributions(
             fontsize=7,
             y=0.995,
         )
-        fig.supxlabel("PGA score 0", fontsize=7, y=0.02)
-        fig.supylabel("PGA score 1", fontsize=7, x=0.01)
+        fig.supxlabel(x_axis_label, fontsize=7, y=0.02)
+        fig.supylabel(y_axis_label, fontsize=7, x=0.01)
         out_name = (
-            "revisit_pga_scores_density_by_observed_and_mean_other_path_"
+            f"{output_prefix}_by_observed_and_mean_other_path_"
             f"{split_stub}{scope_part}.png"
         )
         fig.savefig(figdir / out_name, dpi=180, bbox_inches="tight")
         plt.close(fig)
+
+
+def plot_pga_score_current_value_densities(
+    df: pd.DataFrame,
+    figdir: Path,
+    *,
+    combo_label: str,
+    min_density_samples: int,
+) -> None:
+    if df.empty or not {"pga_score_0", "pga_score_1"}.issubset(df.columns):
+        return
+    plot_df = df.copy()
+    plot_df["z_mu_0"] = pd.to_numeric(plot_df["pga_score_0"], errors="coerce")
+    plot_df["z_mu_1"] = pd.to_numeric(plot_df["pga_score_1"], errors="coerce")
+    # These are empirical score coordinates, not posterior Gaussian axes.
+    # Dropping z_sigma_* makes the shared plotter use KDE over score points
+    # instead of treating latent posterior sigmas as uncertainty in PGA space.
+    plot_df = plot_df.drop(
+        columns=[
+            col
+            for col in plot_df.columns
+            if col.startswith("z_sigma_")
+            or col.startswith("prior_sigma_")
+            or col.startswith("prior_mu_")
+            or col.startswith("prior_normalized_z_mu_")
+        ],
+        errors="ignore",
+    )
+    base.plot_combo_density(
+        plot_df,
+        figdir,
+        combo_label=combo_label,
+        grid_n=120,
+        max_density_points=1500,
+        task_tree_type="",
+        latent_file_prefix="revisit_pga_scores_density",
+        plot_context_heatmaps=False,
+        x_axis_label="PGA score 0",
+        y_axis_label="PGA score 1",
+        x_panel_label="PGA score 0",
+        min_density_samples=min_density_samples,
+        use_global_z_limits=False,
+        zero_center_axes=True,
+    )
+
+
+def model_row_label(row: pd.Series) -> str:
+    parts = [
+        f"seed {int(row['seed'])}" if "seed" in row and pd.notna(row["seed"]) else "seed ?",
+        f"beta {float(row['beta']):g}" if "beta" in row and pd.notna(row["beta"]) else "beta ?",
+        f"opp {float(row['opportunity']):g}" if "opportunity" in row and pd.notna(row["opportunity"]) else "opp ?",
+    ]
+    if "lambda" in row and pd.notna(row["lambda"]):
+        parts.append(f"lambda {float(row['lambda']):g}")
+    return "\n".join(parts)
+
+
+def scatter_panel_points(
+    ax,
+    df: pd.DataFrame,
+    *,
+    color_col: str,
+    cmap,
+    norm,
+    max_points: int,
+    seed: int,
+) -> None:
+    if df.empty or not {"z_mu_0", "z_mu_1", color_col}.issubset(df.columns):
+        return
+    work = df[["z_mu_0", "z_mu_1", color_col]].copy()
+    for col in work.columns:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.replace([np.inf, -np.inf], np.nan).dropna()
+    if work.empty:
+        return
+    if max_points > 0 and len(work) > max_points:
+        work = work.sample(max_points, random_state=seed)
+    ax.scatter(
+        work["z_mu_0"],
+        work["z_mu_1"],
+        c=work[color_col],
+        cmap=cmap,
+        norm=norm,
+        s=5,
+        alpha=0.55,
+        linewidths=0,
+        rasterized=True,
+    )
+
+
+def observed_value_contour_groups(
+    df: pd.DataFrame,
+    *,
+    color_col: str,
+    min_density_samples: int,
+    max_groups: int = 8,
+) -> List[Tuple[float, pd.DataFrame]]:
+    if df.empty or color_col not in df.columns:
+        return []
+    work = df.copy()
+    work[color_col] = pd.to_numeric(work[color_col], errors="coerce")
+    work = work[np.isfinite(work[color_col])].copy()
+    if work.empty:
+        return []
+    min_n = max(1, int(min_density_samples))
+    unique_values = np.asarray(sorted(work[color_col].dropna().unique()), dtype=float)
+    groups: List[Tuple[float, pd.DataFrame]] = []
+    if len(unique_values) <= max_groups:
+        for value in unique_values:
+            sub = work[np.isclose(work[color_col], value)].copy()
+            if len(sub) >= min_n:
+                groups.append((float(value), sub))
+        return groups
+
+    n_bins = min(int(max_groups), max(1, len(work) // min_n))
+    if n_bins <= 1:
+        return [(float(np.nanmean(work[color_col])), work)] if len(work) >= min_n else []
+    try:
+        bins = pd.qcut(work[color_col], q=n_bins, duplicates="drop")
+    except ValueError:
+        bins = pd.cut(work[color_col], bins=n_bins, duplicates="drop")
+    for _, sub in work.groupby(bins, observed=True):
+        if len(sub) < min_n:
+            continue
+        groups.append((float(np.nanmean(sub[color_col])), sub.copy()))
+    return groups
+
+
+def plot_model_reward_density_grid(
+    df: pd.DataFrame,
+    outpath: Path,
+    *,
+    title: str,
+    x_label: str,
+    y_label: str,
+    density_uses_posterior: bool,
+    min_density_samples: int,
+    max_density_points: int,
+    xlim: Tuple[float, float],
+    ylim: Tuple[float, float],
+    color_col: str = "sampled_observed_reward",
+) -> None:
+    required = {
+        "model_label",
+        "actual_node_reward",
+        "timestep",
+        "observed_node",
+        "z_mu_0",
+        "z_mu_1",
+        color_col,
+    }
+    if df.empty or not required.issubset(df.columns):
+        return
+    plot_df = df.copy()
+    for col in ["actual_node_reward", "z_mu_0", "z_mu_1", color_col]:
+        plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+    plot_df = plot_df.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["model_label", "actual_node_reward", "z_mu_0", "z_mu_1", color_col]
+    )
+    if plot_df.empty:
+        return
+    rewards = sorted(float(x) for x in plot_df["actual_node_reward"].dropna().unique())
+    models = list(dict.fromkeys(plot_df["model_label"].astype(str).tolist()))
+    if not rewards or not models:
+        return
+
+    color_values = plot_df[color_col].to_numpy(dtype=float)
+    color_values = color_values[np.isfinite(color_values)]
+    if color_values.size == 0:
+        return
+    color_min = float(np.nanmin(color_values))
+    color_max = float(np.nanmax(color_values))
+    if math.isclose(color_min, color_max):
+        color_min -= 0.5
+        color_max += 0.5
+    cmap = plt.get_cmap("viridis")
+    norm = matplotlib.colors.Normalize(vmin=color_min, vmax=color_max)
+
+    n_rows = len(models)
+    n_cols = len(rewards)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(n_cols * base.PANEL_SIZE_IN + 1.15, n_rows * base.PANEL_SIZE_IN + 0.95),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    x_grid = np.linspace(float(xlim[0]), float(xlim[1]), 120)
+    y_grid = np.linspace(float(ylim[0]), float(ylim[1]), 120)
+    density_fn = base.posterior_z_mixture_density if density_uses_posterior else base.empirical_mu_kde_density
+
+    for row_i, model in enumerate(models):
+        for col_i, reward in enumerate(rewards):
+            ax = axes[row_i, col_i]
+            panel = plot_df[
+                (plot_df["model_label"].astype(str) == str(model))
+                & np.isclose(plot_df["actual_node_reward"], reward)
+            ].copy()
+            ax.set_xlim(*xlim)
+            ax.set_ylim(*ylim)
+            ax.set_xticks(base.GLOBAL_Z0_Z1_TICKS if xlim == base.GLOBAL_Z0_Z1_LIMITS[0] else [xlim[0], 0.0, xlim[1]])
+            ax.set_yticks(base.GLOBAL_Z0_Z1_TICKS if ylim == base.GLOBAL_Z0_Z1_LIMITS[1] else [ylim[0], 0.0, ylim[1]])
+            if row_i == 0:
+                ax.set_title(f"R={reward:g}", fontsize=base.PLOT_FONT_SIZE)
+            if col_i == 0:
+                ax.set_ylabel(str(model), fontsize=base.PLOT_FONT_SIZE)
+            if panel.empty or len(panel) < max(1, int(min_density_samples)):
+                ax.text(0.5, 0.5, f"n={len(panel)}", transform=ax.transAxes, ha="center", va="center", fontsize=6)
+            else:
+                for group_value, group_df in observed_value_contour_groups(
+                    panel,
+                    color_col=color_col,
+                    min_density_samples=min_density_samples,
+                ):
+                    density = density_fn(
+                        group_df,
+                        x_grid,
+                        y_grid,
+                        max_points=max_density_points,
+                        seed=base.reward_contour_seed(reward, row_i, f"{title}_{group_value:g}"),
+                        min_samples=min_density_samples,
+                    )
+                    if density is None:
+                        continue
+                    levels = base.positive_contour_levels(density, masses=(0.50, 0.90))
+                    if levels is None:
+                        continue
+                    ax.contour(
+                        x_grid,
+                        y_grid,
+                        density,
+                        levels=levels,
+                        colors=[cmap(norm(float(group_value)))],
+                        linewidths=0.65,
+                        alpha=0.85,
+                    )
+                scatter_panel_points(
+                    ax,
+                    panel,
+                    color_col=color_col,
+                    cmap=cmap,
+                    norm=norm,
+                    max_points=max_density_points,
+                    seed=base.reward_contour_seed(reward, row_i, f"{title}_scatter"),
+                )
+            ax.axhline(0.0, color="#bdbdbd", linewidth=0.35, zorder=0)
+            ax.axvline(0.0, color="#bdbdbd", linewidth=0.35, zorder=0)
+            ax.tick_params(length=2, pad=1, labelsize=base.PLOT_FONT_SIZE)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+
+    fig.suptitle(title, fontsize=base.PLOT_FONT_SIZE, y=0.995)
+    fig.supxlabel(x_label, fontsize=base.PLOT_FONT_SIZE, y=0.02)
+    fig.supylabel(y_label, fontsize=base.PLOT_FONT_SIZE, x=0.005)
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), fraction=0.025, pad=0.012)
+    cbar.ax.tick_params(labelsize=base.PLOT_FONT_SIZE)
+    cbar.set_label("observed value", fontsize=base.PLOT_FONT_SIZE)
+    fig.tight_layout(rect=(0.02, 0.04, 0.94, 0.96), h_pad=0.35, w_pad=0.25)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outpath, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def zero_centered_limits_for_frame(df: pd.DataFrame) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    limits = base.axis_limits(df)
+    if limits is None:
+        return base.GLOBAL_Z0_Z1_LIMITS
+    return base.zero_centered_square_axis_limits(*limits)
+
+
+def load_model_reward_comparison_frames(successes: List[dict]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    norm_parts: List[pd.DataFrame] = []
+    pga_parts: List[pd.DataFrame] = []
+    for success in successes:
+        combo_dir = Path(success["combo_dir"])
+        meta_path = combo_dir / "posterior_parameters" / "posterior_state_metadata.csv"
+        if not meta_path.exists():
+            continue
+        meta = pd.read_csv(meta_path)
+        if meta.empty:
+            continue
+        if {"prior_normalized_z_mu_0", "prior_normalized_z_mu_1"}.issubset(meta.columns):
+            norm_df = meta.copy()
+            norm_df["z_mu_0"] = pd.to_numeric(norm_df["prior_normalized_z_mu_0"], errors="coerce")
+            norm_df["z_mu_1"] = pd.to_numeric(norm_df["prior_normalized_z_mu_1"], errors="coerce")
+            if {"prior_normalized_z_sigma_0", "prior_normalized_z_sigma_1"}.issubset(norm_df.columns):
+                norm_df["z_sigma_0"] = pd.to_numeric(norm_df["prior_normalized_z_sigma_0"], errors="coerce")
+                norm_df["z_sigma_1"] = pd.to_numeric(norm_df["prior_normalized_z_sigma_1"], errors="coerce")
+            elif {"z_sigma_0", "z_sigma_1", "prior_sigma_0", "prior_sigma_1"}.issubset(norm_df.columns):
+                norm_df["z_sigma_0"] = pd.to_numeric(norm_df["z_sigma_0"], errors="coerce") / pd.to_numeric(norm_df["prior_sigma_0"], errors="coerce").clip(lower=1e-6)
+                norm_df["z_sigma_1"] = pd.to_numeric(norm_df["z_sigma_1"], errors="coerce") / pd.to_numeric(norm_df["prior_sigma_1"], errors="coerce").clip(lower=1e-6)
+            norm_df["model_label"] = model_row_label(norm_df.iloc[0])
+            norm_parts.append(norm_df)
+
+        pga_path = combo_dir / "pga" / "pga_scores.csv"
+        if pga_path.exists():
+            pga_df = pd.read_csv(pga_path)
+            if {"pga_score_0", "pga_score_1"}.issubset(pga_df.columns):
+                pga_df["z_mu_0"] = pd.to_numeric(pga_df["pga_score_0"], errors="coerce")
+                pga_df["z_mu_1"] = pd.to_numeric(pga_df["pga_score_1"], errors="coerce")
+                pga_df["model_label"] = model_row_label(pga_df.iloc[0])
+                pga_parts.append(pga_df)
+    norm_all = pd.concat(norm_parts, ignore_index=True) if norm_parts else pd.DataFrame()
+    pga_all = pd.concat(pga_parts, ignore_index=True) if pga_parts else pd.DataFrame()
+    return norm_all, pga_all
+
+
+def plot_model_reward_comparison_outputs(
+    outdir: Path,
+    successes: List[dict],
+    *,
+    min_density_samples: int,
+    max_density_points: int,
+) -> None:
+    norm_all, pga_all = load_model_reward_comparison_frames(successes)
+    if norm_all.empty and pga_all.empty:
+        return
+    sigma_values = sorted(
+        set(pd.to_numeric(norm_all.get("observation_sigma", pd.Series(dtype=float)), errors="coerce").dropna().unique())
+        | set(pd.to_numeric(pga_all.get("observation_sigma", pd.Series(dtype=float)), errors="coerce").dropna().unique())
+    )
+    root = ensure_dir(outdir / "model_reward_density_by_sigma")
+    for sigma in sigma_values:
+        sigma_dir = ensure_dir(root / f"sigma_{base.file_token(sigma)}")
+        norm_sigma = norm_all[np.isclose(pd.to_numeric(norm_all.get("observation_sigma", np.nan), errors="coerce"), sigma)].copy() if not norm_all.empty else pd.DataFrame()
+        pga_sigma = pga_all[np.isclose(pd.to_numeric(pga_all.get("observation_sigma", np.nan), errors="coerce"), sigma)].copy() if not pga_all.empty else pd.DataFrame()
+        source = norm_sigma if not norm_sigma.empty else pga_sigma
+        if source.empty:
+            continue
+        timesteps = sorted(int(x) for x in pd.to_numeric(source.get("timestep", pd.Series(dtype=float)), errors="coerce").dropna().unique())
+        observed_nodes = sorted(int(x) for x in pd.to_numeric(source.get("observed_node", pd.Series(dtype=float)), errors="coerce").dropna().unique())
+        pga_limits = zero_centered_limits_for_frame(pga_sigma) if not pga_sigma.empty else base.GLOBAL_Z0_Z1_LIMITS
+        for timestep in timesteps:
+            for observed_node in observed_nodes:
+                selector_msg = f"sigma={sigma:g}, timestep={timestep}, observed node={observed_node}"
+                if not norm_sigma.empty:
+                    panel_df = norm_sigma[
+                        np.isclose(pd.to_numeric(norm_sigma["timestep"], errors="coerce"), timestep)
+                        & np.isclose(pd.to_numeric(norm_sigma["observed_node"], errors="coerce"), observed_node)
+                    ].copy()
+                    plot_model_reward_density_grid(
+                        panel_df,
+                        sigma_dir / f"prior_normalized_z_t{timestep}_observed_node_{observed_node}.png",
+                        title=f"Prior-normalized posterior z, {selector_msg}",
+                        x_label="(z_0 - prior_mu_0) / prior_sigma_0",
+                        y_label="(z_1 - prior_mu_1) / prior_sigma_1",
+                        density_uses_posterior=True,
+                        min_density_samples=min_density_samples,
+                        max_density_points=max_density_points,
+                        xlim=base.GLOBAL_Z0_Z1_LIMITS[0],
+                        ylim=base.GLOBAL_Z0_Z1_LIMITS[1],
+                    )
+                if not pga_sigma.empty:
+                    panel_df = pga_sigma[
+                        np.isclose(pd.to_numeric(pga_sigma["timestep"], errors="coerce"), timestep)
+                        & np.isclose(pd.to_numeric(pga_sigma["observed_node"], errors="coerce"), observed_node)
+                    ].copy()
+                    plot_model_reward_density_grid(
+                        panel_df,
+                        sigma_dir / f"pga_scores_t{timestep}_observed_node_{observed_node}.png",
+                        title=f"PGA score KDE, {selector_msg}",
+                        x_label="PGA score 0",
+                        y_label="PGA score 1",
+                        density_uses_posterior=False,
+                        min_density_samples=min_density_samples,
+                        max_density_points=max_density_points,
+                        xlim=pga_limits[0],
+                        ylim=pga_limits[1],
+                    )
 
 
 def plot_component_loadings(pga: ProductGaussianPGA, outpath: Path) -> None:
@@ -1288,7 +1717,17 @@ def task_decoding_metrics(df: pd.DataFrame, score_cols: List[str], target_cols: 
     except Exception as exc:
         return pd.DataFrame([{"status": "skipped_missing_sklearn", "error": str(exc)}])
 
-    x = df[score_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    available_score_cols = [col for col in score_cols if col in df.columns]
+    if len(available_score_cols) == 0:
+        return pd.DataFrame(
+            [
+                {
+                    "status": "skipped_missing_score_columns",
+                    "requested_score_cols": ",".join(score_cols),
+                }
+            ]
+        )
+    x = df[available_score_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     for target_col in target_cols:
         if target_col not in df.columns:
             continue
@@ -1530,6 +1969,7 @@ def run_combo(
         seed=args.analysis_seed_offset + seed + 10_000,
         beta=beta,
         max_observations_before_stop=args.max_observations_before_stop,
+        force_first_observe_node=int(args.force_first_observe_node),
     )
     if metadata.empty:
         failures.append({"combo": combo_label, "reason": "no retained posterior states"})
@@ -1542,7 +1982,9 @@ def run_combo(
         args.max_states,
         rng,
     )
+    norm_z_mu, norm_z_sigma = prior_normalize_gaussian(z_mu, z_sigma, prior_mu, prior_sigma)
     for latent_i in range(z_mu.shape[1]):
+        prior_sigma_i = np.maximum(prior_sigma[:, latent_i], SIGMA_EPS)
         metadata[f"z_mu_{latent_i}"] = z_mu[:, latent_i]
         metadata[f"z_logvar_{latent_i}"] = z_logvar[:, latent_i]
         metadata[f"z_sigma_{latent_i}"] = z_sigma[:, latent_i]
@@ -1551,7 +1993,8 @@ def run_combo(
         metadata[f"prior_sigma_{latent_i}"] = prior_sigma[:, latent_i]
         metadata[f"prior_normalized_z_mu_{latent_i}"] = (
             z_mu[:, latent_i] - prior_mu[:, latent_i]
-        ) / np.maximum(prior_sigma[:, latent_i], SIGMA_EPS)
+        ) / prior_sigma_i
+        metadata[f"prior_normalized_z_sigma_{latent_i}"] = z_sigma[:, latent_i] / prior_sigma_i
     metadata["latent_dim"] = latent_dim
     metadata["rnn_dim"] = rnn_dim
     metadata["seed"] = seed
@@ -1561,6 +2004,7 @@ def run_combo(
     metadata["opportunity"] = opportunity
     metadata["observation_sigma"] = sigma
     metadata["checkpoint_path"] = str(checkpoint)
+    metadata["force_first_observe_node"] = int(args.force_first_observe_node)
     metadata.to_csv(combo_dir / "posterior_parameters" / "posterior_state_metadata.csv", index=False)
     np.savez_compressed(
         combo_dir / "posterior_parameters" / "posterior_parameters.npz",
@@ -1570,6 +2014,8 @@ def run_combo(
         prior_mu=prior_mu,
         prior_logvar=prior_logvar,
         prior_sigma=prior_sigma,
+        prior_normalized_z_mu=norm_z_mu,
+        prior_normalized_z_sigma=norm_z_sigma,
     )
 
     methods = method_list(args.reduction_method)
@@ -1580,13 +2026,14 @@ def run_combo(
 
     for scope_name, idx in scope_iter(metadata, args.pga_fit_scope):
         scope_meta = metadata.iloc[idx].copy().reset_index(drop=True)
-        scope_mu = z_mu[idx]
-        scope_sigma = z_sigma[idx]
+        scope_mu = norm_z_mu[idx]
+        scope_sigma = norm_z_sigma[idx]
         scope_rng = np.random.default_rng(rng.integers(0, 2**31 - 1))
         scope_suffix = "" if scope_name == "pooled" else f"_{scope_name}"
 
         scores_e, pca = euclidean_pca_fit_transform(np.concatenate([scope_mu, np.log(scope_sigma)], axis=1), args.n_components)
         euclid_df = add_score_columns(scope_meta, scores_e, "euclidean_pca")
+        euclid_df["geometry_space"] = "prior_normalized"
         euclid_df.to_csv(combo_dir / "euclidean_pca" / f"euclidean_pca_scores{scope_suffix}.csv", index=False)
         np.savez_compressed(combo_dir / "euclidean_pca" / f"euclidean_pca_components{scope_suffix}.npz", **pca)
 
@@ -1595,17 +2042,20 @@ def run_combo(
             scores = pga.fit_transform(scope_mu, scope_sigma)
             pga_scores_for_mds = scores if scope_name == "pooled" else pga_scores_for_mds
             pga_df = add_score_columns(scope_meta, scores, "pga")
+            pga_df["geometry_space"] = "prior_normalized"
             pga_df.to_csv(combo_dir / "pga" / f"pga_scores{scope_suffix}.csv", index=False)
             pga.save(combo_dir / "pga" / f"pga_components{scope_suffix}.npz")
             rec_mu, rec_sigma = pga.inverse_transform(scores)
             np.savez_compressed(
                 combo_dir / "pga" / f"pga_reconstructed_posteriors{scope_suffix}.npz",
-                reconstructed_mu=rec_mu,
-                reconstructed_sigma=rec_sigma,
+                reconstructed_prior_normalized_mu=rec_mu,
+                reconstructed_prior_normalized_sigma=rec_sigma,
+                geometry_space=np.asarray("prior_normalized"),
             )
             pga_metrics = pga.reconstruction_metrics(scope_mu, scope_sigma, scope_rng, args.max_pairs)
             pga_metric_row = {
                 "representation": "pga",
+                "geometry_space": "prior_normalized",
                 "fit_scope": scope_name,
                 "n_states": int(len(scope_meta)),
                 "latent_dim": int(latent_dim),
@@ -1637,6 +2087,14 @@ def run_combo(
                     prior_norm_df["prior_normalized_z_mu_1"],
                     errors="coerce",
                 )
+                for latent_i in (0, 1):
+                    sigma_col = f"z_sigma_{latent_i}"
+                    prior_sigma_col = f"prior_sigma_{latent_i}"
+                    if {sigma_col, prior_sigma_col}.issubset(prior_norm_df.columns):
+                        prior_norm_df[sigma_col] = (
+                            pd.to_numeric(prior_norm_df[sigma_col], errors="coerce")
+                            / pd.to_numeric(prior_norm_df[prior_sigma_col], errors="coerce").clip(lower=1e-6)
+                        )
                 base.plot_combo_density(
                     prior_norm_df,
                     figdir,
@@ -1646,11 +2104,33 @@ def run_combo(
                     task_tree_type=task.tree_type,
                     latent_file_prefix="revisit_prior_normalized_z0_z1_density",
                     plot_context_heatmaps=False,
-                    x_axis_label="(z_mu_0 - prior_mu_0) / prior_sigma_0",
-                    y_axis_label="(z_mu_1 - prior_mu_1) / prior_sigma_1",
+                    x_axis_label="(z_0 - prior_mu_0) / prior_sigma_0",
+                    y_axis_label="(z_1 - prior_mu_1) / prior_sigma_1",
                     x_panel_label="prior-norm z0",
                     min_density_samples=args.min_density_samples,
                 )
+                plot_pga_score_reward_grid_distributions(
+                    prior_norm_df,
+                    figdir,
+                    combo_label=f"{combo_label}, prior-normalized posterior {scope_name}",
+                    scope_suffix=scope_suffix,
+                    coordinate_x_col="z_mu_0",
+                    coordinate_y_col="z_mu_1",
+                    output_prefix="revisit_prior_normalized_z0_z1_density",
+                    x_axis_label="(z_0 - prior_mu_0) / prior_sigma_0",
+                    y_axis_label="(z_1 - prior_mu_1) / prior_sigma_1",
+                    density_uses_posterior=True,
+                    use_global_z_limits=True,
+                    grid_n=120,
+                    max_density_points=1500,
+                    min_density_samples=args.min_density_samples,
+                )
+            plot_pga_score_current_value_densities(
+                pga_df,
+                figdir,
+                combo_label=f"{combo_label}, PGA score density {scope_name}",
+                min_density_samples=args.min_density_samples,
+            )
             plot_pga_score_reward_grid_distributions(
                 pga_df,
                 figdir,
@@ -1675,7 +2155,7 @@ def run_combo(
                 pair_distances(scope_mu, scope_sigma, pairs),
                 pair_distances(rec_mu, rec_sigma, pairs),
                 figdir / f"pga_original_vs_reconstructed_distance{scope_suffix}.png",
-                f"PGA distance preservation ({scope_name})",
+                f"PGA distance preservation, prior-normalized ({scope_name})",
             )
             decoding = task_decoding_metrics(
                 pga_df,
@@ -1691,6 +2171,7 @@ def run_combo(
             euclid_metrics = pairwise_preservation_metrics(scope_mu, scope_sigma, rec_mu_e, rec_sigma_e, pairs)
             euclid_row = {
                 "representation": "euclidean_pca",
+                "geometry_space": "prior_normalized",
                 "fit_scope": scope_name,
                 "n_states": int(len(scope_meta)),
                 "latent_dim": int(latent_dim),
@@ -1705,46 +2186,65 @@ def run_combo(
     if "gaussian_product_mds" in methods:
         mds_dir = ensure_dir(combo_dir / "gaussian_product_mds")
         mds_figdir = ensure_dir(mds_dir / "figures")
-        pga_init = pga_scores_for_mds
-        if pga_init is None:
-            pga_tmp = ProductGaussianPGA(n_components=2, tol=args.pga_tol, max_iters=args.pga_max_iters).fit(z_mu, z_sigma)
-            pga_init = pga_tmp.transform(z_mu, z_sigma)
-        mds = fit_gaussian_product_mds(
-            z_mu,
-            z_sigma,
-            pga_init,
-            rng,
-            max_pairs=args.max_pairs,
-            train_pair_frac=args.train_pair_frac,
-            restarts=args.embedding_restarts,
-            steps=args.embedding_steps,
-            lr=args.embedding_lr,
-            grad_clip=args.embedding_grad_clip,
-        )
-        mds_df = metadata.copy()
-        for factor_i in range(2):
-            mds_df[f"reduced_mu_{factor_i}"] = mds.reduced_mu[:, factor_i]
-            mds_df[f"reduced_sigma_{factor_i}"] = mds.reduced_sigma[:, factor_i]
-        mds_df["representation"] = "gaussian_product_mds"
-        mds_df.to_csv(mds_dir / "gaussian_product_mds_coordinates.csv", index=False)
-        np.savez_compressed(mds_dir / "gaussian_product_mds_coordinates.npz", reduced_mu=mds.reduced_mu, reduced_sigma=mds.reduced_sigma)
-        mds_metrics = {
-            "representation": "gaussian_product_mds",
-            "fit_scope": "pooled",
-            "n_states": int(len(metadata)),
-            "latent_dim": int(latent_dim),
-            **mds.metrics,
-        }
-        metric_rows.append(mds_metrics)
-        pd.DataFrame([mds_metrics]).to_csv(mds_dir / "gaussian_product_mds_metrics.csv", index=False)
-        plot_mds_factor_geometry(mds_df, mds_figdir)
-        plot_scatter(mds_df.assign(z0=mds.reduced_mu[:, 0], z1=mds.reduced_mu[:, 1]), mds_figdir / "gaussian_product_mds_2factor_reward_summary.png", x_col="z0", y_col="z1", color_col="actual_node_reward", title="Gaussian product MDS reduced means", color_label="actual node reward")
-        decoding = task_decoding_metrics(
-            mds_df.assign(mds_score_0=mds.reduced_mu[:, 0], mds_score_1=mds.reduced_mu[:, 1]),
-            ["mds_score_0", "mds_score_1"],
-            ["actual_node_reward", "observed_node", "observed_path", "timestep", "first_observed_path_actual_reward_raw"],
-        )
-        decoding.to_csv(mds_dir / "original_vs_gaussian_product_mds_task_decoding.csv", index=False)
+        if len(metadata) < 2:
+            mds_metrics = {
+                "representation": "gaussian_product_mds",
+                "geometry_space": "prior_normalized",
+                "fit_scope": "pooled",
+                "n_states": int(len(metadata)),
+                "latent_dim": int(latent_dim),
+                "status": "skipped_too_few_states",
+            }
+            metric_rows.append(mds_metrics)
+            pd.DataFrame([mds_metrics]).to_csv(mds_dir / "gaussian_product_mds_metrics.csv", index=False)
+        else:
+            pga_init = pga_scores_for_mds
+            if pga_init is None:
+                pga_tmp = ProductGaussianPGA(n_components=2, tol=args.pga_tol, max_iters=args.pga_max_iters).fit(norm_z_mu, norm_z_sigma)
+                pga_init = pga_tmp.transform(norm_z_mu, norm_z_sigma)
+            mds = fit_gaussian_product_mds(
+                norm_z_mu,
+                norm_z_sigma,
+                pga_init,
+                rng,
+                max_pairs=args.max_pairs,
+                train_pair_frac=args.train_pair_frac,
+                restarts=args.embedding_restarts,
+                steps=args.embedding_steps,
+                lr=args.embedding_lr,
+                grad_clip=args.embedding_grad_clip,
+            )
+            mds_df = metadata.copy()
+            for factor_i in range(2):
+                mds_df[f"reduced_mu_{factor_i}"] = mds.reduced_mu[:, factor_i]
+                mds_df[f"reduced_sigma_{factor_i}"] = mds.reduced_sigma[:, factor_i]
+            mds_df["representation"] = "gaussian_product_mds"
+            mds_df["geometry_space"] = "prior_normalized"
+            mds_df.to_csv(mds_dir / "gaussian_product_mds_coordinates.csv", index=False)
+            np.savez_compressed(
+                mds_dir / "gaussian_product_mds_coordinates.npz",
+                reduced_mu=mds.reduced_mu,
+                reduced_sigma=mds.reduced_sigma,
+                geometry_space=np.asarray("prior_normalized"),
+            )
+            mds_metrics = {
+                "representation": "gaussian_product_mds",
+                "geometry_space": "prior_normalized",
+                "fit_scope": "pooled",
+                "n_states": int(len(metadata)),
+                "latent_dim": int(latent_dim),
+                **mds.metrics,
+            }
+            metric_rows.append(mds_metrics)
+            pd.DataFrame([mds_metrics]).to_csv(mds_dir / "gaussian_product_mds_metrics.csv", index=False)
+            plot_mds_factor_geometry(mds_df, mds_figdir)
+            plot_scatter(mds_df.assign(z0=mds.reduced_mu[:, 0], z1=mds.reduced_mu[:, 1]), mds_figdir / "gaussian_product_mds_2factor_reward_summary.png", x_col="z0", y_col="z1", color_col="actual_node_reward", title="Gaussian product MDS reduced means", color_label="actual node reward")
+            decoding = task_decoding_metrics(
+                mds_df.assign(mds_score_0=mds.reduced_mu[:, 0], mds_score_1=mds.reduced_mu[:, 1]),
+                ["mds_score_0", "mds_score_1"],
+                ["actual_node_reward", "observed_node", "observed_path", "timestep", "first_observed_path_actual_reward_raw"],
+            )
+            decoding.to_csv(mds_dir / "original_vs_gaussian_product_mds_task_decoding.csv", index=False)
 
     metrics_df = pd.DataFrame(metric_rows)
     if not metrics_df.empty:
@@ -1764,6 +2264,7 @@ def run_combo(
             "checkpoint_path": str(checkpoint),
         },
         "interpretation_notes": [
+            "PGA, Euclidean PCA, and Gaussian-product MDS are fit to prior-normalized posterior parameters: (z_mu - prior_mu) / prior_sigma and z_sigma / prior_sigma.",
             "PGA scores are scalar principal geodesic coordinates, not reduced Gaussian factors.",
             "gaussian_product_mds directly fits two Gaussian factors but is a stress embedding, not PCA/PGA.",
             "PGA axes may flip or rotate across seeds; compare invariant metrics or aligned summaries.",
@@ -1775,6 +2276,7 @@ def run_combo(
     summary_rows.append(f"Checkpoint: {checkpoint}")
     summary_rows.append(f"Retained states: {len(metadata)}")
     summary_rows.append(f"Latent dim: {latent_dim}; product manifold dim: {2 * latent_dim}")
+    summary_rows.append("Geometry reductions use prior-normalized posterior parameters: (z_mu - prior_mu) / prior_sigma and z_sigma / prior_sigma.")
     summary_rows.append("PGA scores are scalar geodesic scores; they are not Gaussian mu/sigma factors.")
     summary_rows.append("gaussian_product_mds fits two reduced Gaussian factors as a distance-preserving embedding.")
     if not metrics_df.empty:
@@ -1835,6 +2337,13 @@ def main() -> None:
             aggregate_rows.append(metrics)
     if aggregate_rows:
         pd.concat(aggregate_rows, ignore_index=True).to_csv(outdir / "gaussian_pga_seed_summary.csv", index=False)
+    if successes:
+        plot_model_reward_comparison_outputs(
+            outdir,
+            successes,
+            min_density_samples=int(args.min_density_samples),
+            max_density_points=int(args.max_density_points),
+        )
 
 
 if __name__ == "__main__":

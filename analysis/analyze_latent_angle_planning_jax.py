@@ -217,17 +217,26 @@ def build_jax_model_and_params(
         allow_node_revisit=False,
         max_observations_before_stop=int(task.num_nodes),
         opportunity_cost=float(opportunity_cost),
+        observation_sigma=0.0,
         lambda_=float(lambda_value),
         alpha=float(alpha),
         beta=float(beta),
+        include_visited_lstm_input=jp.use_visited_lstm_input_for_task(task),
     )
-    dummy = jp.initial_carry(1, task, int(rnn_dim))
+    dummy = jp.initial_carry(
+        1,
+        task,
+        int(rnn_dim),
+        1,
+        jp.visited_lstm_feature_dim_for_task(task),
+    )
     schedule = jp.ScheduleValues(
         current_alpha=jnp.asarray(1.0, dtype=jnp.float32),
         current_beta=jnp.asarray(1.0 / float(beta), dtype=jnp.float32),
         current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+        node_coverage_aux_coef=jnp.asarray(0.0, dtype=jnp.float32),
         forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
     )
@@ -335,7 +344,13 @@ def run_jax_model_trials(
     batches = []
     for batch_i, start in enumerate(range(0, rewards.shape[0], batch_size)):
         batch_rewards = rewards[start:start + batch_size]
-        carry = jp.initial_carry(batch_rewards.shape[0], task, model.rnn_units)
+        carry = jp.initial_carry(
+            batch_rewards.shape[0],
+            task,
+            model.rnn_units,
+            1,
+            jp.visited_lstm_feature_dim_for_task(task),
+        )
         carry = jp.reset_done_envs(carry, jnp.asarray(batch_rewards, dtype=jnp.float32))
         schedule = jp.ScheduleValues(
             current_alpha=jnp.asarray(1.0, dtype=jnp.float32),
@@ -343,6 +358,7 @@ def run_jax_model_trials(
             current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
             expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
             expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+            node_coverage_aux_coef=jnp.asarray(0.0, dtype=jnp.float32),
             forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
             ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
         )

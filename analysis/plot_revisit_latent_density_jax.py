@@ -3,7 +3,7 @@
 
 This script is intentionally narrower than analyze_latent_angle_planning_jax.py:
 it loads revisit-enabled JAX checkpoints, simulates trials with node revisits
-allowed, and writes z_mu_0-vs-z_mu_1 density plots for the two-node task plus
+allowed, and writes posterior z_0-vs-z_1 density plots for the two-node task plus
 compact path-context heatmaps for KL, terminal-choice entropy, and stopping
 time. Each output PNG is for one seed/beta/opportunity/lambda/sigma
 combination. Rows where the model already stopped before the observation are
@@ -118,6 +118,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--analysis-seed-offset", type=int, default=300_000)
     parser.add_argument("--kl-start-multiplier", type=float, default=None)
     parser.add_argument("--kl-annealing-epochs", type=int, default=None)
+    parser.add_argument(
+        "--force-first-observe-node",
+        type=int,
+        default=1,
+        help=(
+            "Force the first action to observe this 1-indexed node, then sample "
+            "subsequent actions from the policy. Use 0 to leave the first action sampled."
+        ),
+    )
     parser.add_argument("--device", default="cpu", help="Accepted for CLI symmetry; plotting uses JAX default device.")
     return parser.parse_args()
 
@@ -262,6 +271,7 @@ def build_model_and_params(
     checkpoint_reward_dim = jp.infer_reward_feature_dim_from_checkpoint(
         checkpoint_path,
         task.num_nodes,
+        jp.visited_lstm_feature_dim_for_task(task),
     )
     model = jp.PlanningVAE(
         rnn_units=int(rnn_dim),
@@ -283,19 +293,27 @@ def build_model_and_params(
         alpha=float(alpha),
         beta=float(beta),
         reward_feature_dim_override=int(checkpoint_reward_dim),
+        include_visited_lstm_input=jp.use_visited_lstm_input_for_task(task),
     )
     reward_feature_dim = (
         int(checkpoint_reward_dim)
         if int(checkpoint_reward_dim) > 0
         else jp.reward_feature_dim_for_sigma(observation_sigma)
     )
-    dummy = jp.initial_carry(1, task, int(rnn_dim), reward_feature_dim)
+    dummy = jp.initial_carry(
+        1,
+        task,
+        int(rnn_dim),
+        reward_feature_dim,
+        jp.visited_lstm_feature_dim_for_task(task),
+    )
     schedule = jp.ScheduleValues(
         current_alpha=jnp.asarray(1.0, dtype=jnp.float32),
         current_beta=jnp.asarray(1.0 / float(beta), dtype=jnp.float32),
         current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+        node_coverage_aux_coef=jnp.asarray(0.0, dtype=jnp.float32),
         forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
     )
@@ -349,6 +367,7 @@ def rollout_revisit_rows(
     seed: int,
     beta: float,
     max_observations_before_stop: int,
+    force_first_observe_node: int = 1,
 ) -> pd.DataFrame:
     rows = []
     path_map = np.asarray(task.path_map, dtype=float)
@@ -360,6 +379,7 @@ def rollout_revisit_rows(
         current_critic_coef=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         expansion_entropy_coef=jnp.asarray(0.0, dtype=jnp.float32),
+        node_coverage_aux_coef=jnp.asarray(0.0, dtype=jnp.float32),
         forced_continue_epsilon=jnp.asarray(0.0, dtype=jnp.float32),
         ppo_clip=jnp.asarray(0.3, dtype=jnp.float32),
     )
@@ -369,7 +389,13 @@ def rollout_revisit_rows(
         batch_rewards = rewards[start:start + batch_size]
         path_rewards = batch_rewards @ path_map.T
         path_reward_sums = np.sum(path_rewards, axis=1)
-        carry = jp.initial_carry(batch_rewards.shape[0], task, model.rnn_units, reward_feature_dim)
+        carry = jp.initial_carry(
+            batch_rewards.shape[0],
+            task,
+            model.rnn_units,
+            reward_feature_dim,
+            jp.visited_lstm_feature_dim_for_task(task),
+        )
         carry = jp.reset_done_envs(carry, jnp.asarray(batch_rewards, dtype=jnp.float32))
         rng = jax.random.PRNGKey(seed + batch_i)
         stopped = np.zeros(batch_rewards.shape[0], dtype=bool)
@@ -381,12 +407,19 @@ def rollout_revisit_rows(
         batch_rows = []
         for step_i in range(num_steps):
             rng, step_rng = jax.random.split(rng)
+            forced_action = None
+            if step_i == 0 and 1 <= int(force_first_observe_node) <= int(task.num_nodes):
+                forced_action = jnp.full(
+                    (batch_rewards.shape[0],),
+                    int(force_first_observe_node) - 1,
+                    dtype=jnp.int32,
+                )
             carry, trans = model.apply(
                 {"params": params},
                 carry,
                 step_rng,
                 schedule,
-                None,
+                forced_action,
                 True,
                 False,
                 False,
@@ -574,6 +607,21 @@ def square_axis_limits(
     return (x_mid - half, x_mid + half), (y_mid - half, y_mid + half)
 
 
+def zero_centered_square_axis_limits(
+    xlim: Tuple[float, float],
+    ylim: Tuple[float, float],
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    max_abs = max(
+        abs(float(xlim[0])),
+        abs(float(xlim[1])),
+        abs(float(ylim[0])),
+        abs(float(ylim[1])),
+    )
+    if not np.isfinite(max_abs) or max_abs <= 0.0:
+        max_abs = 1.0
+    return (-max_abs, max_abs), (-max_abs, max_abs)
+
+
 def empirical_mu_kde_density(
     df: pd.DataFrame,
     x_grid: np.ndarray,
@@ -607,6 +655,60 @@ def empirical_mu_kde_density(
         dx = (xx[None, :, :] - mu_x[sl, None, None]) / bandwidth
         dy = (yy[None, :, :] - mu_y[sl, None, None]) / bandwidth
         norm = 1.0 / (2.0 * np.pi * bandwidth * bandwidth)
+        density += np.sum(norm * np.exp(-0.5 * (dx * dx + dy * dy)), axis=0)
+    density /= float(len(data))
+    return density
+
+
+def posterior_z_mixture_density(
+    df: pd.DataFrame,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    max_points: int,
+    seed: int,
+    min_samples: int = 1,
+) -> Optional[np.ndarray]:
+    """Density of sampled latent z under the posterior mixture.
+
+    Each retained row contributes a diagonal Gaussian
+    N((z0,z1); (z_mu_0,z_mu_1), diag(z_sigma_0^2,z_sigma_1^2)).
+    For prior-normalized plots, callers replace z_mu and z_sigma with
+    (z_mu-prior_mu)/prior_sigma and z_sigma/prior_sigma before calling this.
+    """
+    cols = ["z_mu_0", "z_mu_1", "z_sigma_0", "z_sigma_1"]
+    if not set(cols).issubset(df.columns):
+        return empirical_mu_kde_density(
+            df,
+            x_grid,
+            y_grid,
+            max_points=max_points,
+            seed=seed,
+            min_samples=min_samples,
+        )
+    data = df[cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    data = data[(data["z_sigma_0"] > 0.0) & (data["z_sigma_1"] > 0.0)]
+    if len(data) < max(1, int(min_samples)):
+        return None
+    if len(data) > max_points:
+        data = data.sample(max_points, random_state=seed)
+    mu_x = data["z_mu_0"].to_numpy(dtype=float)
+    mu_y = data["z_mu_1"].to_numpy(dtype=float)
+    sigma_x = data["z_sigma_0"].to_numpy(dtype=float)
+    sigma_y = data["z_sigma_1"].to_numpy(dtype=float)
+    # Avoid aliasing extremely narrow posteriors on a finite plotting grid.
+    grid_dx = abs(float(x_grid[1] - x_grid[0])) if len(x_grid) > 1 else 1e-3
+    grid_dy = abs(float(y_grid[1] - y_grid[0])) if len(y_grid) > 1 else 1e-3
+    sigma_x = np.maximum(sigma_x, max(0.5 * grid_dx, 1e-4))
+    sigma_y = np.maximum(sigma_y, max(0.5 * grid_dy, 1e-4))
+    xx, yy = np.meshgrid(x_grid, y_grid)
+    density = np.zeros_like(xx, dtype=float)
+    for start in range(0, len(data), 128):
+        sl = slice(start, start + 128)
+        sx = sigma_x[sl, None, None]
+        sy = sigma_y[sl, None, None]
+        dx = (xx[None, :, :] - mu_x[sl, None, None]) / sx
+        dy = (yy[None, :, :] - mu_y[sl, None, None]) / sy
+        norm = 1.0 / (2.0 * np.pi * sx * sy)
         density += np.sum(norm * np.exp(-0.5 * (dx * dx + dy * dy)), axis=0)
     density /= float(len(data))
     return density
@@ -672,6 +774,42 @@ def value_centroids(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
         .agg(z_mu_0=("z_mu_0", "mean"), z_mu_1=("z_mu_1", "mean"), n=("z_mu_0", "size"))
         .sort_values(value_col)
     )
+
+
+def plottable_group_values(
+    df: pd.DataFrame,
+    value_col: str,
+    min_samples: int,
+    *,
+    extra_group_cols: Iterable[str] = (),
+) -> np.ndarray:
+    """Values whose finite z0/z1 group has enough samples to be plotted."""
+    group_cols = list(extra_group_cols) + [value_col]
+    latent_cols = ["z_mu_0", "z_mu_1"]
+    if {"z_sigma_0", "z_sigma_1"}.issubset(df.columns):
+        latent_cols += ["z_sigma_0", "z_sigma_1"]
+    required = set(group_cols + latent_cols)
+    if df.empty or not required.issubset(df.columns):
+        return np.asarray([], dtype=float)
+    work = df[group_cols + latent_cols].copy()
+    for col in group_cols + latent_cols:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna()
+    if {"z_sigma_0", "z_sigma_1"}.issubset(work.columns):
+        work = work[(work["z_sigma_0"] > 0.0) & (work["z_sigma_1"] > 0.0)]
+    if work.empty:
+        return np.asarray([], dtype=float)
+    counts = (
+        work.groupby(group_cols, dropna=True)
+        .size()
+        .reset_index(name="n")
+    )
+    counts = counts[counts["n"] >= max(1, int(min_samples))]
+    if counts.empty:
+        return np.asarray([], dtype=float)
+    values = pd.to_numeric(counts[value_col], errors="coerce").to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    return np.asarray(sorted(np.unique(values)), dtype=float)
 
 
 def reward_contour_seed(timestep: float, reward_value: float, group: str) -> int:
@@ -1059,10 +1197,12 @@ def plot_combo_density(
     task_tree_type: str = "",
     latent_file_prefix: str = "revisit_latent_z0_z1_density",
     plot_context_heatmaps: bool = True,
-    x_axis_label: str = "z_mu_0",
-    y_axis_label: str = "z_mu_1",
+    x_axis_label: str = "z_0",
+    y_axis_label: str = "z_1",
     x_panel_label: str = "z0",
     min_density_samples: int = 1,
+    use_global_z_limits: bool = True,
+    zero_center_axes: bool = False,
 ):
     if df.empty:
         return
@@ -1072,9 +1212,15 @@ def plot_combo_density(
     import matplotlib.pyplot as plt
     from matplotlib.colors import Normalize, TwoSlopeNorm
 
-    if axis_limits(df) is None:
+    limits = axis_limits(df)
+    if limits is None:
         return
-    xlim, ylim = GLOBAL_Z0_Z1_LIMITS
+    if use_global_z_limits:
+        xlim, ylim = GLOBAL_Z0_Z1_LIMITS
+    elif zero_center_axes:
+        xlim, ylim = zero_centered_square_axis_limits(*limits)
+    else:
+        xlim, ylim = square_axis_limits(*limits)
     x_grid = np.linspace(xlim[0], xlim[1], max(40, min(int(grid_n), 250)))
     y_grid = np.linspace(ylim[0], ylim[1], max(40, min(int(grid_n), 250)))
     reward_col = "actual_node_reward" if "actual_node_reward" in df.columns else "node_reward"
@@ -1244,20 +1390,27 @@ def plot_combo_density(
         values = values[keep]
         if piece.empty:
             return
-        value_min = float(np.nanmin(values))
-        value_max = float(np.nanmax(values))
+        plottable_values = plottable_group_values(
+            piece,
+            value_col,
+            min_density_samples,
+        )
+        if plottable_values.size == 0:
+            return
+        value_min = float(np.nanmin(plottable_values))
+        value_max = float(np.nanmax(plottable_values))
         if math.isclose(value_min, value_max):
             value_min -= 0.5
             value_max += 0.5
         value_norm = Normalize(vmin=value_min, vmax=value_max)
         value_cmap = plt.get_cmap(cmap_name)
         fig, ax = plt.subplots(figsize=single_panel_figsize(colorbar=True))
-        for value in sorted(values.dropna().unique()):
+        for value in plottable_values:
             value_piece = piece[np.isclose(pd.to_numeric(piece[value_col], errors="coerce"), value)].copy()
             if value_piece.empty:
                 continue
             color = value_cmap(value_norm(float(value)))
-            density = empirical_mu_kde_density(
+            density = posterior_z_mixture_density(
                 value_piece,
                 x_grid,
                 y_grid,
@@ -1425,7 +1578,7 @@ def plot_combo_density(
                 reward_piece = piece[np.isclose(piece_rewards, reward_value)].copy()
                 if reward_piece.empty:
                     continue
-                density = empirical_mu_kde_density(
+                density = posterior_z_mixture_density(
                     reward_piece,
                     x_grid,
                     y_grid,
@@ -1479,8 +1632,12 @@ def plot_combo_density(
 
     diff_col = "first_observed_minus_second_actual_reward"
     if diff_col in df.columns:
-        diff_values_all = pd.to_numeric(df[diff_col], errors="coerce")
-        diff_values_all = diff_values_all[np.isfinite(diff_values_all)]
+        diff_values_all = plottable_group_values(
+            df,
+            diff_col,
+            min_density_samples,
+            extra_group_cols=("node_visit_order", "timestep"),
+        )
         if len(diff_values_all) > 0:
             diff_min = float(np.nanmin(diff_values_all))
             diff_max = float(np.nanmax(diff_values_all))
@@ -1501,12 +1658,20 @@ def plot_combo_density(
                     if piece.empty:
                         continue
                     fig, ax = plt.subplots(figsize=single_panel_figsize(colorbar=True))
+                    plottable_diff_values = plottable_group_values(
+                        piece,
+                        diff_col,
+                        min_density_samples,
+                    )
+                    if plottable_diff_values.size == 0:
+                        plt.close(fig)
+                        continue
                     piece_diff = pd.to_numeric(piece[diff_col], errors="coerce")
-                    for diff_value in sorted(piece_diff.dropna().unique()):
+                    for diff_value in plottable_diff_values:
                         diff_piece = piece[np.isclose(piece_diff, diff_value)].copy()
                         if diff_piece.empty:
                             continue
-                        density = empirical_mu_kde_density(
+                        density = posterior_z_mixture_density(
                             diff_piece,
                             x_grid,
                             y_grid,
@@ -1574,7 +1739,7 @@ def plot_combo_density(
             if role_piece.empty:
                 continue
             color = role_colors[role]
-            density = empirical_mu_kde_density(
+            density = posterior_z_mixture_density(
                 role_piece,
                 x_grid,
                 y_grid,
@@ -1696,7 +1861,9 @@ def main() -> None:
                                         seed=args.analysis_seed_offset + seed + 10_000,
                                         beta=beta,
                                         max_observations_before_stop=args.max_observations_before_stop,
+                                        force_first_observe_node=int(args.force_first_observe_node),
                                     )
+                                    rows["force_first_observe_node"] = int(args.force_first_observe_node)
                                     combo_dir = combo_output_dir(
                                         outdir,
                                         seed=seed,
@@ -1729,6 +1896,14 @@ def main() -> None:
                                             prior_norm_rows["prior_normalized_z_mu_1"],
                                             errors="coerce",
                                         )
+                                        for latent_i in (0, 1):
+                                            sigma_col = f"z_sigma_{latent_i}"
+                                            prior_sigma_col = f"prior_sigma_{latent_i}"
+                                            if {sigma_col, prior_sigma_col}.issubset(prior_norm_rows.columns):
+                                                prior_norm_rows[sigma_col] = (
+                                                    pd.to_numeric(prior_norm_rows[sigma_col], errors="coerce")
+                                                    / pd.to_numeric(prior_norm_rows[prior_sigma_col], errors="coerce").clip(lower=1e-6)
+                                                )
                                         plot_combo_density(
                                             prior_norm_rows,
                                             combo_dir / "figures",
@@ -1738,8 +1913,8 @@ def main() -> None:
                                             task_tree_type=task.tree_type,
                                             latent_file_prefix="revisit_prior_normalized_z0_z1_density",
                                             plot_context_heatmaps=False,
-                                            x_axis_label="(z_mu_0 - prior_mu_0) / prior_sigma_0",
-                                            y_axis_label="(z_mu_1 - prior_mu_1) / prior_sigma_1",
+                                            x_axis_label="(z_0 - prior_mu_0) / prior_sigma_0",
+                                            y_axis_label="(z_1 - prior_mu_1) / prior_sigma_1",
                                             x_panel_label="prior-norm z0",
                                             min_density_samples=args.min_density_samples,
                                         )

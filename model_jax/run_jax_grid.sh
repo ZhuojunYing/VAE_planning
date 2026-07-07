@@ -19,6 +19,7 @@ if ! {
     echo "Usage beta/opp/lambda lists: $0 beta_list alpha_min alpha_max alpha_steps opportunity_list lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
     echo "Pass --sigma VALUE or --observation-sigma VALUE in extra_jax_args to add Gaussian observation noise."
     echo "Pass --sigma-list 0,0.25,0.5 in extra_jax_args to submit one Slurm job per sigma value."
+    echo "Sampled-lambda critic defaults to q. Override with --sampled-lambda-critic value or SAMPLED_LAMBDA_CRITIC=value."
     echo "Add --allow-node-revisit in extra_jax_args, or set ALLOW_NODE_REVISIT=1, to keep observed nodes legal."
     echo "Revisit runs default to --max-observations-before-stop 10 and --num-steps 11 unless overridden."
     exit 1
@@ -90,6 +91,18 @@ has_extra_arg() {
     return 1
 }
 
+has_any_extra_arg() {
+    local arg flag
+    for arg in "${extra_args[@]:-}"; do
+        for flag in "$@"; do
+            if [ "$arg" = "$flag" ] || [[ "$arg" == "$flag="* ]]; then
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
 case "${ALLOW_NODE_REVISIT:-}" in
     1|true|TRUE|yes|YES|on|ON)
         if ! has_extra_arg "--allow-node-revisit"; then
@@ -97,6 +110,10 @@ case "${ALLOW_NODE_REVISIT:-}" in
         fi
         ;;
 esac
+
+if ! has_any_extra_arg "--sampled-lambda-critic" "--critic" "--critic-type" "--critic-mode"; then
+    extra_args+=("--sampled-lambda-critic" "${SAMPLED_LAMBDA_CRITIC:-q}")
+fi
 
 mkdir -p logs
 
