@@ -3,9 +3,8 @@
 set -euo pipefail
 
 if [ "$#" -lt 11 ]; then
-    echo "Usage: $0 lambda alpha beta model_dir sim_dir trial_n input_type seed train opportunity_cost tree_size [expansion_decision_version] [model_variant] [tree_config] [rnn_units] [latent_dim] [extra_jax_args...]"
-    echo "Example: $0 100.0 0.0 1000.0 outputs/jax_models/ outputs/jax_simulations/ 2000 uniform 31 train 0.0266666666667 3 lstm vae bandit3 32 16 --num-envs 200 --backend cpu --kl-start-multiplier 5 --kl-annealing-epochs 60 --sigma 0.5 --allow-node-revisit --max-observations-before-stop 10"
-    echo "Extra JAX args include --pay-kl-on-stop to pay pending KL on terminal stop; filenames add _stop_paid."
+    echo "Usage: $0 lambda alpha beta model_dir sim_dir trial_n input_type seed train opportunity_cost tree_size [expansion_decision_version] [model_variant] [tree_config] [rnn_units] [latent_dim] [extra_evidence_args...]"
+    echo "Example: $0 100.0 0.0 1000.0 outputs/jax_models_evi/ outputs/jax_simulations_evi/ 2000 evidence 1 train 0.02 2 lstm vae evidence 32 16 --coherence-values 0,0.05,0.1,0.2,0.4,0.8 --observation-noise-std 1.0 --max-observations-before-stop 10"
     exit 1
 fi
 
@@ -20,11 +19,11 @@ seed=$8
 train=$9
 opportunity_cost_string=${10}
 tree_size=${11}
-expansion_decision_version=${12:-"decoder"}
+expansion_decision_version=${12:-"lstm"}
 model_variant=${13:-"vae"}
-tree_config=${14:-""}
-rnn_units=${15:-"64"}
-latent_dim=${16:-"32"}
+tree_config=${14:-"evidence"}
+rnn_units=${15:-"32"}
+latent_dim=${16:-"16"}
 
 shift $(( $# >= 16 ? 16 : $# ))
 
@@ -71,7 +70,7 @@ if [ -f vae_env/bin/activate ]; then
     source vae_env/bin/activate
 fi
 
-python -m model_jax.planning \
+python -m model_jax.evidence_accumulation \
     "$lambda_string" \
     "$alpha_string" \
     "$beta_string" \

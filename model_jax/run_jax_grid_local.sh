@@ -22,6 +22,7 @@ if ! {
     echo "Sampled-lambda critic defaults to q. Override with --sampled-lambda-critic value or SAMPLED_LAMBDA_CRITIC=value."
     echo "Add --allow-node-revisit in extra_jax_args, or set ALLOW_NODE_REVISIT=1, to keep observed nodes legal."
     echo "Revisit runs default to --max-observations-before-stop 10 and --num-steps 11 unless overridden."
+    echo "Add --pay-kl-on-stop in extra_jax_args, or set PAY_KL_ON_STOP=1, to pay pending KL on terminal stop; filenames add _stop_paid."
     echo "Jobs are run locally and sequentially."
     exit 1
 fi

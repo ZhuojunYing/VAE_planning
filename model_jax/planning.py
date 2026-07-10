@@ -138,6 +138,7 @@ class RunConfig:
     kl_annealing_epochs: int
     node_coverage_aux_coef: float
     node_coverage_aux_epochs: int
+    pay_kl_on_stop: bool = False
     save_every_update: bool = False
 
 
@@ -470,6 +471,7 @@ def model_name_for(config: RunConfig, task: TaskSpec) -> str:
         )
         else ""
     )
+    stop_paid_label = "_stop_paid" if bool(config.pay_kl_on_stop) else ""
     visited_lstm_label = "_visitedidx" if use_visited_lstm_input_for_task(task) else ""
     return (
         f"lambda_{config.lambda_}_alpha_{config.alpha}_beta_{config.beta}_"
@@ -481,6 +483,7 @@ def model_name_for(config: RunConfig, task: TaskSpec) -> str:
         f"{kl_schedule_label}"
         f"{node_coverage_aux_label}"
         f"{sampled_lambda_critic_label}"
+        f"{stop_paid_label}"
         f"{visited_lstm_label}"
     )
 
@@ -656,6 +659,7 @@ class PlanningVAE(nn.Module):
     latent_keep_dims: tuple[int, ...] = ()
     lstm_context_pca_mean: tuple[float, ...] = ()
     lstm_context_pca_components: tuple[tuple[float, ...], ...] = ()
+    pay_kl_on_stop: bool = False
 
     def reward_feature_dim(self) -> int:
         if int(self.reward_feature_dim_override) > 0:
@@ -1017,7 +1021,10 @@ class PlanningVAE(nn.Module):
             kl_per_sample = jnp.mean(kl_per_dim, axis=-1)
             observed_kl = kl_per_sample * is_observe.astype(jnp.float32)
             if self.expansion_decision_version in ("lstm", "pre_lstm"):
-                paid_kl = carry.pending_kl * is_observe.astype(jnp.float32)
+                pay_pending_kl = is_observe
+                if bool(self.pay_kl_on_stop):
+                    pay_pending_kl = pay_pending_kl | is_stop
+                paid_kl = carry.pending_kl * pay_pending_kl.astype(jnp.float32)
                 pending_kl = observed_kl
             else:
                 paid_kl = observed_kl
@@ -3281,6 +3288,7 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         alpha=config.alpha,
         beta=config.beta,
         include_visited_lstm_input=use_visited_lstm_input_for_task(task),
+        pay_kl_on_stop=config.pay_kl_on_stop,
     )
     updates_per_epoch = max(1, math.ceil(config.steps_per_epoch / (config.num_envs * config.num_steps)))
     total_updates = config.epochs * updates_per_epoch
@@ -3322,7 +3330,8 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         f"kl_start_multiplier={config.kl_start_multiplier} | "
         f"kl_annealing_epochs={config.kl_annealing_epochs} | "
         f"node_coverage_aux_coef={config.node_coverage_aux_coef} | "
-        f"node_coverage_aux_epochs={config.node_coverage_aux_epochs}",
+        f"node_coverage_aux_epochs={config.node_coverage_aux_epochs} | "
+        f"pay_kl_on_stop={config.pay_kl_on_stop}",
         flush=True,
     )
     rows = []
@@ -3434,6 +3443,7 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
                 "kl_annealing_epochs": int(config.kl_annealing_epochs),
                 "node_coverage_aux_start_coef": float(config.node_coverage_aux_coef),
                 "node_coverage_aux_epochs": int(config.node_coverage_aux_epochs),
+                "pay_kl_on_stop": bool(config.pay_kl_on_stop),
             }
         )
         rows.append(row)
@@ -3520,6 +3530,7 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
         beta=config.beta,
         reward_feature_dim_override=int(checkpoint_reward_dim),
         include_visited_lstm_input=use_visited_lstm_input_for_task(task),
+        pay_kl_on_stop=config.pay_kl_on_stop,
     )
     rng = jax.random.PRNGKey(config.seed)
     reward_feature_dim = (
@@ -3859,6 +3870,18 @@ def parse_args() -> RunConfig:
             "schedule epochs. If 0, a nonzero coefficient is held constant."
         ),
     )
+    parser.add_argument(
+        "--pay-kl-on-stop",
+        "--pay-memory-cost-on-stop",
+        action="store_true",
+        default=os.environ.get("PAY_KL_ON_STOP", "").strip().lower() in {"1", "true", "yes", "on"},
+        help=(
+            "For LSTM/pre-LSTM expansion runs, pay the pending memory KL when the next "
+            "decision is a terminal stop action. By default the last observation before "
+            "stop remains free, matching older checkpoints. Enabled runs add _stop_paid "
+            "to model and simulation filenames."
+        ),
+    )
     args = parser.parse_args()
 
     lambda_values = parse_float_list(args.lambda_string)
@@ -3947,6 +3970,7 @@ def parse_args() -> RunConfig:
         kl_annealing_epochs=max(int(kl_annealing_epochs), 0),
         node_coverage_aux_coef=max(float(args.node_coverage_aux_coef), 0.0),
         node_coverage_aux_epochs=max(int(args.node_coverage_aux_epochs), 0),
+        pay_kl_on_stop=bool(args.pay_kl_on_stop),
     )
 
 

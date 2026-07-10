@@ -40,6 +40,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
 import numpy as np
 import pandas as pd
 
@@ -65,6 +66,7 @@ FAMILY_COLOR_RAMPS = {
     "vary_beta": BETA_COLOR_RAMP,
     "vary_opportunity": OPPORTUNITY_COLOR_RAMP,
 }
+POSTERIOR_TRIAL_CONTOUR_MASS = 0.90
 
 
 def parse_values(raw: str | None, typ=float) -> list:
@@ -241,6 +243,11 @@ def resolve_output_dir(args: argparse.Namespace) -> Path:
         return base
     label = output_combo_label(args)
     return base if base.name == label else base / label
+
+
+def should_write_normalized_z_aggregate_plots(args: argparse.Namespace) -> bool:
+    tree_label = normalize_tree_name(getattr(args, "output_tree_label", getattr(args, "tree", "default")))
+    return tree_label == "default"
 
 
 def load_default_preset(args: argparse.Namespace) -> argparse.Namespace:
@@ -434,8 +441,15 @@ def rollout_with_streams(
     seed_offset: int,
     force_round_robin_observations: bool = False,
     force_first_observe_node: int = 0,
+    progress_label: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     n_trials = rewards.shape[0]
+    if progress_label:
+        print(
+            f"{progress_label}: starting rollout with {n_trials} total trial(s), "
+            f"num_steps={int(config.num_steps)}, max_observations={int(config.max_observations_before_stop)}",
+            flush=True,
+        )
     reward_feature_dim = int(model.reward_feature_dim_override) or jp.reward_feature_dim_for_sigma(
         config.observation_sigma
     )
@@ -531,6 +545,15 @@ def rollout_with_streams(
                 ))
             if is_stop[trial] and not np.isfinite(stop_t[trial]):
                 stop_t[trial] = float(timestep)
+        if progress_label:
+            done_now = np.asarray(carry.done, dtype=bool)
+            print(
+                f"{progress_label}: simulated timestep {timestep}/{int(config.num_steps)}; "
+                f"active={int(np.sum(~done_now))}/{n_trials}; "
+                f"stopped={int(np.sum(np.isfinite(stop_t)))}/{n_trials}; "
+                f"observed_events={int(np.sum(obs_count))}",
+                flush=True,
+            )
 
     rows = []
     paid_rows = []
@@ -631,7 +654,16 @@ def rollout_with_streams(
                 "prior_logvar": prior_logvar_i,
             }
         )
-    return pd.DataFrame(rows), pd.DataFrame(paid_rows)
+    latent_df = pd.DataFrame(rows)
+    paid_latent_df = pd.DataFrame(paid_rows)
+    if progress_label:
+        print(
+            f"{progress_label}: rollout finished; valid_last_paid="
+            f"{int(latent_df['valid_last_paid'].sum()) if 'valid_last_paid' in latent_df.columns else 0}/"
+            f"{len(latent_df)}; paid_latent_rows={len(paid_latent_df)}",
+            flush=True,
+        )
+    return latent_df, paid_latent_df
 
 
 def symmetric_diag_gaussian_kl(mu: np.ndarray, logvar: np.ndarray) -> float:
@@ -2908,7 +2940,10 @@ def param_density_folder_name(row: pd.Series) -> str:
     return f"{family}_{parameter_name}_{value_token(parameter_value)}"
 
 
-def build_paid_latent_density_frame(paid_latents: pd.DataFrame) -> pd.DataFrame:
+def build_paid_latent_density_frame(
+    paid_latents: pd.DataFrame,
+    path_map: np.ndarray | None = None,
+) -> pd.DataFrame:
     required = {
         "family",
         "parameter_name",
@@ -2930,6 +2965,8 @@ def build_paid_latent_density_frame(paid_latents: pd.DataFrame) -> pd.DataFrame:
     if paid_latents.empty or not required.issubset(paid_latents.columns):
         return pd.DataFrame()
     rows = []
+    reward_cols_all = reward_columns(paid_latents)
+    path_map_arr = np.asarray(path_map, dtype=float) if path_map is not None else None
     for _, row in paid_latents.iterrows():
         try:
             z_mu = np.asarray(row["z_mu"], dtype=float)
@@ -2956,12 +2993,27 @@ def build_paid_latent_density_frame(paid_latents: pd.DataFrame) -> pd.DataFrame:
         ):
             continue
         observed_node = int(row["observed_node"])
-        reward_cols = reward_columns(pd.DataFrame([row]))
+        reward_cols = reward_cols_all
         other_actual_reward = np.nan
+        observed_path_index = observed_node
+        observed_path_reward = float(row["actual_observed_reward"])
+        mean_other_path_reward = np.nan
         if reward_cols and 1 <= observed_node <= len(reward_cols):
             rewards = np.asarray([float(row[col]) for col in reward_cols], dtype=float)
             other_rewards = np.delete(rewards, observed_node - 1)
             other_actual_reward = float(np.nanmean(other_rewards)) if other_rewards.size else np.nan
+            if path_map_arr is not None and path_map_arr.ndim == 2 and path_map_arr.shape[1] == rewards.size:
+                path_values = path_map_arr @ rewards
+                path_hits = np.flatnonzero(path_map_arr[:, observed_node - 1] > 0.0)
+                if path_hits.size:
+                    observed_path_index = int(path_hits[0]) + 1
+                    observed_path_reward = float(path_values[int(path_hits[0])])
+                    other_path_values = np.delete(path_values, int(path_hits[0]))
+                    mean_other_path_reward = (
+                        float(np.nanmean(other_path_values)) if other_path_values.size else np.nan
+                    )
+            else:
+                mean_other_path_reward = other_actual_reward
         prior_sigma = np.maximum(prior_sigma, 1e-8)
         norm_mu = (z_mu - prior_mu) / prior_sigma
         norm_sigma = z_sigma / prior_sigma
@@ -2981,6 +3033,14 @@ def build_paid_latent_density_frame(paid_latents: pd.DataFrame) -> pd.DataFrame:
             "observed_reward": float(row["observed_reward"]),
             "actual_node_reward": float(row["actual_observed_reward"]),
             "other_node_actual_reward": other_actual_reward,
+            "observed_path_index": int(observed_path_index),
+            "actual_path_reward": float(observed_path_reward),
+            "mean_other_path_reward": mean_other_path_reward,
+            "observed_minus_mean_other_path_reward": (
+                float(observed_path_reward - mean_other_path_reward)
+                if np.isfinite(mean_other_path_reward)
+                else np.nan
+            ),
             "force_first_observe_node": int(row.get("force_first_observe_node", 0) or 0),
             "force_round_robin_observations": bool(row.get("force_round_robin_observations", False)),
             "z_mu_0": float(z_mu[0]),
@@ -3002,6 +3062,344 @@ def build_paid_latent_density_frame(paid_latents: pd.DataFrame) -> pd.DataFrame:
             out[f"prior_normalized_sigma_{i}"] = float(value)
         rows.append(out)
     return pd.DataFrame(rows)
+
+
+def prepare_density_path_reward_columns(density_rows: pd.DataFrame) -> pd.DataFrame:
+    rows = density_rows.copy()
+    if rows.empty:
+        return rows
+    if "actual_path_reward" not in rows.columns:
+        rows["actual_path_reward"] = pd.to_numeric(
+            rows.get("actual_node_reward", pd.Series(np.nan, index=rows.index)),
+            errors="coerce",
+        )
+    if "mean_other_path_reward" not in rows.columns:
+        rows["mean_other_path_reward"] = pd.to_numeric(
+            rows.get("other_node_actual_reward", pd.Series(np.nan, index=rows.index)),
+            errors="coerce",
+        )
+    if "observed_minus_mean_other_path_reward" not in rows.columns:
+        rows["observed_minus_mean_other_path_reward"] = (
+            pd.to_numeric(rows["actual_path_reward"], errors="coerce")
+            - pd.to_numeric(rows["mean_other_path_reward"], errors="coerce")
+        )
+    if "observed_path_index" not in rows.columns:
+        rows["observed_path_index"] = pd.to_numeric(
+            rows.get("observed_node", pd.Series(np.nan, index=rows.index)),
+            errors="coerce",
+        )
+    return rows
+
+
+def latent_mu_trace_covariance_summaries(
+    density_rows: pd.DataFrame,
+    *,
+    min_samples: int,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    required = {
+        "family",
+        "parameter_name",
+        "parameter_value",
+        "beta",
+        "opportunity",
+        "sigma",
+        "seed",
+        "paid_observation_index",
+        "prior_normalized_z_mu_0",
+        "prior_normalized_z_mu_1",
+    }
+    if density_rows.empty or not required.issubset(density_rows.columns):
+        return pd.DataFrame(), {}
+    rows = prepare_density_path_reward_columns(density_rows)
+    for col in [
+        "parameter_value",
+        "beta",
+        "opportunity",
+        "sigma",
+        "seed",
+        "paid_observation_index",
+        "observed_path_index",
+        "actual_path_reward",
+        "mean_other_path_reward",
+        "observed_minus_mean_other_path_reward",
+        "prior_normalized_z_mu_0",
+        "prior_normalized_z_mu_1",
+    ]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    rows = rows.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=[
+            "family",
+            "parameter_name",
+            "parameter_value",
+            "beta",
+            "opportunity",
+            "sigma",
+            "seed",
+            "paid_observation_index",
+            "observed_path_index",
+            "actual_path_reward",
+            "mean_other_path_reward",
+            "observed_minus_mean_other_path_reward",
+            "prior_normalized_z_mu_0",
+            "prior_normalized_z_mu_1",
+        ]
+    )
+    if rows.empty:
+        return pd.DataFrame(), {}
+
+    cell_group_cols = [
+        "family",
+        "parameter_name",
+        "parameter_value",
+        "beta",
+        "opportunity",
+        "sigma",
+        "seed",
+        "paid_observation_index",
+        "observed_path_index",
+        "actual_path_reward",
+        "mean_other_path_reward",
+        "observed_minus_mean_other_path_reward",
+    ]
+    cells = (
+        rows.groupby(cell_group_cols, dropna=False)
+        .agg(
+            var_z0_mu_norm=("prior_normalized_z_mu_0", lambda x: float(np.nanvar(x, ddof=1)) if np.isfinite(x).sum() > 1 else np.nan),
+            var_z1_mu_norm=("prior_normalized_z_mu_1", lambda x: float(np.nanvar(x, ddof=1)) if np.isfinite(x).sum() > 1 else np.nan),
+            n_states=("prior_normalized_z_mu_0", lambda x: int(np.isfinite(x).sum())),
+        )
+        .reset_index()
+    )
+    cells["trace_cov_z_mu_norm"] = (
+        pd.to_numeric(cells["var_z0_mu_norm"], errors="coerce")
+        + pd.to_numeric(cells["var_z1_mu_norm"], errors="coerce")
+    )
+    cells = cells[np.isfinite(cells["trace_cov_z_mu_norm"])].copy()
+    if int(min_samples) > 1:
+        cells = cells[pd.to_numeric(cells["n_states"], errors="coerce") >= int(min_samples)].copy()
+    if cells.empty:
+        return cells, {}
+
+    base_cols = ["family", "parameter_name", "parameter_value", "beta", "opportunity", "sigma"]
+    seed_cols = base_cols + ["seed"]
+    x_specs = {
+        "paid_observation_index": {
+            "x_col": "paid_observation_index",
+            "extra_condition_cols": [
+                "observed_path_index",
+                "actual_path_reward",
+                "mean_other_path_reward",
+            ],
+        },
+        "actual_path_reward": {
+            "x_col": "actual_path_reward",
+            "extra_condition_cols": [
+                "paid_observation_index",
+                "observed_path_index",
+                "mean_other_path_reward",
+            ],
+        },
+        "observed_minus_mean_other_path_reward": {
+            "x_col": "observed_minus_mean_other_path_reward",
+            "extra_condition_cols": [
+                "paid_observation_index",
+                "observed_path_index",
+                "actual_path_reward",
+                "mean_other_path_reward",
+            ],
+        },
+    }
+    summaries: dict[str, pd.DataFrame] = {}
+    for name, spec in x_specs.items():
+        x_col = spec["x_col"]
+        seed_summary = (
+            cells.groupby(seed_cols + [x_col], dropna=False)
+            .agg(
+                seed_trace_cov_z_mu_norm=("trace_cov_z_mu_norm", "mean"),
+                n_cells=("trace_cov_z_mu_norm", lambda x: int(np.isfinite(x).sum())),
+                mean_n_states=("n_states", "mean"),
+            )
+            .reset_index()
+        )
+        summary = (
+            seed_summary.groupby(base_cols + [x_col], dropna=False)
+            .agg(
+                mean_trace_cov_z_mu_norm=("seed_trace_cov_z_mu_norm", "mean"),
+                sem_trace_cov_z_mu_norm=("seed_trace_cov_z_mu_norm", sem_finite),
+                n_seeds=("seed", "nunique"),
+                mean_cells=("n_cells", "mean"),
+                mean_n_states=("mean_n_states", "mean"),
+            )
+            .reset_index()
+        )
+        summaries[name] = summary
+    return cells, summaries
+
+
+def plot_latent_mu_trace_covariance_sigma_rows(
+    summary: pd.DataFrame,
+    outpath: Path,
+    *,
+    x_col: str,
+    x_label: str,
+    min_samples: int = 1,
+    symmetric_x: bool = False,
+) -> None:
+    if summary.empty or x_col not in summary.columns:
+        return
+    data = summary.copy()
+    data["mean_trace_cov_z_mu_norm"] = pd.to_numeric(
+        data["mean_trace_cov_z_mu_norm"], errors="coerce"
+    )
+    data["sem_trace_cov_z_mu_norm"] = pd.to_numeric(
+        data["sem_trace_cov_z_mu_norm"], errors="coerce"
+    )
+    data[x_col] = pd.to_numeric(data[x_col], errors="coerce")
+    data = data.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=[x_col, "mean_trace_cov_z_mu_norm"]
+    )
+    if data.empty:
+        return
+    plt.rcParams.update(
+        {
+            "font.size": PLOT_FONT_SIZE_PT,
+            "axes.titlesize": PLOT_FONT_SIZE_PT,
+            "axes.labelsize": PLOT_FONT_SIZE_PT,
+            "xtick.labelsize": PLOT_FONT_SIZE_PT,
+            "ytick.labelsize": PLOT_FONT_SIZE_PT,
+            "legend.fontsize": PLOT_FONT_SIZE_PT,
+            "figure.dpi": 300,
+        }
+    )
+    sigmas = sorted(pd.to_numeric(data["sigma"], errors="coerce").dropna().unique())
+    if not sigmas:
+        return
+    y_lower, y_upper = dynamic_linear_limits(
+        data["mean_trace_cov_z_mu_norm"].to_numpy(dtype=float),
+        data["sem_trace_cov_z_mu_norm"].to_numpy(dtype=float),
+    )
+    y_lower = min(0.0, y_lower)
+    if y_upper <= y_lower:
+        y_upper = y_lower + 1.0
+    family_specs = [
+        ("vary_beta", "Vary beta", "beta", FAMILY_COLOR_RAMPS["vary_beta"], "o", "-"),
+        ("vary_opportunity", "Vary opportunity", "opp", FAMILY_COLOR_RAMPS["vary_opportunity"], "^", "--"),
+    ]
+    fig, axes = plt.subplots(
+        len(sigmas),
+        len(family_specs),
+        figsize=(
+            len(family_specs) * 1.55 * PANEL_WIDTH_IN + 1.55,
+            max(len(sigmas), 1) * PANEL_HEIGHT_IN + 0.65,
+        ),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    handles, labels = [], []
+    for row_idx, sigma in enumerate(sigmas):
+        sigma_data = data[np.isclose(pd.to_numeric(data["sigma"], errors="coerce"), sigma)].copy()
+        for col_idx, (family, family_title, short_name, cmap_name, marker, linestyle) in enumerate(family_specs):
+            ax = axes[row_idx, col_idx]
+            fam_data = sigma_data[sigma_data["family"] == family].copy()
+            if fam_data.empty:
+                if row_idx == 0:
+                    ax.set_title(family_title)
+                if col_idx == 0:
+                    ax.set_ylabel(f"sigma={sigma:g}\ntrace Cov\nVar(z0)+Var(z1)")
+                ax.set_ylim(y_lower, y_upper)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+                ax.tick_params(length=2, pad=1)
+                continue
+            params = sorted(pd.to_numeric(fam_data["parameter_value"], errors="coerce").dropna().unique())
+            colors = color_values(len(params), cmap_name)
+            for color, param in zip(colors, params):
+                sub = fam_data[
+                    np.isclose(pd.to_numeric(fam_data["parameter_value"], errors="coerce"), param)
+                ].sort_values(x_col)
+                if sub.empty:
+                    continue
+                label = f"{short_name}={float(param):g}"
+                line = ax.errorbar(
+                    sub[x_col],
+                    sub["mean_trace_cov_z_mu_norm"],
+                    yerr=sub["sem_trace_cov_z_mu_norm"],
+                    marker=marker,
+                    linestyle=linestyle,
+                    linewidth=0.9,
+                    markersize=2.5,
+                    capsize=1.5,
+                    color=color,
+                    label=label,
+                )
+                if row_idx == 0 and label not in labels:
+                    handles.append(line)
+                    labels.append(label)
+            if row_idx == 0:
+                ax.set_title(family_title)
+            if col_idx == 0:
+                ax.set_ylabel(f"sigma={sigma:g}\ntrace Cov\nVar(z0)+Var(z1)")
+            ax.set_ylim(y_lower, y_upper)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.tick_params(length=2, pad=1)
+            if symmetric_x:
+                ax.set_xlim(*symmetric_observed_difference_xlim(data, x_col))
+                ax.axvline(0.0, color="#999999", linewidth=0.45, zorder=0)
+    for ax in axes[-1, :]:
+        ax.set_xlabel(x_label)
+    if handles:
+        fig.legend(handles, labels, frameon=False, loc="center left", bbox_to_anchor=(0.84, 0.5))
+    fig.tight_layout(rect=(0, 0, 0.83, 1), h_pad=0.75, w_pad=0.65)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outpath, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_latent_mu_trace_covariance_outputs(
+    density_rows: pd.DataFrame,
+    outdir: Path,
+    *,
+    min_samples: int,
+) -> None:
+    cells, summaries = latent_mu_trace_covariance_summaries(
+        density_rows,
+        min_samples=int(min_samples),
+    )
+    if cells.empty or not summaries:
+        print("Latent z_mu trace covariance: no eligible cells to plot.", flush=True)
+        return
+    cells.to_csv(outdir / "latent_z_mu_trace_covariance_cells.csv", index=False)
+    plot_specs = {
+        "paid_observation_index": (
+            "paid observation index",
+            "latent_z_mu_trace_covariance_vs_paid_observation_index_sigma_rows_beta_opp_overlay.png",
+            False,
+        ),
+        "actual_path_reward": (
+            "actual reward of observed path",
+            "latent_z_mu_trace_covariance_vs_observed_path_reward_sigma_rows_beta_opp_overlay.png",
+            False,
+        ),
+        "observed_minus_mean_other_path_reward": (
+            "observed path reward - mean other path reward",
+            "latent_z_mu_trace_covariance_vs_observed_minus_mean_other_path_reward_sigma_rows_beta_opp_overlay.png",
+            True,
+        ),
+    }
+    for key, summary in summaries.items():
+        summary.to_csv(outdir / f"latent_z_mu_trace_covariance_by_{key}.csv", index=False)
+        x_label, filename, symmetric_x = plot_specs[key]
+        plot_latent_mu_trace_covariance_sigma_rows(
+            summary,
+            outdir / filename,
+            x_col=key,
+            x_label=x_label,
+            min_samples=min_samples,
+            symmetric_x=symmetric_x,
+        )
 
 
 def observed_value_contour_groups(
@@ -3069,6 +3467,51 @@ def scatter_density_points(
         linewidths=0,
         rasterized=True,
     )
+
+
+def draw_per_trial_posterior_contours(
+    ax,
+    df: pd.DataFrame,
+    *,
+    color_col: str,
+    cmap,
+    norm,
+    max_points: int,
+    seed: int,
+    mass: float = POSTERIOR_TRIAL_CONTOUR_MASS,
+) -> None:
+    required = ["z_mu_0", "z_mu_1", "z_sigma_0", "z_sigma_1", color_col]
+    if df.empty or any(col not in df.columns for col in required):
+        return
+    work = df[required].copy()
+    for col in required:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.replace([np.inf, -np.inf], np.nan).dropna()
+    work = work[(work["z_sigma_0"] > 0.0) & (work["z_sigma_1"] > 0.0)].copy()
+    if work.empty:
+        return
+    if max_points > 0 and len(work) > max_points:
+        work = work.sample(max_points, random_state=seed)
+    clipped_mass = min(max(float(mass), 1e-6), 1.0 - 1e-6)
+    radius = math.sqrt(-2.0 * math.log(1.0 - clipped_mass))
+    for row in work.itertuples(index=False):
+        mu0 = float(getattr(row, "z_mu_0"))
+        mu1 = float(getattr(row, "z_mu_1"))
+        sigma0 = float(getattr(row, "z_sigma_0"))
+        sigma1 = float(getattr(row, "z_sigma_1"))
+        value = float(getattr(row, color_col))
+        ellipse = Ellipse(
+            (mu0, mu1),
+            width=2.0 * radius * sigma0,
+            height=2.0 * radius * sigma1,
+            angle=0.0,
+            facecolor="none",
+            edgecolor=cmap(norm(value)),
+            linewidth=0.28,
+            alpha=0.22,
+            zorder=1,
+        )
+        ax.add_patch(ellipse)
 
 
 def zero_centered_axis_limits(frame: pd.DataFrame) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -3163,33 +3606,44 @@ def plot_model_reward_density_grid(
             if panel.empty or len(panel) < max(1, int(min_samples)):
                 ax.text(0.5, 0.5, f"n={len(panel)}", transform=ax.transAxes, ha="center", va="center", fontsize=6)
             else:
-                for value, group in observed_value_contour_groups(
-                    panel,
-                    color_col="observed_reward",
-                    min_density_samples=min_samples,
-                ):
-                    density = density_fn(
-                        group,
-                        x_grid,
-                        y_grid,
+                if density_uses_posterior:
+                    draw_per_trial_posterior_contours(
+                        ax,
+                        panel,
+                        color_col="observed_reward",
+                        cmap=cmap,
+                        norm=norm,
                         max_points=max_points,
-                        seed=stable_group_seed((title, row_i, reward, value)),
-                        min_samples=min_samples,
+                        seed=stable_group_seed((title, row_i, reward, "posterior_contours")),
                     )
-                    if density is None:
-                        continue
-                    levels = gpga.base.positive_contour_levels(density, masses=(0.50, 0.90))
-                    if levels is None:
-                        continue
-                    ax.contour(
-                        x_grid,
-                        y_grid,
-                        density,
-                        levels=levels,
-                        colors=[cmap(norm(float(value)))],
-                        linewidths=0.65,
-                        alpha=0.85,
-                    )
+                else:
+                    for value, group in observed_value_contour_groups(
+                        panel,
+                        color_col="observed_reward",
+                        min_density_samples=min_samples,
+                    ):
+                        density = density_fn(
+                            group,
+                            x_grid,
+                            y_grid,
+                            max_points=max_points,
+                            seed=stable_group_seed((title, row_i, reward, value)),
+                            min_samples=min_samples,
+                        )
+                        if density is None:
+                            continue
+                        levels = gpga.base.positive_contour_levels(density, masses=(0.50, 0.90))
+                        if levels is None:
+                            continue
+                        ax.contour(
+                            x_grid,
+                            y_grid,
+                            density,
+                            levels=levels,
+                            colors=[cmap(norm(float(value)))],
+                            linewidths=0.65,
+                            alpha=0.85,
+                        )
                 scatter_density_points(
                     ax,
                     panel,
@@ -3302,33 +3756,44 @@ def plot_other_vs_observed_reward_density_grid(
             if panel.empty or len(panel) < max(1, int(min_samples)):
                 ax.text(0.5, 0.5, f"n={len(panel)}", transform=ax.transAxes, ha="center", va="center", fontsize=6)
             else:
-                for value, group in observed_value_contour_groups(
-                    panel,
-                    color_col="observed_reward",
-                    min_density_samples=min_samples,
-                ):
-                    density = density_fn(
-                        group,
-                        x_grid,
-                        y_grid,
+                if density_uses_posterior:
+                    draw_per_trial_posterior_contours(
+                        ax,
+                        panel,
+                        color_col="observed_reward",
+                        cmap=cmap,
+                        norm=norm,
                         max_points=max_points,
-                        seed=stable_group_seed((title, row_i, col_i, value)),
-                        min_samples=min_samples,
+                        seed=stable_group_seed((title, row_i, col_i, "posterior_contours")),
                     )
-                    if density is None:
-                        continue
-                    levels = gpga.base.positive_contour_levels(density, masses=(0.50, 0.90))
-                    if levels is None:
-                        continue
-                    ax.contour(
-                        x_grid,
-                        y_grid,
-                        density,
-                        levels=levels,
-                        colors=[cmap(norm(float(value)))],
-                        linewidths=0.65,
-                        alpha=0.85,
-                    )
+                else:
+                    for value, group in observed_value_contour_groups(
+                        panel,
+                        color_col="observed_reward",
+                        min_density_samples=min_samples,
+                    ):
+                        density = density_fn(
+                            group,
+                            x_grid,
+                            y_grid,
+                            max_points=max_points,
+                            seed=stable_group_seed((title, row_i, col_i, value)),
+                            min_samples=min_samples,
+                        )
+                        if density is None:
+                            continue
+                        levels = gpga.base.positive_contour_levels(density, masses=(0.50, 0.90))
+                        if levels is None:
+                            continue
+                        ax.contour(
+                            x_grid,
+                            y_grid,
+                            density,
+                            levels=levels,
+                            colors=[cmap(norm(float(value)))],
+                            linewidths=0.65,
+                            alpha=0.85,
+                        )
                 scatter_density_points(
                     ax,
                     panel,
@@ -3381,34 +3846,62 @@ def fit_sigma_pga_scores(
         return pd.DataFrame()
     scores_cache_path = cache_dir / "aggregate_pga_scores.csv" if cache_dir is not None else None
     fit_cache_path = cache_dir / "aggregate_pga_fit.npz" if cache_dir is not None else None
+    cache_label = str(cache_dir) if cache_dir is not None else "no-cache-dir"
+    print(
+        f"PGA[{cache_label}]: requested for {len(frame)} row(s); "
+        f"reuse_cache={bool(reuse_cache)}; max_states={int(max_states)}; max_iters={int(max_iters)}",
+        flush=True,
+    )
     if reuse_cache and scores_cache_path is not None and scores_cache_path.exists():
+        print(f"PGA[{cache_label}]: loading cached score table {scores_cache_path}", flush=True)
         cached = pd.read_csv(scores_cache_path)
         if {"z_mu_0", "z_mu_1"}.issubset(cached.columns):
+            print(f"PGA[{cache_label}]: loaded {len(cached)} cached score row(s)", flush=True)
             return cached
+        print(
+            f"PGA[{cache_label}]: cached score table is missing z_mu_0/z_mu_1; refitting",
+            flush=True,
+        )
 
     work = frame.copy().reset_index(drop=True)
     values = work[mu_cols + sigma_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
     valid = values.notna().all(axis=1)
     work = work.loc[valid].reset_index(drop=True)
+    print(f"PGA[{cache_label}]: {len(work)} row(s) remain after finite mu/sigma filtering", flush=True)
     if len(work) < 2:
+        print(f"PGA[{cache_label}]: fewer than 2 rows; skipping PGA", flush=True)
         return pd.DataFrame()
     mu = work[mu_cols].to_numpy(dtype=float)
     sigma = work[sigma_cols].to_numpy(dtype=float)
     sigma = np.maximum(sigma, 1e-8)
     if reuse_cache and fit_cache_path is not None and fit_cache_path.exists():
+        print(f"PGA[{cache_label}]: loading cached fit {fit_cache_path}", flush=True)
         pga = gpga.ProductGaussianPGA.load(fit_cache_path)
     else:
         fit_idx = np.arange(len(work), dtype=int)
         if int(max_states) > 0 and len(fit_idx) > int(max_states):
             rng = np.random.default_rng(20260706)
             fit_idx = np.sort(rng.choice(fit_idx, size=int(max_states), replace=False))
-        pga = gpga.ProductGaussianPGA(n_components=2, max_iters=int(max_iters))
+        print(
+            f"PGA[{cache_label}]: fitting PGA on {len(fit_idx)} sampled state(s) "
+            f"from {len(work)} available row(s)",
+            flush=True,
+        )
+        pga = gpga.ProductGaussianPGA(
+            n_components=2,
+            max_iters=int(max_iters),
+            progress_label=f"PGA[{cache_label}]",
+            progress_every=max(1, min(10, int(max_iters))),
+        )
         pga.fit(mu[fit_idx], sigma[fit_idx])
         if fit_cache_path is not None:
             fit_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"PGA[{cache_label}]: saving fit cache {fit_cache_path}", flush=True)
             pga.save(fit_cache_path)
+    print(f"PGA[{cache_label}]: transforming {len(work)} state(s) to scores", flush=True)
     scores = pga.transform(mu, sigma)
     if scores.shape[1] < 2:
+        print(f"PGA[{cache_label}]: transformed scores have fewer than 2 components; skipping", flush=True)
         return pd.DataFrame()
     work["z_mu_0"] = scores[:, 0]
     work["z_mu_1"] = scores[:, 1]
@@ -3419,7 +3912,9 @@ def fit_sigma_pga_scores(
             work = work.drop(columns=[col])
     if scores_cache_path is not None:
         scores_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"PGA[{cache_label}]: saving score cache {scores_cache_path}", flush=True)
         work.to_csv(scores_cache_path, index=False)
+    print(f"PGA[{cache_label}]: done; score_rows={len(work)}", flush=True)
     return work
 
 
@@ -3432,34 +3927,91 @@ def plot_aggregate_latent_density_outputs(
     pga_max_states: int,
     pga_max_iters: int,
     reuse_pga_fits: bool = False,
+    keep_pooled_plots: bool = False,
+    fit_pga: bool = True,
+    write_normalized_z_plots: bool = True,
 ) -> None:
     if density_rows.empty:
         return
+    if not bool(fit_pga) and not bool(write_normalized_z_plots):
+        print(
+            "Aggregate latent density: skipping because both PGA fitting/plots and "
+            "normalized-z plots are disabled.",
+            flush=True,
+        )
+        return
     root = outdir / "aggregate_latent_density_by_sigma"
     root.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Aggregate latent density: starting with {len(density_rows)} paid latent row(s); "
+        f"reuse_pga_fits={bool(reuse_pga_fits)}; "
+        f"keep_pooled_plots={bool(keep_pooled_plots)}; "
+        f"fit_pga={bool(fit_pga)}; "
+        f"write_normalized_z_plots={bool(write_normalized_z_plots)}; "
+        f"output_root={root}",
+        flush=True,
+    )
+    if "other_node_actual_reward" not in density_rows.columns:
+        print(
+            "Aggregate latent density: paid_latent_density_rows.csv does not contain "
+            "other_node_actual_reward, so the beta/opp-specific row-by-other-reward "
+            "density plots cannot be generated from this cache. Regenerate once "
+            "without --plot-only to rebuild the density cache.",
+            flush=True,
+        )
+    if bool(fit_pga) and not reuse_pga_fits:
+        print(
+            "Aggregate latent density: --reuse-aggregate-pga-fits is not set, "
+            "so PGA will be refit even if previous cache files exist.",
+            flush=True,
+        )
+    if not bool(fit_pga):
+        print(
+            "Aggregate latent density: --no-pga-fitting is set; skipping PGA "
+            "fit/load and PGA score plots.",
+            flush=True,
+        )
+    if not bool(write_normalized_z_plots):
+        print(
+            "Aggregate latent density: normalized-z plots are disabled for this "
+            "non-default tree.",
+            flush=True,
+        )
     for sigma in sorted(pd.to_numeric(density_rows["sigma"], errors="coerce").dropna().unique()):
         sigma_rows = density_rows[np.isclose(pd.to_numeric(density_rows["sigma"], errors="coerce"), sigma)].copy()
         if sigma_rows.empty:
             continue
         sigma_dir = root / f"sigma_{value_token(sigma)}"
         sigma_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"Aggregate latent density: sigma={sigma:g}; rows={len(sigma_rows)}; dir={sigma_dir}",
+            flush=True,
+        )
 
         norm_rows = sigma_rows.copy()
         norm_rows["z_mu_0"] = pd.to_numeric(norm_rows["prior_normalized_z_mu_0"], errors="coerce")
         norm_rows["z_mu_1"] = pd.to_numeric(norm_rows["prior_normalized_z_mu_1"], errors="coerce")
         norm_rows["z_sigma_0"] = pd.to_numeric(norm_rows["prior_normalized_z_sigma_0"], errors="coerce")
         norm_rows["z_sigma_1"] = pd.to_numeric(norm_rows["prior_normalized_z_sigma_1"], errors="coerce")
-        pga_rows = fit_sigma_pga_scores(
-            sigma_rows,
-            max_states=pga_max_states,
-            max_iters=pga_max_iters,
-            cache_dir=sigma_dir,
-            reuse_cache=reuse_pga_fits,
-        )
+        if bool(fit_pga):
+            pga_rows = fit_sigma_pga_scores(
+                sigma_rows,
+                max_states=pga_max_states,
+                max_iters=pga_max_iters,
+                cache_dir=sigma_dir,
+                reuse_cache=reuse_pga_fits,
+            )
+        else:
+            pga_rows = pd.DataFrame()
         pga_xlim, pga_ylim = zero_centered_axis_limits(pga_rows)
 
         timesteps = sorted(pd.to_numeric(sigma_rows["timestep"], errors="coerce").dropna().astype(int).unique())
         nodes = sorted(pd.to_numeric(sigma_rows["observed_node"], errors="coerce").dropna().astype(int).unique())
+        print(
+            f"Aggregate latent density: sigma={sigma:g}; plotting {len(timesteps)} timestep(s) "
+            f"x {len(nodes)} observed-node value(s)",
+            flush=True,
+        )
 
         def write_density_set(
             *,
@@ -3469,27 +4021,33 @@ def plot_aggregate_latent_density_outputs(
             title_suffix: str,
         ) -> None:
             target_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                f"Aggregate latent density: writing density set {target_dir} "
+                f"with norm_rows={len(norm_source)}, pga_rows={len(pga_source)}",
+                flush=True,
+            )
             for timestep in timesteps:
                 for node in nodes:
                     selector = (
                         np.isclose(pd.to_numeric(norm_source["timestep"], errors="coerce"), timestep)
                         & np.isclose(pd.to_numeric(norm_source["observed_node"], errors="coerce"), node)
                     )
-                    plot_model_reward_density_grid(
-                        norm_source[selector].copy(),
-                        target_dir / f"prior_normalized_z_t{timestep}_observed_node_{node}.png",
-                        title=(
-                            f"Prior-normalized z, sigma={sigma:g}, t={timestep}, "
-                            f"observed node={node}{title_suffix}"
-                        ),
-                        x_label="(z_0 - prior_mu_0) / prior_sigma_0",
-                        y_label="(z_1 - prior_mu_1) / prior_sigma_1",
-                        density_uses_posterior=True,
-                        min_samples=min_samples,
-                        max_points=max_points,
-                        xlim=(-5.0, 5.0),
-                        ylim=(-5.0, 5.0),
-                    )
+                    if write_normalized_z_plots:
+                        plot_model_reward_density_grid(
+                            norm_source[selector].copy(),
+                            target_dir / f"prior_normalized_z_t{timestep}_observed_node_{node}.png",
+                            title=(
+                                f"Prior-normalized z, sigma={sigma:g}, t={timestep}, "
+                                f"observed node={node}{title_suffix}"
+                            ),
+                            x_label="(z_0 - prior_mu_0) / prior_sigma_0",
+                            y_label="(z_1 - prior_mu_1) / prior_sigma_1",
+                            density_uses_posterior=True,
+                            min_samples=min_samples,
+                            max_points=max_points,
+                            xlim=(-5.0, 5.0),
+                            ylim=(-5.0, 5.0),
+                        )
                     if not pga_source.empty:
                         pga_selector = (
                             np.isclose(pd.to_numeric(pga_source["timestep"], errors="coerce"), timestep)
@@ -3521,27 +4079,33 @@ def plot_aggregate_latent_density_outputs(
             if norm_source.empty or "other_node_actual_reward" not in norm_source.columns:
                 return
             target_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                f"Aggregate latent density: writing reward-pair density set {target_dir} "
+                f"with norm_rows={len(norm_source)}, pga_rows={len(pga_source)}",
+                flush=True,
+            )
             for timestep in timesteps:
                 for node in nodes:
                     selector = (
                         np.isclose(pd.to_numeric(norm_source["timestep"], errors="coerce"), timestep)
                         & np.isclose(pd.to_numeric(norm_source["observed_node"], errors="coerce"), node)
                     )
-                    plot_other_vs_observed_reward_density_grid(
-                        norm_source[selector].copy(),
-                        target_dir / f"prior_normalized_z_t{timestep}_observed_node_{node}.png",
-                        title=(
-                            f"Prior-normalized z, sigma={sigma:g}, t={timestep}, "
-                            f"observed node={node}{title_suffix}"
-                        ),
-                        x_label="(z_0 - prior_mu_0) / prior_sigma_0",
-                        y_label="(z_1 - prior_mu_1) / prior_sigma_1",
-                        density_uses_posterior=True,
-                        min_samples=min_samples,
-                        max_points=max_points,
-                        xlim=(-5.0, 5.0),
-                        ylim=(-5.0, 5.0),
-                    )
+                    if write_normalized_z_plots:
+                        plot_other_vs_observed_reward_density_grid(
+                            norm_source[selector].copy(),
+                            target_dir / f"prior_normalized_z_t{timestep}_observed_node_{node}.png",
+                            title=(
+                                f"Prior-normalized z, sigma={sigma:g}, t={timestep}, "
+                                f"observed node={node}{title_suffix}"
+                            ),
+                            x_label="(z_0 - prior_mu_0) / prior_sigma_0",
+                            y_label="(z_1 - prior_mu_1) / prior_sigma_1",
+                            density_uses_posterior=True,
+                            min_samples=min_samples,
+                            max_points=max_points,
+                            xlim=(-5.0, 5.0),
+                            ylim=(-5.0, 5.0),
+                        )
                     if not pga_source.empty and "other_node_actual_reward" in pga_source.columns:
                         pga_selector = (
                             np.isclose(pd.to_numeric(pga_source["timestep"], errors="coerce"), timestep)
@@ -3563,15 +4127,23 @@ def plot_aggregate_latent_density_outputs(
                             ylim=pga_ylim,
                         )
 
-        write_density_set(
-            target_dir=sigma_dir,
-            norm_source=norm_rows,
-            pga_source=pga_rows,
-            title_suffix="",
-        )
+        if keep_pooled_plots:
+            write_density_set(
+                target_dir=sigma_dir,
+                norm_source=norm_rows,
+                pga_source=pga_rows,
+                title_suffix="",
+            )
+        else:
+            print(
+                "Aggregate latent density: skipping pooled all-seed plots. "
+                "Use --keep-pooled-aggregate-density-plots to also write them.",
+                flush=True,
+            )
 
         seeds = sorted(pd.to_numeric(sigma_rows["seed"], errors="coerce").dropna().astype(int).unique())
         for seed in seeds:
+            print(f"Aggregate latent density: sigma={sigma:g}; seed={seed}", flush=True)
             seed_norm_rows = norm_rows[
                 np.isclose(pd.to_numeric(norm_rows["seed"], errors="coerce"), seed)
             ].copy()
@@ -3580,12 +4152,20 @@ def plot_aggregate_latent_density_outputs(
                 if not pga_rows.empty
                 else pd.DataFrame()
             )
-            write_density_set(
-                target_dir=sigma_dir / f"seed_{value_token(seed)}",
-                norm_source=seed_norm_rows,
-                pga_source=seed_pga_rows,
-                title_suffix=f", seed={seed}",
-            )
+            if keep_pooled_plots:
+                write_density_set(
+                    target_dir=sigma_dir / f"seed_{value_token(seed)}",
+                    norm_source=seed_norm_rows,
+                    pga_source=seed_pga_rows,
+                    title_suffix=f", seed={seed}",
+                )
+            elif "other_node_actual_reward" not in seed_norm_rows.columns:
+                print(
+                    "Aggregate latent density: not writing pooled seed-level plots by default, "
+                    "and this cached density table cannot write grouped beta/opp plots because "
+                    "other_node_actual_reward is missing.",
+                    flush=True,
+                )
             if not seed_norm_rows.empty:
                 for (_, _), param_norm_rows in seed_norm_rows.groupby(
                     ["family", "parameter_value"],
@@ -3594,6 +4174,11 @@ def plot_aggregate_latent_density_outputs(
                 ):
                     if param_norm_rows.empty:
                         continue
+                    print(
+                        f"Aggregate latent density: sigma={sigma:g}; seed={seed}; "
+                        f"{family_param_label(param_norm_rows.iloc[0])}",
+                        flush=True,
+                    )
                     param_dir = sigma_dir / f"seed_{value_token(seed)}" / param_density_folder_name(param_norm_rows.iloc[0])
                     if not seed_pga_rows.empty:
                         param_pga_rows = seed_pga_rows[
@@ -3729,6 +4314,13 @@ def run_one(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     task = jp.build_task(args.tree_size, args.tree_type, args.input_type)
     config = make_config(args, seed=seed, beta=beta, opportunity=opportunity, sigma=sigma)
+    model_name = jp.model_name_for(config, task)
+    weights_path = Path(config.model_dir) / f"{model_name}.msgpack"
+    progress_label = (
+        f"{family} {parameter_name}={parameter_value:g} beta={beta:g} "
+        f"opp={opportunity:g} sigma={sigma:g} seed={seed}"
+    )
+    print(f"{progress_label}: loading model {weights_path}", flush=True)
     model, params = jp.load_state_for_sim(config, task)
     rewards, streams, metadata = build_reward_combination_trials(
         np.asarray(task.reward_values, dtype=float),
@@ -3740,6 +4332,13 @@ def run_one(
         n_reward_combinations=int(args.n_reward_combinations),
         reward_combination_seed=int(seed),
     )
+    n_conditions = int(metadata["condition_index"].nunique()) if "condition_index" in metadata.columns else 0
+    print(
+        f"{progress_label}: generated {len(rewards)} total trial(s) "
+        f"from {n_conditions} reward condition(s) x {int(args.n_sample_sets)} sample set(s); "
+        f"nodes={int(task.num_nodes)}; streams_shape={tuple(streams.shape)}",
+        flush=True,
+    )
     latent_df, paid_latent_df = rollout_with_streams(
         model,
         params,
@@ -3750,11 +4349,19 @@ def run_one(
         seed_offset=int(round(10_000 * sigma) + round(beta) + round(10_000 * opportunity)),
         force_round_robin_observations=bool(args.force_round_robin_observations),
         force_first_observe_node=int(args.force_first_observe_node),
+        progress_label=progress_label,
     )
+    print(f"{progress_label}: enriching metadata and computing pairwise summaries", flush=True)
     paid_latents_with_metadata = enrich_paid_latents_with_metadata(paid_latent_df, metadata)
     pairwise = compute_pairwise_kl(latent_df, metadata)
     paid_pairwise = compute_pairwise_kl_by_paid_timestep(paid_latent_df, metadata)
     successive = compute_successive_timestep_kl(paid_latent_df, metadata)
+    print(
+        f"{progress_label}: pairwise_rows={len(pairwise)}, "
+        f"paid_pairwise_rows={len(paid_pairwise)}, successive_rows={len(successive)}, "
+        f"paid_latent_rows={len(paid_latents_with_metadata)}",
+        flush=True,
+    )
     for col, value in [
         ("family", family),
         ("parameter_name", parameter_name),
@@ -3846,6 +4453,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-pga-fitting",
+        action="store_true",
+        help=(
+            "Skip aggregate PGA fit/load and PGA score density plots. This still "
+            "allows normalized-z aggregate plots for the 2-node default task."
+        ),
+    )
+    parser.add_argument(
+        "--skip-aggregate-latent-density",
+        action="store_true",
+        help=(
+            "Skip the aggregate_latent_density_by_sigma output tree entirely. "
+            "Other diagnostics that use paid_latent_density_rows.csv, such as "
+            "trace-covariance spread plots, are still generated."
+        ),
+    )
+    parser.add_argument(
+        "--keep-pooled-aggregate-density-plots",
+        action="store_true",
+        help=(
+            "Also write the older pooled aggregate latent-density plots directly "
+            "under each sigma/ and sigma/seed_* folder. By default, only the "
+            "beta/opp-specific reward-grid folders are generated."
+        ),
+    )
+    parser.add_argument(
         "--analysis-diff-bin-width",
         type=float,
         default=1.0,
@@ -3930,8 +4563,15 @@ def main() -> None:
         successive_summary_path = outdir / "successive_timestep_kl_across_timesteps_summary.csv"
         if not pairwise_path.exists():
             raise FileNotFoundError(f"Missing existing pairwise CSV: {pairwise_path}")
+        print(f"Plot-only: reading pairwise CSV {pairwise_path}", flush=True)
         pairwise = pd.read_csv(pairwise_path)
+        print(f"Plot-only: pairwise rows={len(pairwise)}", flush=True)
         summary = pd.read_csv(summary_path) if summary_path.exists() else summarize(pairwise)[1]
+        print(
+            f"Plot-only: summary rows={len(summary)} from "
+            f"{summary_path if summary_path.exists() else 'fresh summarize(pairwise)'}",
+            flush=True,
+        )
         if any(spec["pairwise_col"] in pairwise.columns for spec in LATENT_METRIC_PLOT_SPECS) and any(
             spec["summary_mean"] not in summary.columns for spec in LATENT_METRIC_PLOT_SPECS
         ):
@@ -3940,7 +4580,9 @@ def main() -> None:
         paid_by_timestep = pd.DataFrame()
         paid_summary = pd.DataFrame()
         if paid_timestep_reward_pair_path.exists():
+            print(f"Plot-only: reading paid-timestep CSV {paid_timestep_reward_pair_path}", flush=True)
             paid_timestep_reward_pair = pd.read_csv(paid_timestep_reward_pair_path)
+            print(f"Plot-only: paid-timestep pairwise rows={len(paid_timestep_reward_pair)}", flush=True)
             by_timestep, paid_seed, paid_summary = summarize_paid_timestep_pairwise(
                 paid_timestep_reward_pair
             )
@@ -3949,6 +4591,7 @@ def main() -> None:
             paid_seed.to_csv(outdir / "pairwise_kl_across_paid_timesteps_by_seed.csv", index=False)
             paid_summary.to_csv(outdir / "pairwise_kl_across_paid_timesteps_summary.csv", index=False)
         elif paid_summary_path.exists():
+            print(f"Plot-only: reading paid summary CSV {paid_summary_path}", flush=True)
             paid_summary = pd.read_csv(paid_summary_path)
         else:
             print(
@@ -3959,7 +4602,9 @@ def main() -> None:
         successive_by_timestep = pd.DataFrame()
         successive_summary = pd.DataFrame()
         if successive_path.exists():
+            print(f"Plot-only: reading successive timestep CSV {successive_path}", flush=True)
             successive = pd.read_csv(successive_path)
+            print(f"Plot-only: successive rows={len(successive)}", flush=True)
             successive_by_timestep, successive_seed, successive_summary = summarize_successive_timestep_kl(
                 successive
             )
@@ -4002,16 +4647,34 @@ def main() -> None:
             )
         density_path = outdir / "paid_latent_density_rows.csv"
         if density_path.exists():
+            print(f"Plot-only: reading paid latent density CSV {density_path}", flush=True)
             density_rows = pd.read_csv(density_path)
-            plot_aggregate_latent_density_outputs(
+            print(f"Plot-only: paid latent density rows={len(density_rows)}", flush=True)
+            print("Plot-only: writing latent z_mu trace covariance spread plots.", flush=True)
+            write_latent_mu_trace_covariance_outputs(
                 density_rows,
                 outdir,
                 min_samples=int(args.min_samples),
-                max_points=int(args.latent_density_max_points),
-                pga_max_states=int(args.aggregate_pga_max_states),
-                pga_max_iters=int(args.aggregate_pga_max_iters),
-                reuse_pga_fits=bool(args.reuse_aggregate_pga_fits),
             )
+            if bool(args.skip_aggregate_latent_density):
+                print(
+                    "Plot-only: --skip-aggregate-latent-density is set; "
+                    "not writing aggregate_latent_density_by_sigma plots.",
+                    flush=True,
+                )
+            else:
+                plot_aggregate_latent_density_outputs(
+                    density_rows,
+                    outdir,
+                    min_samples=int(args.min_samples),
+                    max_points=int(args.latent_density_max_points),
+                    pga_max_states=int(args.aggregate_pga_max_states),
+                    pga_max_iters=int(args.aggregate_pga_max_iters),
+                    reuse_pga_fits=bool(args.reuse_aggregate_pga_fits),
+                    keep_pooled_plots=bool(args.keep_pooled_aggregate_density_plots),
+                    fit_pga=not bool(args.no_pga_fitting),
+                    write_normalized_z_plots=should_write_normalized_z_aggregate_plots(args),
+                )
         else:
             print(
                 "No paid_latent_density_rows.csv found; aggregate normalized-z/PGA "
@@ -4098,19 +4761,41 @@ def main() -> None:
         sigma_pair_trials_per_sigma=int(args.sigma_pair_trials_per_sigma),
         min_samples=int(args.min_samples),
     )
-    density_rows = build_paid_latent_density_frame(paid_latents)
+    density_task = jp.build_task(args.tree_size, args.tree_type, args.input_type)
+    density_rows = build_paid_latent_density_frame(paid_latents, path_map=density_task.path_map)
     if not density_rows.empty:
         density_rows.to_csv(outdir / "paid_latent_density_rows.csv", index=False)
-        print("Writing aggregate normalized-z and prior-normalized-PGA density plots.", flush=True)
-        plot_aggregate_latent_density_outputs(
+        print("Writing latent z_mu trace covariance spread plots.", flush=True)
+        write_latent_mu_trace_covariance_outputs(
             density_rows,
             outdir,
             min_samples=int(args.min_samples),
-            max_points=int(args.latent_density_max_points),
-            pga_max_states=int(args.aggregate_pga_max_states),
-            pga_max_iters=int(args.aggregate_pga_max_iters),
-            reuse_pga_fits=bool(args.reuse_aggregate_pga_fits),
         )
+        if bool(args.skip_aggregate_latent_density):
+            print(
+                "--skip-aggregate-latent-density is set; not writing "
+                "aggregate_latent_density_by_sigma plots.",
+                flush=True,
+            )
+        else:
+            print(
+                "Writing aggregate latent density plots "
+                f"(normalized_z={should_write_normalized_z_aggregate_plots(args)}, "
+                f"pga={not bool(args.no_pga_fitting)}).",
+                flush=True,
+            )
+            plot_aggregate_latent_density_outputs(
+                density_rows,
+                outdir,
+                min_samples=int(args.min_samples),
+                max_points=int(args.latent_density_max_points),
+                pga_max_states=int(args.aggregate_pga_max_states),
+                pga_max_iters=int(args.aggregate_pga_max_iters),
+                reuse_pga_fits=bool(args.reuse_aggregate_pga_fits),
+                keep_pooled_plots=bool(args.keep_pooled_aggregate_density_plots),
+                fit_pga=not bool(args.no_pga_fitting),
+                write_normalized_z_plots=should_write_normalized_z_aggregate_plots(args),
+            )
     if len(summary):
         print("Writing standard pairwise diagnostic plots.", flush=True)
         plot_all_metric_variants(

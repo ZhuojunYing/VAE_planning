@@ -248,18 +248,41 @@ def hyperboloid_exp_map(x: np.ndarray, v: np.ndarray) -> np.ndarray:
     return flat.reshape(out.shape)
 
 
-def karcher_mean_factor(x: np.ndarray, tol: float, max_iters: int) -> np.ndarray:
+def karcher_mean_factor(
+    x: np.ndarray,
+    tol: float,
+    max_iters: int,
+    progress_label: str = "",
+    progress_every: int = 10,
+) -> np.ndarray:
     extrinsic = np.mean(x, axis=0)
     mean = normalize_hyperboloid(extrinsic)
     if not np.isfinite(mean).all():
         mean = x[0].copy()
-    for _ in range(int(max_iters)):
+    last_update_norm = float("nan")
+    for iter_i in range(int(max_iters)):
         logs = hyperboloid_log_map(mean[None, :], x)
         update = np.mean(logs, axis=0)
         update_norm = math.sqrt(max(float(lorentz_dot(update, update)), 0.0))
+        last_update_norm = update_norm
+        if progress_label and (
+            iter_i == 0
+            or (iter_i + 1) % max(int(progress_every), 1) == 0
+            or update_norm < tol
+        ):
+            print(
+                f"{progress_label}: Karcher iter {iter_i + 1}/{int(max_iters)} "
+                f"update_norm={update_norm:.6g}",
+                flush=True,
+            )
         if update_norm < tol:
             break
         mean = hyperboloid_exp_map(mean[None, :], update[None, :])[0]
+    if progress_label:
+        print(
+            f"{progress_label}: Karcher done; final_update_norm={last_update_norm:.6g}",
+            flush=True,
+        )
     return mean
 
 
@@ -306,16 +329,35 @@ class ProductGaussianPGA:
     explained_variance: Optional[np.ndarray] = None
     explained_variance_ratio: Optional[np.ndarray] = None
     singular_values: Optional[np.ndarray] = None
+    progress_label: str = ""
+    progress_every: int = 10
 
     def fit(self, mu: np.ndarray, sigma: np.ndarray) -> "ProductGaussianPGA":
         mu, sigma = validate_mu_sigma(mu, sigma)
         xh = halfplane_to_hyperboloid(mu, sigma)
         latent_dim = mu.shape[1]
+        if self.progress_label:
+            print(
+                f"{self.progress_label}: fitting PGA with {mu.shape[0]} state(s), "
+                f"latent_dim={latent_dim}, max_iters={self.max_iters}",
+                flush=True,
+            )
         means = []
         bases = []
         tangent_parts = []
         for latent_i in range(latent_dim):
-            mean_i = karcher_mean_factor(xh[:, latent_i, :], self.tol, self.max_iters)
+            factor_label = (
+                f"{self.progress_label}: factor {latent_i + 1}/{latent_dim}"
+                if self.progress_label
+                else ""
+            )
+            mean_i = karcher_mean_factor(
+                xh[:, latent_i, :],
+                self.tol,
+                self.max_iters,
+                progress_label=factor_label,
+                progress_every=int(self.progress_every),
+            )
             basis_i = tangent_basis_at(mean_i)
             logs = hyperboloid_log_map(mean_i[None, :], xh[:, latent_i, :])
             coords = np.stack(
@@ -344,6 +386,8 @@ class ProductGaussianPGA:
         self.explained_variance_ratio = (
             eigenvalues[: self.n_components] / total if total > 0 else np.zeros(self.n_components)
         )
+        if self.progress_label:
+            print(f"{self.progress_label}: PGA SVD done", flush=True)
         return self
 
     def tangent_coordinates(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
