@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  bash analysis/run_bandit_simplex_weights_jax.sh [analysis args...]
+
+Examples:
+  bash analysis/run_bandit_simplex_weights_jax.sh default \
+    --vary-memory-lambda-values "10,20,80" \
+    --vary-opportunity-values "0.06,0.2,0.4" \
+    --sigmas "0,0.5,1.0,2.0" \
+    --seeds "1,2,3" \
+    --n-trials 2000 \
+    --rollout-mode round_robin
+
+  bash analysis/run_bandit_simplex_weights_jax.sh default --plot-only
+
+If no analysis args are provided, this wrapper runs:
+  analysis/plot_bandit_simplex_weights_jax.py default
+using the Python script's defaults.
+
+Optional environment overrides:
+  PYTHON_BIN=vae_env/bin/python
+  MPLCONFIGDIR=/tmp/matplotlib
+  OMP_NUM_THREADS=1
+  OPENBLAS_NUM_THREADS=1
+  MKL_NUM_THREADS=1
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+mkdir -p logs
+
+PYTHON_BIN="${PYTHON_BIN:-vae_env/bin/python}"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "Python executable not found or not executable: ${PYTHON_BIN}" >&2
+  exit 1
+fi
+
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+
+if (($# == 0)); then
+  set -- default
+fi
+
+echo "Running bandit/revisit simplex-weight analysis locally"
+echo "Repository: ${REPO_ROOT}"
+echo "Python: ${PYTHON_BIN}"
+echo "MPLCONFIGDIR: ${MPLCONFIGDIR}"
+echo "OMP_NUM_THREADS: ${OMP_NUM_THREADS}"
+echo "OPENBLAS_NUM_THREADS: ${OPENBLAS_NUM_THREADS}"
+echo "MKL_NUM_THREADS: ${MKL_NUM_THREADS}"
+echo "Host: $(hostname)"
+echo "Started: $(date)"
+echo "Arguments: $*"
+
+"${PYTHON_BIN}" analysis/plot_bandit_simplex_weights_jax.py "$@"
+
+echo "Finished: $(date)"

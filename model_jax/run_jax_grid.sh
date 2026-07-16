@@ -14,31 +14,34 @@ if ! {
     { [ "$#" -ge 14 ] && is_train_arg "${11}"; } ||
     { [ "$#" -ge 12 ] && is_train_arg "${9}"; }
 }; then
-    echo "Usage legacy: $0 beta_min beta_max beta_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
-    echo "Usage opp/lambda lists: $0 beta_min beta_max beta_steps alpha_min alpha_max alpha_steps opportunity_list lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
-    echo "Usage beta/opp/lambda lists: $0 beta_list alpha_min alpha_max alpha_steps opportunity_list lambda_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
+    echo "Usage legacy: $0 memory_lambda_min memory_lambda_max memory_lambda_steps alpha_min alpha_max alpha_steps opportunity_min opportunity_max opportunity_steps loss_scale_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
+    echo "Usage opp/loss-scale lists: $0 memory_lambda_min memory_lambda_max memory_lambda_steps alpha_min alpha_max alpha_steps opportunity_list loss_scale_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
+    echo "Usage memory-lambda/opp/loss-scale lists: $0 memory_lambda_list alpha_min alpha_max alpha_steps opportunity_list loss_scale_list seed_min seed_max train input_type tree_size expansion_decision_version [model_variant] [tree_config] [rnn_units] [latent_dim] [num_updates] [num_envs] [n_sim_trials] [extra_jax_args...]"
+    echo "The first positional range/list is the direct paid-KL memory lambda. The old inverse beta convention is no longer used."
     echo "Pass --sigma VALUE or --observation-sigma VALUE in extra_jax_args to add Gaussian observation noise."
     echo "Pass --sigma-list 0,0.25,0.5 in extra_jax_args to submit one Slurm job per sigma value."
     echo "Sampled-lambda critic defaults to q. Override with --sampled-lambda-critic value or SAMPLED_LAMBDA_CRITIC=value."
     echo "Add --allow-node-revisit in extra_jax_args, or set ALLOW_NODE_REVISIT=1, to keep observed nodes legal."
     echo "Revisit runs default to --max-observations-before-stop 10 and --num-steps 11 unless overridden."
     echo "Add --pay-kl-on-stop in extra_jax_args, or set PAY_KL_ON_STOP=1, to pay pending KL on terminal stop; filenames add _stop_paid."
+    echo "Add --observer-only in extra_jax_args, or set CHOICE_AT_END_ONLY=1, to force terminal choice at the observation cap; filenames add _observer_endchoice."
+    echo "Add --critic-huber-delta and --advantage-clip in extra_jax_args for PPO stabilization."
     exit 1
 fi
 
 if [ "$#" -ge 16 ] && is_train_arg "${13}"; then
     arg_mode="legacy"
 elif [ "$#" -ge 14 ] && is_train_arg "${11}"; then
-    arg_mode="opportunity_lambda_lists"
+    arg_mode="opportunity_loss_scale_lists"
 else
-    arg_mode="beta_opportunity_lambda_lists"
+    arg_mode="lambda_opportunity_loss_scale_lists"
 fi
 
 if [ "$arg_mode" = "legacy" ]; then
-    beta_arg=$1; beta_max=$2; beta_steps=$3
+    memory_lambda_arg=$1; memory_lambda_max=$2; memory_lambda_steps=$3
     alpha_min=$4; alpha_max=$5; alpha_steps=$6
     opportunity_arg=$7; opportunity_max=$8; opportunity_steps=$9
-    lambda_str=${10}; seed_min=${11}; seed_max=${12}
+    loss_scale_str=${10}; seed_min=${11}; seed_max=${12}
     train=${13}; input_type=${14}; tree_size=${15}; expansion_decision_version=${16}
     model_variant=${17:-"vae"}; tree_config=${18:-""}; rnn_units=${19:-"64"}; latent_dim=${20:-"32"}
     num_updates=${21:-"24000"}; num_envs=${22:-"200"}
@@ -49,11 +52,11 @@ if [ "$arg_mode" = "legacy" ]; then
     else
         extra_args=("${@:24}")
     fi
-elif [ "$arg_mode" = "opportunity_lambda_lists" ]; then
-    beta_arg=$1; beta_max=$2; beta_steps=$3
+elif [ "$arg_mode" = "opportunity_loss_scale_lists" ]; then
+    memory_lambda_arg=$1; memory_lambda_max=$2; memory_lambda_steps=$3
     alpha_min=$4; alpha_max=$5; alpha_steps=$6
     opportunity_arg=$7; opportunity_max=""; opportunity_steps=""
-    lambda_str=$8; seed_min=$9; seed_max=${10}
+    loss_scale_str=$8; seed_min=$9; seed_max=${10}
     train=${11}; input_type=${12}; tree_size=${13}; expansion_decision_version=${14}
     model_variant=${15:-"vae"}; tree_config=${16:-""}; rnn_units=${17:-"64"}; latent_dim=${18:-"32"}
     num_updates=${19:-"24000"}; num_envs=${20:-"200"}
@@ -65,10 +68,10 @@ elif [ "$arg_mode" = "opportunity_lambda_lists" ]; then
         extra_args=("${@:22}")
     fi
 else
-    beta_arg=$1; beta_max=""; beta_steps=""
+    memory_lambda_arg=$1; memory_lambda_max=""; memory_lambda_steps=""
     alpha_min=$2; alpha_max=$3; alpha_steps=$4
     opportunity_arg=$5; opportunity_max=""; opportunity_steps=""
-    lambda_str=$6; seed_min=$7; seed_max=$8
+    loss_scale_str=$6; seed_min=$7; seed_max=$8
     train=$9; input_type=${10}; tree_size=${11}; expansion_decision_version=${12}
     model_variant=${13:-"vae"}; tree_config=${14:-""}; rnn_units=${15:-"64"}; latent_dim=${16:-"32"}
     num_updates=${17:-"24000"}; num_envs=${18:-"200"}
@@ -112,6 +115,14 @@ case "${ALLOW_NODE_REVISIT:-}" in
         ;;
 esac
 
+case "${CHOICE_AT_END_ONLY:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+        if ! has_any_extra_arg "--choice-at-end-only" "--observer-only" "--observer-end-choice"; then
+            extra_args+=("--observer-only")
+        fi
+        ;;
+esac
+
 if ! has_any_extra_arg "--sampled-lambda-critic" "--critic" "--critic-type" "--critic-mode"; then
     extra_args+=("--sampled-lambda-critic" "${SAMPLED_LAMBDA_CRITIC:-q}")
 fi
@@ -124,8 +135,8 @@ jax_slurm_time=${JAX_SLURM_TIME:-24:00:00}
 
 echo "JAX Slurm resources: cpus-per-task=${jax_cpus_per_task}, mem=${jax_mem}, time=${jax_slurm_time}"
 
-python - "$beta_arg" "$beta_max" "$beta_steps" "$alpha_min" "$alpha_max" "$alpha_steps" \
-    "$opportunity_arg" "$opportunity_max" "$opportunity_steps" "$lambda_str" \
+python - "$memory_lambda_arg" "$memory_lambda_max" "$memory_lambda_steps" "$alpha_min" "$alpha_max" "$alpha_steps" \
+    "$opportunity_arg" "$opportunity_max" "$opportunity_steps" "$loss_scale_str" \
     "$seed_min" "$seed_max" "$train" "$input_type" "$tree_size" "$expansion_decision_version" \
     "$model_variant" "$tree_config" "$rnn_units" "$latent_dim" "$num_updates" "$num_envs" \
     "$n_sim_trials" "$jax_cpus_per_task" "$jax_mem" "$jax_slurm_time" "${extra_args[@]}" <<'PY' |
@@ -136,10 +147,10 @@ import sys
 import numpy as np
 
 (
-    beta_arg, beta_max, beta_steps,
+    memory_lambda_arg, memory_lambda_max, memory_lambda_steps,
     alpha_min, alpha_max, alpha_steps,
     opportunity_arg, opportunity_max, opportunity_steps,
-    lambda_str, seed_min, seed_max, train, input_type, tree_size,
+    loss_scale_str, seed_min, seed_max, train, input_type, tree_size,
     expansion_decision_version, model_variant, tree_config, rnn_units, latent_dim,
     num_updates, num_envs, n_sim_trials, jax_cpus_per_task, jax_mem, jax_slurm_time, *extra_args
 ) = sys.argv[1:]
@@ -202,10 +213,10 @@ def extra_int(flag, default):
             return int(text.split("=", 1)[1])
     return int(default)
 
-betas = parse_range_or_list(beta_arg, beta_max, beta_steps)
+memory_lambdas = parse_range_or_list(memory_lambda_arg, memory_lambda_max, memory_lambda_steps)
 alphas = list(np.linspace(float(alpha_min), float(alpha_max), int(alpha_steps)))
 opps = parse_range_or_list(opportunity_arg, opportunity_max, opportunity_steps)
-lambdas = parse_list(lambda_str)
+loss_scales = parse_list(loss_scale_str)
 seeds = range(int(seed_min), int(seed_max) + 1)
 sigma_list_raw, extra_args = pop_extra_option(
     extra_args,
@@ -229,7 +240,7 @@ num_steps = extra_int(
 steps_per_epoch = int(num_updates) * int(num_envs) * num_steps // 120
 steps_per_epoch = max(steps_per_epoch, int(num_envs) * num_steps)
 
-for seed, beta, alpha, lambda_, opp, sigma in itertools.product(seeds, betas, alphas, lambdas, opps, sigmas):
+for seed, memory_lambda, alpha, loss_scale, opp, sigma in itertools.product(seeds, memory_lambdas, alphas, loss_scales, opps, sigmas):
     sigma_args = [] if sigma is None else ["--sigma", str(sigma)]
     cmd = [
         "sbatch",
@@ -239,7 +250,7 @@ for seed, beta, alpha, lambda_, opp, sigma in itertools.product(seeds, betas, al
         "--mem", jax_mem,
         "--output=logs/slurm-%j.out",
         "model_jax/run_jax_model.sh",
-        str(lambda_), str(alpha), str(beta),
+        str(loss_scale), str(alpha), str(memory_lambda),
         "outputs/jax_models/", "outputs/jax_simulations/", n_sim_trials,
         input_type, str(seed), train, str(opp), tree_size,
         expansion_decision_version, model_variant, tree_config, rnn_units, latent_dim,

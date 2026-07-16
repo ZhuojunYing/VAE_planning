@@ -10,8 +10,8 @@ objective in ``model/``.  The important parity points are:
   revisit mode that keeps them legal;
 * an LSTM state, Gaussian posterior, timestep Gaussian prior, decoder, joint
   expansion policy, action-value critic, and reward probe;
-* KL scaling semantics match TensorFlow: the command-line beta is an inverse
-  KL scale and the effective KL multiplier is ``1 / beta``;
+* KL scaling uses two explicit weights: ``loss_scale`` for reward/action losses
+  and ``memory_lambda`` for the direct paid-KL multiplier;
 * expansion return targets support the TensorFlow modes controlled by
   ``EXPANSION_RETURN_TARGET``: ``lambda`` uses sampled-reward counterfactual
   bootstrap targets, ``sampled_lambda`` uses trajectory lambda-returns, and
@@ -97,9 +97,9 @@ class TaskSpec:
 
 @dataclass(frozen=True)
 class RunConfig:
-    lambda_: float
+    loss_scale: float
     alpha: float
-    beta: float
+    memory_lambda: float
     model_dir: str
     epochs: int
     input_type: str
@@ -138,7 +138,12 @@ class RunConfig:
     kl_annealing_epochs: int
     node_coverage_aux_coef: float
     node_coverage_aux_epochs: int
+    critic_huber_delta: float
+    advantage_clip: float
+    learning_rate: float = 5e-4
+    min_learning_rate: float | None = None
     pay_kl_on_stop: bool = False
+    choice_at_end_only: bool = False
     save_every_update: bool = False
 
 
@@ -472,9 +477,10 @@ def model_name_for(config: RunConfig, task: TaskSpec) -> str:
         else ""
     )
     stop_paid_label = "_stop_paid" if bool(config.pay_kl_on_stop) else ""
+    observer_label = "_observer_endchoice" if bool(config.choice_at_end_only) else ""
     visited_lstm_label = "_visitedidx" if use_visited_lstm_input_for_task(task) else ""
     return (
-        f"lambda_{config.lambda_}_alpha_{config.alpha}_beta_{config.beta}_"
+        f"loss_scale_{config.loss_scale}_alpha_{config.alpha}_lambda_{config.memory_lambda}_"
         f"opportunity_{config.opportunity_cost}_expansion_{config.expansion_decision_version}_"
         f"{model_variant_label(config.model_variant)}"
         f"seed_{config.seed}_{tree_label}_{architecture_file_label(config.rnn_units, config.latent_dim)}"
@@ -484,6 +490,60 @@ def model_name_for(config: RunConfig, task: TaskSpec) -> str:
         f"{node_coverage_aux_label}"
         f"{sampled_lambda_critic_label}"
         f"{stop_paid_label}"
+        f"{observer_label}"
+        f"{visited_lstm_label}"
+    )
+
+
+def legacy_model_name_for(config: RunConfig, task: TaskSpec) -> str:
+    """Older planning checkpoints used lambda=loss-scale and beta=memory weight."""
+    tree_label = f"{config.tree_size}n{task.tree_name_suffix}"
+    revisit_label = (
+        f"_revisit_maxobs_{config.max_observations_before_stop}"
+        if config.allow_node_revisit
+        else ""
+    )
+    sigma_label = (
+        f"_obs_sigma_{config.observation_sigma:g}"
+        if abs(float(config.observation_sigma)) > 1e-12
+        else ""
+    )
+    kl_schedule_label = (
+        f"_klstart_{config.kl_start_multiplier:g}_klanneal_{config.kl_annealing_epochs}"
+        if (
+            abs(float(config.kl_start_multiplier) - 1.0) > 1e-12
+            or int(config.kl_annealing_epochs) > 0
+        )
+        else ""
+    )
+    node_coverage_aux_label = (
+        f"_nodecov_{config.node_coverage_aux_coef:g}_anneal_{config.node_coverage_aux_epochs}"
+        if abs(float(config.node_coverage_aux_coef)) > 1e-12
+        else ""
+    )
+    sampled_lambda_critic_label = (
+        "_vcritic"
+        if (
+            normalize_return_target_mode(config.return_target_mode) == "sampled_lambda"
+            and str(config.sampled_lambda_critic).strip().lower() in {"value", "v", "scalar_v"}
+        )
+        else ""
+    )
+    stop_paid_label = "_stop_paid" if bool(config.pay_kl_on_stop) else ""
+    observer_label = "_observer_endchoice" if bool(config.choice_at_end_only) else ""
+    visited_lstm_label = "_visitedidx" if use_visited_lstm_input_for_task(task) else ""
+    return (
+        f"lambda_{config.loss_scale}_alpha_{config.alpha}_beta_{config.memory_lambda}_"
+        f"opportunity_{config.opportunity_cost}_expansion_{config.expansion_decision_version}_"
+        f"{model_variant_label(config.model_variant)}"
+        f"seed_{config.seed}_{tree_label}_{architecture_file_label(config.rnn_units, config.latent_dim)}"
+        f"{revisit_label}"
+        f"{sigma_label}"
+        f"{kl_schedule_label}"
+        f"{node_coverage_aux_label}"
+        f"{sampled_lambda_critic_label}"
+        f"{stop_paid_label}"
+        f"{observer_label}"
         f"{visited_lstm_label}"
     )
 
@@ -647,9 +707,9 @@ class PlanningVAE(nn.Module):
     max_observations_before_stop: int
     opportunity_cost: float
     observation_sigma: float
-    lambda_: float
+    loss_scale: float
     alpha: float
-    beta: float
+    memory_lambda: float
     reward_feature_dim_override: int = 0
     include_visited_lstm_input: bool = False
     latent_perturb_mode: str = "none"
@@ -660,6 +720,7 @@ class PlanningVAE(nn.Module):
     lstm_context_pca_mean: tuple[float, ...] = ()
     lstm_context_pca_components: tuple[tuple[float, ...], ...] = ()
     pay_kl_on_stop: bool = False
+    choice_at_end_only: bool = False
 
     def reward_feature_dim(self) -> int:
         if int(self.reward_feature_dim_override) > 0:
@@ -879,8 +940,6 @@ class PlanningVAE(nn.Module):
             q_values = jnp.zeros_like(logits)
         observed_count = jnp.sum(carry.observed, axis=-1, keepdims=True)
         min_observations = 1.0 if self.expansion_decision_version == "decoder" else 0.0
-        can_stop = (observed_count >= min_observations).astype(jnp.float32)
-        terminal_invalid = (1.0 - can_stop) * jnp.ones((batch_size, self.num_paths), dtype=jnp.float32)
         observation_limit_reached = (
             carry.step_index[:, None] >= int(self.max_observations_before_stop)
         )
@@ -892,6 +951,13 @@ class PlanningVAE(nn.Module):
             jnp.ones_like(carry.observed),
             base_observe_invalid,
         )
+        legal_observe_count = jnp.sum(1.0 - observe_invalid, axis=-1, keepdims=True)
+        no_observe_available = legal_observe_count <= 0.0
+        observer_end_reached = observation_limit_reached | no_observe_available
+        can_stop = (observed_count >= min_observations).astype(jnp.float32)
+        if bool(self.choice_at_end_only):
+            can_stop = can_stop * observer_end_reached.astype(jnp.float32)
+        terminal_invalid = (1.0 - can_stop) * jnp.ones((batch_size, self.num_paths), dtype=jnp.float32)
         decision_mask = jnp.concatenate([observe_invalid, terminal_invalid], axis=-1)
         legal_mask = (1.0 - decision_mask) * active_2
         masked_logits = logits + decision_mask * -1e9
@@ -1177,7 +1243,7 @@ def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) ->
     # TensorFlow computes schedules once per epoch and reuses that value for
     # every batch in the epoch. Keep the JAX schedule epoch-discrete too.
     epoch = update_idx // max(updates_per_epoch, 1)
-    target_beta = 1.0 / config.beta
+    target_beta = config.memory_lambda
     if int(config.kl_annealing_epochs) > 0:
         epoch_value = jnp.asarray(epoch, dtype=jnp.float32)
         kl_progress = jnp.minimum(
@@ -1230,11 +1296,17 @@ def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) ->
     )
 
 
-def learning_rate_at(step: jax.Array, total_steps: int) -> jax.Array:
+def learning_rate_at(
+    step: jax.Array,
+    total_steps: int,
+    peak_learning_rate: float = 5e-4,
+    min_learning_rate: float | None = None,
+) -> jax.Array:
     step = jnp.asarray(step)
     progress = jnp.minimum(step.astype(jnp.float32) / float(max(total_steps, 1)), 1.0)
-    peak = jnp.asarray(5e-4, dtype=jnp.float32)
-    floor = peak * 0.1
+    peak = jnp.asarray(float(peak_learning_rate), dtype=jnp.float32)
+    floor_value = float(min_learning_rate) if min_learning_rate is not None else float(peak_learning_rate) * 0.1
+    floor = jnp.asarray(floor_value, dtype=jnp.float32)
     return floor + 0.5 * (peak - floor) * (1.0 + jnp.cos(jnp.pi * progress))
 
 
@@ -1387,6 +1459,7 @@ def counterfactual_bootstrap_q_targets(
     min_observations_before_stop: float,
     allow_node_revisit: bool,
     max_observations_before_stop: int,
+    choice_at_end_only: bool,
 ) -> jax.Array:
     step_count, batch_size, time_steps = transitions.observed_before.shape
     reward_prior_mean = jnp.mean(reward_values)
@@ -1458,11 +1531,6 @@ def counterfactual_bootstrap_q_targets(
         ).reshape((step_count, batch_size, time_steps + path_map.shape[0]))
 
         next_observed_count = jnp.sum(next_observed, axis=-1, keepdims=True)
-        next_can_stop = (next_observed_count >= float(min_observations_before_stop)).astype(jnp.float32)
-        next_terminal_invalid = (
-            (1.0 - next_can_stop)
-            * jnp.ones((step_count, batch_size, path_map.shape[0]), dtype=jnp.float32)
-        )
         next_observation_count = transitions.step_index + 1
         next_observation_limit_reached = (
             next_observation_count[:, :, None] >= int(max_observations_before_stop)
@@ -1474,6 +1542,16 @@ def counterfactual_bootstrap_q_targets(
             next_observation_limit_reached,
             jnp.ones_like(next_observed),
             base_next_observe_invalid,
+        )
+        next_legal_observe_count = jnp.sum(1.0 - next_observe_invalid, axis=-1, keepdims=True)
+        next_no_observe_available = next_legal_observe_count <= 0.0
+        next_observer_end_reached = next_observation_limit_reached | next_no_observe_available
+        next_can_stop = (next_observed_count >= float(min_observations_before_stop)).astype(jnp.float32)
+        if bool(choice_at_end_only):
+            next_can_stop = next_can_stop * next_observer_end_reached.astype(jnp.float32)
+        next_terminal_invalid = (
+            (1.0 - next_can_stop)
+            * jnp.ones((step_count, batch_size, path_map.shape[0]), dtype=jnp.float32)
         )
         next_decision_mask = jnp.concatenate([next_observe_invalid, next_terminal_invalid], axis=-1)
         next_active = transitions.valid[:, :, None] * has_next_decision[:, :, None]
@@ -1557,6 +1635,7 @@ def apply_expansion_return_targets(
             min_observations,
             config.allow_node_revisit,
             config.max_observations_before_stop,
+            config.choice_at_end_only,
         )
         selected_q_target = jnp.take_along_axis(
             q_targets,
@@ -1567,6 +1646,25 @@ def apply_expansion_return_targets(
         q_targets=jax.lax.stop_gradient(q_targets),
         selected_q_target=jax.lax.stop_gradient(selected_q_target),
     )
+
+
+def critic_error_loss(error: jax.Array, huber_delta: float) -> jax.Array:
+    """Squared critic loss, optionally Huberized for large target errors."""
+    if float(huber_delta) <= 0.0:
+        return jnp.square(error)
+    delta = jnp.asarray(float(huber_delta), dtype=error.dtype)
+    abs_error = jnp.abs(error)
+    quadratic = jnp.minimum(abs_error, delta)
+    linear = abs_error - quadratic
+    return 0.5 * jnp.square(quadratic) + delta * linear
+
+
+def clip_advantages(advantages: jax.Array, clip_value: float) -> jax.Array:
+    """Clip PPO advantages when a positive threshold is configured."""
+    if float(clip_value) <= 0.0:
+        return advantages
+    bound = jnp.asarray(float(clip_value), dtype=advantages.dtype)
+    return jnp.clip(advantages, -bound, bound)
 
 
 def fixed_sampled_lambda_targets(
@@ -1612,6 +1710,7 @@ def fixed_sampled_lambda_targets(
         config.lambda_return,
     )
     advantages = (selected_q_target - old_target_state_values) * transitions.valid
+    advantages = clip_advantages(advantages, config.advantage_clip) * transitions.valid
     return jax.lax.stop_gradient(selected_q_target), jax.lax.stop_gradient(advantages)
 
 
@@ -1779,7 +1878,7 @@ def cached_expansion_ppo_loss(
     params,
     batch: CachedExpansionPPOData,
     schedule: ScheduleValues,
-    lambda_: float,
+    loss_scale: float,
 ) -> jax.Array:
     flat_input = batch.expansion_input.reshape((-1, batch.expansion_input.shape[-1]))
     logits = model.apply(
@@ -1817,8 +1916,8 @@ def cached_expansion_ppo_loss(
         batch.coverage_mask,
     )
     return (
-        expansion_loss * float(lambda_)
-        + schedule.node_coverage_aux_coef * float(lambda_) * coverage_aux_loss
+        expansion_loss * float(loss_scale)
+        + schedule.node_coverage_aux_coef * float(loss_scale) * coverage_aux_loss
     )
 
 
@@ -2035,7 +2134,7 @@ def create_train_state(model: PlanningVAE, config: RunConfig, task: TaskSpec, rn
     )
     dummy_schedule = ScheduleValues(
         current_alpha=1.0,
-        current_beta=1.0 / config.beta,
+        current_beta=config.memory_lambda,
         current_critic_coef=0.1,
         expansion_epsilon=0.0,
         expansion_entropy_coef=1.0,
@@ -2056,7 +2155,12 @@ def create_train_state(model: PlanningVAE, config: RunConfig, task: TaskSpec, rn
             method=PlanningVAE.value_critic_values,
         )["params"]
         params = merge_missing_param_subtrees(params, value_params)
-    schedule = lambda step: learning_rate_at(step, total_updates * optimizer_steps_per_update(config))
+    schedule = lambda step: learning_rate_at(
+        step,
+        total_updates * optimizer_steps_per_update(config),
+        config.learning_rate,
+        config.min_learning_rate,
+    )
     tx = optax.chain(
         optax.clip_by_global_norm(10.0),
         optax.adamw(learning_rate=schedule, weight_decay=1e-4),
@@ -2300,6 +2404,7 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
             rollout_old_logp: jax.Array,
             advantages: jax.Array,
         ):
+            advantages = clip_advantages(advantages, config.advantage_clip) * transitions.valid
             weights = compute_policy_weights(transitions, path_map, task.num_nodes)
             ratio = jnp.exp(jnp.clip(transitions.log_prob - rollout_old_logp, -10.0, 10.0))
             clipped_ratio = jnp.clip(ratio, 1.0 - schedule.ppo_clip, 1.0 + schedule.ppo_clip)
@@ -2320,7 +2425,10 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
             if config.return_target_mode == "sampled_lambda":
                 if use_sampled_lambda_value_critic(config):
                     critic_err = (
-                        jnp.square(transitions.policy_value_pred - transitions.selected_q_target)
+                        critic_error_loss(
+                            transitions.policy_value_pred - transitions.selected_q_target,
+                            config.critic_huber_delta,
+                        )
                         * transitions.valid
                     )
                     critic_loss = jnp.sum(critic_err) / (jnp.sum(transitions.valid) + 1e-6)
@@ -2333,11 +2441,23 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
                         )
                         * transitions.valid[:, :, None]
                     )
-                    critic_err = jnp.square(transitions.q_values - transitions.q_targets) * critic_mask
+                    critic_err = (
+                        critic_error_loss(
+                            transitions.q_values - transitions.q_targets,
+                            config.critic_huber_delta,
+                        )
+                        * critic_mask
+                    )
                     critic_loss = jnp.sum(critic_err) / (jnp.sum(critic_mask) + 1e-6)
             else:
                 critic_mask = transitions.legal_mask
-                critic_err = jnp.square(transitions.q_values - transitions.q_targets) * critic_mask
+                critic_err = (
+                    critic_error_loss(
+                        transitions.q_values - transitions.q_targets,
+                        config.critic_huber_delta,
+                    )
+                    * critic_mask
+                )
                 critic_loss = jnp.sum(critic_err) / (jnp.sum(critic_mask) + 1e-6)
             information_loss = jnp.mean(transitions.paid_kl)
             reconstruction_loss = jnp.mean(transitions.reconstruction_loss)
@@ -2358,17 +2478,17 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
             )
             total_loss = (
                 information_loss * schedule.current_beta
-                + action_loss * config.lambda_
-                + expansion_loss * config.lambda_
-                + critic_loss * config.lambda_ * schedule.current_critic_coef
+                + action_loss * config.loss_scale
+                + expansion_loss * config.loss_scale
+                + critic_loss * config.loss_scale * schedule.current_critic_coef
                 + reconstruction_loss * config.alpha
                 + probe_loss
             )
             expansion_head_loss = (
-                expansion_loss * config.lambda_
-                + critic_loss * config.lambda_ * schedule.current_critic_coef
-                + action_loss * config.lambda_
-                + schedule.node_coverage_aux_coef * config.lambda_ * node_coverage_aux_loss
+                expansion_loss * config.loss_scale
+                + critic_loss * config.loss_scale * schedule.current_critic_coef
+                + action_loss * config.loss_scale
+                + schedule.node_coverage_aux_coef * config.loss_scale * node_coverage_aux_loss
             )
             metrics_parts = aggregate_best_value_metrics(transitions, path_map, task.num_nodes)
             coverage_metrics = aggregate_observation_coverage_metrics(transitions, path_map)
@@ -2401,6 +2521,8 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
                 learning_rate=learning_rate_at(
                     train_state.step,
                     total_updates * optimizer_steps_per_update(config),
+                    config.learning_rate,
+                    config.min_learning_rate,
                 ),
                 continue_best_sums=metrics_parts[0],
                 continue_best_counts=metrics_parts[1],
@@ -2581,7 +2703,7 @@ def build_update_fn(model: PlanningVAE, task: TaskSpec, config: RunConfig, total
                     replace_param_subtree(params, "expansion_head", expansion_head_params),
                     minibatch,
                     schedule,
-                    config.lambda_,
+                    config.loss_scale,
                 )
 
             def ppo_expansion_only_epoch(state_rng, _):
@@ -2884,6 +3006,7 @@ def build_update_component_profile_fns(
                 target_key,
             )
             advantages = jax.lax.stop_gradient(transitions.selected_q_target - transitions.policy_value_pred)
+        advantages = clip_advantages(advantages, config.advantage_clip) * transitions.valid
         weights = compute_policy_weights(transitions, path_map, task.num_nodes)
         ratio = jnp.exp(jnp.clip(transitions.log_prob - rollout_old_logp, -10.0, 10.0))
         clipped_ratio = jnp.clip(ratio, 1.0 - schedule.ppo_clip, 1.0 + schedule.ppo_clip)
@@ -2904,7 +3027,10 @@ def build_update_component_profile_fns(
         if config.return_target_mode == "sampled_lambda":
             if use_sampled_lambda_value_critic(config):
                 critic_err = (
-                    jnp.square(transitions.policy_value_pred - transitions.selected_q_target)
+                    critic_error_loss(
+                        transitions.policy_value_pred - transitions.selected_q_target,
+                        config.critic_huber_delta,
+                    )
                     * transitions.valid
                 )
                 critic_loss = jnp.sum(critic_err) / (jnp.sum(transitions.valid) + 1e-6)
@@ -2917,11 +3043,23 @@ def build_update_component_profile_fns(
                     )
                     * transitions.valid[:, :, None]
                 )
-                critic_err = jnp.square(transitions.q_values - transitions.q_targets) * critic_mask
+                critic_err = (
+                    critic_error_loss(
+                        transitions.q_values - transitions.q_targets,
+                        config.critic_huber_delta,
+                    )
+                    * critic_mask
+                )
                 critic_loss = jnp.sum(critic_err) / (jnp.sum(critic_mask) + 1e-6)
         else:
             critic_mask = transitions.legal_mask
-            critic_err = jnp.square(transitions.q_values - transitions.q_targets) * critic_mask
+            critic_err = (
+                critic_error_loss(
+                    transitions.q_values - transitions.q_targets,
+                    config.critic_huber_delta,
+                )
+                * critic_mask
+            )
             critic_loss = jnp.sum(critic_err) / (jnp.sum(critic_mask) + 1e-6)
         information_loss = jnp.mean(transitions.paid_kl)
         reconstruction_loss = jnp.mean(transitions.reconstruction_loss)
@@ -2942,17 +3080,17 @@ def build_update_component_profile_fns(
         )
         total_loss = (
             information_loss * schedule.current_beta
-            + action_loss * config.lambda_
-            + expansion_loss * config.lambda_
-            + critic_loss * config.lambda_ * schedule.current_critic_coef
+            + action_loss * config.loss_scale
+            + expansion_loss * config.loss_scale
+            + critic_loss * config.loss_scale * schedule.current_critic_coef
             + reconstruction_loss * config.alpha
             + probe_loss
         )
         expansion_head_loss = (
-            expansion_loss * config.lambda_
-            + critic_loss * config.lambda_ * schedule.current_critic_coef
-            + action_loss * config.lambda_
-            + schedule.node_coverage_aux_coef * config.lambda_ * node_coverage_aux_loss
+            expansion_loss * config.loss_scale
+            + critic_loss * config.loss_scale * schedule.current_critic_coef
+            + action_loss * config.loss_scale
+            + schedule.node_coverage_aux_coef * config.loss_scale * node_coverage_aux_loss
         )
         return total_loss, expansion_head_loss
 
@@ -3031,7 +3169,7 @@ def build_update_component_profile_fns(
                     replace_param_subtree(all_params, "expansion_head", expansion_head_params),
                     minibatch,
                     schedule,
-                    config.lambda_,
+                    config.loss_scale,
                 )
 
             expansion_head_grads = jax.grad(cached_expansion_head_loss_from_subtree)(
@@ -3205,10 +3343,15 @@ def finalize_epoch_row(
             if config.return_target_mode in {"lambda", "sampled_lambda"}
             else float("nan")
         ),
+        "loss_scale": config.loss_scale,
+        "memory_lambda": config.memory_lambda,
+        "critic_huber_delta": config.critic_huber_delta,
+        "advantage_clip": config.advantage_clip,
         "forced_continue_epsilon": 0.0,
         "expansion_entropy_coef": float(np.asarray(metrics.entropy_coef)),
         "node_coverage_aux_coef": float(np.asarray(metrics.node_coverage_aux_coef)),
         "critic_coef": float(np.asarray(metrics.critic_coef)),
+        "current_memory_lambda": float(np.asarray(metrics.current_beta)),
         "current_beta": float(np.asarray(metrics.current_beta)),
     }
     for name in [
@@ -3284,11 +3427,12 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         max_observations_before_stop=config.max_observations_before_stop,
         opportunity_cost=config.opportunity_cost,
         observation_sigma=config.observation_sigma,
-        lambda_=config.lambda_,
+        loss_scale=config.loss_scale,
         alpha=config.alpha,
-        beta=config.beta,
+        memory_lambda=config.memory_lambda,
         include_visited_lstm_input=use_visited_lstm_input_for_task(task),
         pay_kl_on_stop=config.pay_kl_on_stop,
+        choice_at_end_only=config.choice_at_end_only,
     )
     updates_per_epoch = max(1, math.ceil(config.steps_per_epoch / (config.num_envs * config.num_steps)))
     total_updates = config.epochs * updates_per_epoch
@@ -3316,6 +3460,8 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         f"total_updates={total_updates} | "
         f"jit_training={config.jit_training} | "
         f"backend={config.backend or 'default'} | "
+        f"loss_scale={config.loss_scale} | "
+        f"memory_lambda={config.memory_lambda} | "
         f"return_target={config.return_target_mode} | "
         f"sampled_lambda_critic={config.sampled_lambda_critic} | "
         f"lambda_return={config.lambda_return} | "
@@ -3331,7 +3477,10 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
         f"kl_annealing_epochs={config.kl_annealing_epochs} | "
         f"node_coverage_aux_coef={config.node_coverage_aux_coef} | "
         f"node_coverage_aux_epochs={config.node_coverage_aux_epochs} | "
-        f"pay_kl_on_stop={config.pay_kl_on_stop}",
+        f"critic_huber_delta={config.critic_huber_delta} | "
+        f"advantage_clip={config.advantage_clip} | "
+        f"pay_kl_on_stop={config.pay_kl_on_stop} | "
+        f"choice_at_end_only={config.choice_at_end_only}",
         flush=True,
     )
     rows = []
@@ -3444,6 +3593,7 @@ def train(config: RunConfig, task: TaskSpec) -> tuple[object, PlanningTrainState
                 "node_coverage_aux_start_coef": float(config.node_coverage_aux_coef),
                 "node_coverage_aux_epochs": int(config.node_coverage_aux_epochs),
                 "pay_kl_on_stop": bool(config.pay_kl_on_stop),
+                "choice_at_end_only": bool(config.choice_at_end_only),
             }
         )
         rows.append(row)
@@ -3499,6 +3649,10 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
     path_tuple = tuple(tuple(float(v) for v in row) for row in task.path_map)
     reward_tuple = tuple(float(v) for v in task.reward_values)
     weights_path = Path(config.model_dir) / f"{model_name_for(config, task)}.msgpack"
+    if not weights_path.exists():
+        legacy_weights_path = Path(config.model_dir) / f"{legacy_model_name_for(config, task)}.msgpack"
+        if legacy_weights_path.exists():
+            weights_path = legacy_weights_path
     visited_feature_dim = visited_lstm_feature_dim_for_task(task)
     checkpoint_reward_dim = (
         infer_reward_feature_dim_from_checkpoint(
@@ -3525,12 +3679,13 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
         max_observations_before_stop=config.max_observations_before_stop,
         opportunity_cost=config.opportunity_cost,
         observation_sigma=config.observation_sigma,
-        lambda_=config.lambda_,
+        loss_scale=config.loss_scale,
         alpha=config.alpha,
-        beta=config.beta,
+        memory_lambda=config.memory_lambda,
         reward_feature_dim_override=int(checkpoint_reward_dim),
         include_visited_lstm_input=use_visited_lstm_input_for_task(task),
         pay_kl_on_stop=config.pay_kl_on_stop,
+        choice_at_end_only=config.choice_at_end_only,
     )
     rng = jax.random.PRNGKey(config.seed)
     reward_feature_dim = (
@@ -3547,7 +3702,7 @@ def load_state_for_sim(config: RunConfig, task: TaskSpec) -> tuple[PlanningVAE, 
     )
     sched = ScheduleValues(
         current_alpha=1.0,
-        current_beta=1.0 / config.beta,
+        current_beta=config.memory_lambda,
         current_critic_coef=0.0,
         expansion_epsilon=0.0,
         expansion_entropy_coef=0.0,
@@ -3607,7 +3762,7 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
     carry = reset_done_envs(carry, reset_rewards)
     sched = ScheduleValues(
         current_alpha=1.0,
-        current_beta=1.0 / config.beta,
+        current_beta=config.memory_lambda,
         current_critic_coef=0.0,
         expansion_epsilon=0.0,
         expansion_entropy_coef=0.0,
@@ -3661,6 +3816,7 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
             "allow_node_revisit": bool(config.allow_node_revisit),
             "max_observations_before_stop": int(config.max_observations_before_stop),
             "visited_lstm_input": bool(use_visited_lstm_input_for_task(task)),
+            "choice_at_end_only": bool(config.choice_at_end_only),
         }
         stopped_before_timestep = False
         for t, trans in enumerate(transitions, start=1):
@@ -3708,9 +3864,9 @@ def simulate(config: RunConfig, task: TaskSpec, model: PlanningVAE | None = None
 
 def parse_args() -> RunConfig:
     parser = argparse.ArgumentParser()
-    parser.add_argument("lambda_string")
+    parser.add_argument("loss_scale_string")
     parser.add_argument("alpha_string")
-    parser.add_argument("beta_string")
+    parser.add_argument("memory_lambda_string")
     parser.add_argument("model_dir")
     parser.add_argument("epochs", type=int)
     parser.add_argument("input_type")
@@ -3837,7 +3993,7 @@ def parse_args() -> RunConfig:
         type=float,
         default=float(os.environ.get("KL_START_MULTIPLIER", "1.0")),
         help=(
-            "Initial multiplier on the effective KL weight 1/beta. "
+            "Initial multiplier on the direct memory KL weight lambda. "
             "Use 0 with --kl-annealing-epochs for classic KL warm-up, or >1 "
             "to start with stronger KL pressure and anneal back to target. Default: 1."
         ),
@@ -3858,7 +4014,7 @@ def parse_args() -> RunConfig:
         help=(
             "Optional auxiliary loss coefficient that encourages the expansion "
             "policy to distribute probability over currently unobserved nodes. "
-            "The term is independent of lambda and defaults to 0."
+            "The term is independent of the memory lambda and defaults to 0."
         ),
     )
     parser.add_argument(
@@ -3869,6 +4025,42 @@ def parse_args() -> RunConfig:
             "Linearly anneal --node-coverage-aux-coef to 0 over this many "
             "schedule epochs. If 0, a nonzero coefficient is held constant."
         ),
+    )
+    parser.add_argument(
+        "--critic-huber-delta",
+        type=float,
+        default=float(os.environ.get("CRITIC_HUBER_DELTA", "10.0")),
+        help=(
+            "Use Huber loss for expansion critic errors with this delta. Set "
+            "<= 0 for legacy squared-error critic loss. Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--advantage-clip",
+        type=float,
+        default=float(os.environ.get("ADVANTAGE_CLIP", "10.0")),
+        help=(
+            "Clip PPO advantages to +/- this value. Set <= 0 to disable "
+            "advantage clipping. Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--learning-rate",
+        "--peak-learning-rate",
+        "--lr",
+        dest="learning_rate",
+        type=float,
+        default=float(os.environ.get("JAX_LEARNING_RATE", "5e-4")),
+        help="Peak AdamW learning rate for cosine decay. Default: 5e-4.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        "--learning-rate-floor",
+        "--lr-floor",
+        dest="min_learning_rate",
+        type=float,
+        default=None if "JAX_MIN_LEARNING_RATE" not in os.environ else float(os.environ["JAX_MIN_LEARNING_RATE"]),
+        help="Cosine-decay floor. Default: 0.1 * --learning-rate.",
     )
     parser.add_argument(
         "--pay-kl-on-stop",
@@ -3882,25 +4074,54 @@ def parse_args() -> RunConfig:
             "to model and simulation filenames."
         ),
     )
+    parser.add_argument(
+        "--choice-at-end-only",
+        "--observer-only",
+        "--observer-end-choice",
+        action="store_true",
+        default=os.environ.get("CHOICE_AT_END_ONLY", "").strip().lower() in {"1", "true", "yes", "on"},
+        help=(
+            "Train/evaluate as an observer: terminal path choices are masked until "
+            "--max-observations-before-stop observe decisions have been made. In "
+            "non-revisit tasks terminal choices are also allowed once no observe "
+            "actions remain. Enabled runs add _observer_endchoice to filenames."
+        ),
+    )
     args = parser.parse_args()
 
-    lambda_values = parse_float_list(args.lambda_string)
+    loss_scale_values = parse_float_list(args.loss_scale_string)
     alpha_values = parse_float_list(args.alpha_string)
-    beta_values = parse_float_list(args.beta_string)
+    memory_lambda_values = parse_float_list(args.memory_lambda_string)
     opportunity_values = parse_float_list(args.opportunity_cost_string)
-    if not (len(lambda_values) == len(alpha_values) == len(beta_values) == len(opportunity_values) == 1):
-        raise ValueError("model_jax/planning.py expects one lambda/alpha/beta/opportunity per process.")
+    if not (
+        len(loss_scale_values)
+        == len(alpha_values)
+        == len(memory_lambda_values)
+        == len(opportunity_values)
+        == 1
+    ):
+        raise ValueError(
+            "model_jax/planning.py expects one loss_scale/alpha/lambda/opportunity per process."
+        )
     tree_size = int(args.tree_size)
     normalized_tree_type = normalize_tree_type(args.tree_type, tree_size)
     max_observations_before_stop = max(int(args.max_observations_before_stop), 1)
-    num_steps = int(
-        args.num_steps
-        or ((max_observations_before_stop + 1) if args.allow_node_revisit else tree_size)
-    )
+    if args.choice_at_end_only:
+        default_num_steps = min(max_observations_before_stop, tree_size) + 1
+        if args.allow_node_revisit:
+            default_num_steps = max_observations_before_stop + 1
+    else:
+        default_num_steps = (max_observations_before_stop + 1) if args.allow_node_revisit else tree_size
+    num_steps = int(args.num_steps or default_num_steps)
     if args.allow_node_revisit and num_steps <= max_observations_before_stop:
         raise ValueError(
             "Revisit mode needs one terminal decision after the observation cap. "
             f"Got --num-steps={num_steps} and --max-observations-before-stop={max_observations_before_stop}."
+        )
+    if args.choice_at_end_only and num_steps < default_num_steps:
+        raise ValueError(
+            "Observer/end-choice mode needs one terminal decision after the final allowed observation. "
+            f"Got --num-steps={num_steps}; expected at least {default_num_steps}."
         )
     return_target_rollouts = max(int(args.return_target_rollouts), 1)
     num_envs = int(args.num_envs)
@@ -3929,9 +4150,9 @@ def parse_args() -> RunConfig:
         if not cli_has_kl_epochs and "KL_ANNEALING_EPOCHS" not in os.environ:
             kl_annealing_epochs = int(os.environ.get("DISJOINT3X2_KL_ANNEALING_EPOCHS", "60"))
     return RunConfig(
-        lambda_=lambda_values[0],
+        loss_scale=loss_scale_values[0],
         alpha=alpha_values[0],
-        beta=beta_values[0],
+        memory_lambda=memory_lambda_values[0],
         model_dir=args.model_dir,
         epochs=int(args.epochs),
         input_type=str(args.input_type),
@@ -3970,7 +4191,14 @@ def parse_args() -> RunConfig:
         kl_annealing_epochs=max(int(kl_annealing_epochs), 0),
         node_coverage_aux_coef=max(float(args.node_coverage_aux_coef), 0.0),
         node_coverage_aux_epochs=max(int(args.node_coverage_aux_epochs), 0),
+        critic_huber_delta=max(float(args.critic_huber_delta), 0.0),
+        advantage_clip=max(float(args.advantage_clip), 0.0),
+        learning_rate=max(float(args.learning_rate), 0.0),
+        min_learning_rate=(
+            None if args.min_learning_rate is None else max(float(args.min_learning_rate), 0.0)
+        ),
         pay_kl_on_stop=bool(args.pay_kl_on_stop),
+        choice_at_end_only=bool(args.choice_at_end_only),
     )
 
 

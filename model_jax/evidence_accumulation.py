@@ -81,9 +81,10 @@ class EvidenceTaskSpec:
 
 @dataclass(frozen=True)
 class RunConfig:
-    lambda_: float
+    loss_scale: float
     alpha: float
     beta: float
+    memory_lambda: float
     model_dir: str
     epochs: int
     input_type: str
@@ -120,6 +121,12 @@ class RunConfig:
     incorrect_reward: float
     kl_start_multiplier: float
     kl_annealing_epochs: int
+    critic_huber_delta: float
+    advantage_clip: float
+    learning_rate: float = 5e-4
+    min_learning_rate: float | None = None
+    pay_kl_on_stop: bool = False
+    choice_at_end_only: bool = False
 
 
 class ScheduleValues(NamedTuple):
@@ -291,13 +298,45 @@ def architecture_file_label(rnn_units: int, latent_dim: int) -> str:
 
 
 def model_name_for(config: RunConfig) -> str:
+    stop_paid_label = "_stop_paid" if bool(config.pay_kl_on_stop) else ""
+    observer_label = "_observer_endchoice" if bool(config.choice_at_end_only) else ""
+    reward_label = ""
+    if not (math.isclose(float(config.correct_reward), 1.0) and math.isclose(float(config.incorrect_reward), 0.0)):
+        reward_label = f"_correctreward_{float(config.correct_reward):g}"
+        if not math.isclose(float(config.incorrect_reward), 0.0):
+            reward_label += f"_incorrectreward_{float(config.incorrect_reward):g}"
     return (
-        f"evidence_lambda_{config.lambda_}_alpha_{config.alpha}_beta_{config.beta}_"
+        f"evidence_loss_scale_{config.loss_scale}_alpha_{config.alpha}_beta_{config.beta}_"
+        f"memorylambda_{config.memory_lambda}_opportunity_{config.opportunity_cost}_"
+        f"expansion_{config.expansion_decision_version}_"
+        f"{model_variant_label(config.model_variant)}"
+        f"seed_{config.seed}_{coherence_file_label(config.coherence_values)}_"
+        f"obsstd_{config.observation_noise_std:g}_maxobs_{config.max_observations_before_stop}_"
+        f"{architecture_file_label(config.rnn_units, config.latent_dim)}"
+        f"{reward_label}"
+        f"{stop_paid_label}"
+        f"{observer_label}"
+    )
+
+
+def legacy_model_name_for(config: RunConfig) -> str:
+    stop_paid_label = "_stop_paid" if bool(config.pay_kl_on_stop) else ""
+    observer_label = "_observer_endchoice" if bool(config.choice_at_end_only) else ""
+    reward_label = ""
+    if not (math.isclose(float(config.correct_reward), 1.0) and math.isclose(float(config.incorrect_reward), 0.0)):
+        reward_label = f"_correctreward_{float(config.correct_reward):g}"
+        if not math.isclose(float(config.incorrect_reward), 0.0):
+            reward_label += f"_incorrectreward_{float(config.incorrect_reward):g}"
+    return (
+        f"evidence_lambda_{config.loss_scale}_alpha_{config.alpha}_beta_{config.beta}_"
         f"opportunity_{config.opportunity_cost}_expansion_{config.expansion_decision_version}_"
         f"{model_variant_label(config.model_variant)}"
         f"seed_{config.seed}_{coherence_file_label(config.coherence_values)}_"
         f"obsstd_{config.observation_noise_std:g}_maxobs_{config.max_observations_before_stop}_"
         f"{architecture_file_label(config.rnn_units, config.latent_dim)}"
+        f"{reward_label}"
+        f"{stop_paid_label}"
+        f"{observer_label}"
     )
 
 
@@ -392,7 +431,7 @@ def initial_carry(batch: EvidenceBatch, rnn_units: int) -> EvidenceCarry:
 
 def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) -> ScheduleValues:
     epoch = update_idx // max(updates_per_epoch, 1)
-    target_beta = 1.0 / config.beta
+    target_beta = config.memory_lambda
     if int(config.kl_annealing_epochs) > 0:
         epoch_value = jnp.asarray(epoch, dtype=jnp.float32)
         progress = jnp.minimum(epoch_value / float(max(int(config.kl_annealing_epochs) - 1, 1)), 1.0)
@@ -420,11 +459,17 @@ def make_schedule(config: RunConfig, update_idx: int, updates_per_epoch: int) ->
     )
 
 
-def learning_rate_at(step: jax.Array, total_steps: int) -> jax.Array:
+def learning_rate_at(
+    step: jax.Array,
+    total_steps: int,
+    peak_learning_rate: float = 5e-4,
+    min_learning_rate: float | None = None,
+) -> jax.Array:
     step = jnp.asarray(step)
     progress = jnp.minimum(step.astype(jnp.float32) / float(max(total_steps, 1)), 1.0)
-    peak = jnp.asarray(5e-4, dtype=jnp.float32)
-    floor = peak * 0.1
+    peak = jnp.asarray(float(peak_learning_rate), dtype=jnp.float32)
+    floor_value = float(min_learning_rate) if min_learning_rate is not None else float(peak_learning_rate) * 0.1
+    floor = jnp.asarray(floor_value, dtype=jnp.float32)
     return floor + 0.5 * (peak - floor) * (1.0 + jnp.cos(jnp.pi * progress))
 
 
@@ -443,6 +488,8 @@ class EvidenceVAE(nn.Module):
     opportunity_cost: float
     correct_reward: float
     incorrect_reward: float
+    pay_kl_on_stop: bool = False
+    choice_at_end_only: bool = False
 
     def setup(self):
         input_dim = 2  # current evidence and normalized observation count
@@ -581,11 +628,16 @@ class EvidenceVAE(nn.Module):
         value_pred = self.value_critic(action_input)
 
         continue_invalid = carry.num_observations >= int(self.max_observations)
+        terminal_invalid = (
+            carry.num_observations < int(self.max_observations)
+            if bool(self.choice_at_end_only)
+            else jnp.zeros_like(continue_invalid)
+        )
         decision_invalid = jnp.stack(
             [
                 continue_invalid.astype(jnp.float32),
-                jnp.zeros((batch_size,), dtype=jnp.float32),
-                jnp.zeros((batch_size,), dtype=jnp.float32),
+                terminal_invalid.astype(jnp.float32),
+                terminal_invalid.astype(jnp.float32),
             ],
             axis=-1,
         )
@@ -620,7 +672,10 @@ class EvidenceVAE(nn.Module):
             float(self.incorrect_reward),
             terminal_reward,
         )
-        paid_kl = observed_kl * is_continue.astype(jnp.float32)
+        pay_kl_mask = is_continue
+        if bool(self.pay_kl_on_stop):
+            pay_kl_mask = pay_kl_mask | is_terminal
+        paid_kl = observed_kl * pay_kl_mask.astype(jnp.float32)
         opportunity_cost_paid = float(self.opportunity_cost) * is_continue.astype(jnp.float32)
         memory_cost_paid = schedule.current_beta * paid_kl
         step_reward = terminal_reward - opportunity_cost_paid - memory_cost_paid
@@ -731,6 +786,8 @@ def build_model(config: RunConfig, task: EvidenceTaskSpec) -> EvidenceVAE:
         opportunity_cost=config.opportunity_cost,
         correct_reward=task.correct_reward,
         incorrect_reward=task.incorrect_reward,
+        pay_kl_on_stop=config.pay_kl_on_stop,
+        choice_at_end_only=config.choice_at_end_only,
     )
 
 
@@ -797,6 +854,25 @@ def compute_lambda_returns(
     return returns, advantages
 
 
+def critic_error_loss(error: jax.Array, huber_delta: float) -> jax.Array:
+    """Squared critic loss, optionally Huberized for large TD/return errors."""
+    if float(huber_delta) <= 0.0:
+        return jnp.square(error)
+    delta = jnp.asarray(float(huber_delta), dtype=error.dtype)
+    abs_error = jnp.abs(error)
+    quadratic = jnp.minimum(abs_error, delta)
+    linear = abs_error - quadratic
+    return 0.5 * jnp.square(quadratic) + delta * linear
+
+
+def clip_advantages(advantages: jax.Array, clip_value: float) -> jax.Array:
+    """Clip normalized PPO advantages when a positive threshold is configured."""
+    if float(clip_value) <= 0.0:
+        return advantages
+    bound = jnp.asarray(float(clip_value), dtype=advantages.dtype)
+    return jnp.clip(advantages, -bound, bound)
+
+
 def first_terminal_indices(transitions: EvidenceTransition) -> tuple[jax.Array, jax.Array]:
     final_rollout_step = jax.nn.one_hot(
         transitions.is_terminal.shape[0] - 1,
@@ -842,7 +918,7 @@ def create_train_state(model: EvidenceVAE, config: RunConfig, task: EvidenceTask
     dummy_carry = initial_carry(dummy_batch, config.rnn_units)
     dummy_schedule = ScheduleValues(
         current_alpha=1.0,
-        current_beta=1.0 / config.beta,
+        current_beta=config.memory_lambda,
         current_critic_coef=0.1,
         expansion_epsilon=0.0,
         expansion_entropy_coef=1.0,
@@ -850,7 +926,12 @@ def create_train_state(model: EvidenceVAE, config: RunConfig, task: EvidenceTask
         ppo_clip=0.3,
     )
     params = model.init(rng, dummy_carry, rng, dummy_schedule, None, True)["params"]
-    schedule = lambda step: learning_rate_at(step, total_updates * optimizer_steps_per_update(config))
+    schedule = lambda step: learning_rate_at(
+        step,
+        total_updates * optimizer_steps_per_update(config),
+        config.learning_rate,
+        config.min_learning_rate,
+    )
     tx = optax.chain(
         optax.clip_by_global_norm(10.0),
         optax.adamw(learning_rate=schedule, weight_decay=1e-4),
@@ -907,19 +988,20 @@ def build_update_fn(model: EvidenceVAE, task: EvidenceTaskSpec, config: RunConfi
             - schedule.expansion_entropy_coef
             * (jnp.sum(transitions.entropy * valid) / (jnp.sum(valid) + 1e-6))
         )
-        critic_loss = (
-            jnp.sum(jnp.square(transitions.value_pred - returns) * valid)
-            / (jnp.sum(valid) + 1e-6)
-        )
+        critic_err = critic_error_loss(
+            transitions.value_pred - returns,
+            config.critic_huber_delta,
+        ) * valid
+        critic_loss = jnp.sum(critic_err) / (jnp.sum(valid) + 1e-6)
         information_loss = jnp.sum(transitions.paid_kl * valid) / (jnp.sum(valid) + 1e-6)
         reconstruction_loss = jnp.sum(transitions.reconstruction_loss * valid) / (jnp.sum(valid) + 1e-6)
         action_loss = terminal_expected_action_loss(transitions)
         probe_loss = jnp.sum(transitions.probe_loss) / (jnp.sum(transitions.valid_probe) + 1e-6)
         probe_acc = jnp.sum(transitions.probe_correct) / (jnp.sum(transitions.valid_probe) + 1e-6)
         total_loss = (
-            expansion_loss * config.lambda_
-            + critic_loss * config.lambda_ * schedule.current_critic_coef
-            + action_loss * config.lambda_
+            expansion_loss * config.loss_scale
+            + critic_loss * config.loss_scale * schedule.current_critic_coef
+            + action_loss * config.loss_scale
             + information_loss * schedule.current_beta
             + reconstruction_loss * config.alpha
             + probe_loss
@@ -941,7 +1023,12 @@ def build_update_fn(model: EvidenceVAE, task: EvidenceTaskSpec, config: RunConfi
             entropy_coef=jnp.asarray(schedule.expansion_entropy_coef),
             critic_coef=jnp.asarray(schedule.current_critic_coef),
             current_beta=jnp.asarray(schedule.current_beta),
-            learning_rate=learning_rate_at(train_state_step_for_lr(), total_updates * optimizer_steps_per_update(config)),
+            learning_rate=learning_rate_at(
+                train_state_step_for_lr(),
+                total_updates * optimizer_steps_per_update(config),
+                config.learning_rate,
+                config.min_learning_rate,
+            ),
         )
         return total_loss, metrics
 
@@ -970,6 +1057,9 @@ def build_update_fn(model: EvidenceVAE, task: EvidenceTaskSpec, config: RunConfi
         advantages = jax.lax.stop_gradient(
             (advantages - jnp.mean(advantages * old_transitions.valid) / (jnp.mean(old_transitions.valid) + 1e-6))
             / (jnp.sqrt(jnp.mean(jnp.square(advantages) * old_transitions.valid) + 1e-6))
+        )
+        advantages = jax.lax.stop_gradient(
+            clip_advantages(advantages, config.advantage_clip) * old_transitions.valid
         )
 
         def ppo_epoch(epoch_state, _):
@@ -1002,6 +1092,8 @@ def build_update_fn(model: EvidenceVAE, task: EvidenceTaskSpec, config: RunConfi
                         learning_rate=learning_rate_at(
                             minibatch_state.step,
                             total_updates * optimizer_steps_per_update(config),
+                            config.learning_rate,
+                            config.min_learning_rate,
                         )
                     )
                     return total_loss, metrics
@@ -1062,7 +1154,15 @@ def train(config: RunConfig, task: EvidenceTaskSpec) -> tuple[EvidenceVAE, Evide
         f"total_updates={total_updates} | jit_training={config.jit_training} | "
         f"coherence_values={','.join(f'{x:g}' for x in config.coherence_values)} | "
         f"observation_noise_std={config.observation_noise_std} | "
-        f"max_observations_before_stop={config.max_observations_before_stop}",
+        f"correct_reward={config.correct_reward} | "
+        f"incorrect_reward={config.incorrect_reward} | "
+        f"loss_scale={config.loss_scale} | "
+        f"memory_lambda={config.memory_lambda} | "
+        f"critic_huber_delta={config.critic_huber_delta} | "
+        f"advantage_clip={config.advantage_clip} | "
+        f"max_observations_before_stop={config.max_observations_before_stop} | "
+        f"pay_kl_on_stop={config.pay_kl_on_stop} | "
+        f"choice_at_end_only={config.choice_at_end_only}",
         flush=True,
     )
     rows = []
@@ -1115,9 +1215,17 @@ def finalize_epoch_row(epoch: int, metrics_acc: list[UpdateMetrics], config: Run
         "update_epochs": config.update_epochs,
         "expansion_return_target_mode": config.return_target_mode,
         "expansion_lambda_return": config.lambda_return,
+        "loss_scale": config.loss_scale,
+        "memory_lambda": config.memory_lambda,
+        "critic_huber_delta": config.critic_huber_delta,
+        "advantage_clip": config.advantage_clip,
         "coherence_values": ",".join(f"{x:g}" for x in config.coherence_values),
         "observation_noise_std": config.observation_noise_std,
+        "correct_reward": config.correct_reward,
+        "incorrect_reward": config.incorrect_reward,
         "max_observations_before_stop": config.max_observations_before_stop,
+        "pay_kl_on_stop": bool(config.pay_kl_on_stop),
+        "choice_at_end_only": bool(config.choice_at_end_only),
         "total_loss": float(np.mean(stack.total_loss)),
         "information_loss": float(np.mean(stack.information_loss)),
         "kl_loss": float(np.mean(stack.information_loss)),
@@ -1134,6 +1242,7 @@ def finalize_epoch_row(epoch: int, metrics_acc: list[UpdateMetrics], config: Run
         "expansion_entropy_coef": float(np.mean(stack.entropy_coef)),
         "critic_coef": float(np.mean(stack.critic_coef)),
         "current_beta": float(np.mean(stack.current_beta)),
+        "current_memory_lambda": float(np.mean(stack.current_beta)),
     }
 
 
@@ -1144,7 +1253,7 @@ def load_state_for_sim(config: RunConfig, task: EvidenceTaskSpec) -> tuple[Evide
     dummy = initial_carry(dummy_batch, config.rnn_units)
     sched = ScheduleValues(
         current_alpha=1.0,
-        current_beta=1.0 / config.beta,
+        current_beta=config.memory_lambda,
         current_critic_coef=0.0,
         expansion_epsilon=0.0,
         expansion_entropy_coef=0.0,
@@ -1153,8 +1262,12 @@ def load_state_for_sim(config: RunConfig, task: EvidenceTaskSpec) -> tuple[Evide
     )
     params = model.init(rng, dummy, rng, sched, None, False)["params"]
     weights_path = Path(config.model_dir) / f"{model_name_for(config)}.msgpack"
+    legacy_weights_path = Path(config.model_dir) / f"{legacy_model_name_for(config)}.msgpack"
     if weights_path.exists():
         params = serialization.from_bytes(params, weights_path.read_bytes())
+    elif legacy_weights_path.exists():
+        params = serialization.from_bytes(params, legacy_weights_path.read_bytes())
+        print(f"Loaded legacy evidence model weights from: {legacy_weights_path}", flush=True)
     else:
         print(f"Warning: {weights_path} not found; simulating initialized evidence model.", flush=True)
     return model, params
@@ -1169,7 +1282,7 @@ def simulate(config: RunConfig, task: EvidenceTaskSpec, model: EvidenceVAE | Non
     rollout = build_rollout_fn(model, config)
     sched = ScheduleValues(
         current_alpha=1.0,
-        current_beta=1.0 / config.beta,
+        current_beta=config.memory_lambda,
         current_critic_coef=0.0,
         expansion_epsilon=0.0,
         expansion_entropy_coef=0.0,
@@ -1185,9 +1298,30 @@ def simulate(config: RunConfig, task: EvidenceTaskSpec, model: EvidenceVAE | Non
         forced_actions=None,
         training=True,
     )
+    full_policy_transitions = None
+    if not bool(config.choice_at_end_only):
+        forced_actions = jnp.full(
+            (int(config.num_steps), int(config.n_sim_trials)),
+            CONTINUE,
+            dtype=jnp.int32,
+        )
+        if int(config.num_steps) > 0:
+            forced_actions = forced_actions.at[int(config.num_steps) - 1].set(
+                jnp.full((int(config.n_sim_trials),), CHOOSE_A, dtype=jnp.int32)
+            )
+        _trace_carry, _trace_rng, full_policy_transitions = rollout(
+            params,
+            batch,
+            rollout_rng,
+            sched,
+            forced_actions=forced_actions,
+            training=True,
+        )
     transitions = jax.device_get(transitions)
+    if full_policy_transitions is not None:
+        full_policy_transitions = jax.device_get(full_policy_transitions)
     batch_np = jax.device_get(batch)
-    rows = simulation_rows(config, batch_np, transitions)
+    rows = simulation_rows(config, batch_np, transitions, full_policy_transitions)
     out_dir = Path(config.sim_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{model_name_for(config)}_{config.input_type}.csv"
@@ -1199,7 +1333,12 @@ def simulate(config: RunConfig, task: EvidenceTaskSpec, model: EvidenceVAE | Non
     print(f"Evidence simulation timing: total={time.perf_counter() - sim_start:.3f}s", flush=True)
 
 
-def simulation_rows(config: RunConfig, batch: EvidenceBatch, transitions: EvidenceTransition) -> list[dict]:
+def simulation_rows(
+    config: RunConfig,
+    batch: EvidenceBatch,
+    transitions: EvidenceTransition,
+    full_policy_transitions: EvidenceTransition | None = None,
+) -> list[dict]:
     rows = []
     n_trials = int(batch.correct_choice.shape[0])
     for trial in range(n_trials):
@@ -1211,13 +1350,23 @@ def simulation_rows(config: RunConfig, batch: EvidenceBatch, transitions: Eviden
         if terminal_step is None:
             terminal_step = config.num_steps - 1
             terminal_action = int(np.argmax(np.asarray(transitions.probs[terminal_step, trial, 1:])) + 1)
-            terminal_reward = float(terminal_action == int(batch.correct_action[trial]))
+            terminal_reward = (
+                float(config.correct_reward)
+                if terminal_action == int(batch.correct_action[trial])
+                else float(config.incorrect_reward)
+            )
         else:
             terminal_action = int(transitions.terminal_action[terminal_step, trial])
             terminal_reward = float(transitions.terminal_reward[terminal_step, trial])
         num_observations = int(transitions.num_observations_before[terminal_step, trial])
         row = {
             "graph": trial,
+            "loss_scale": float(config.loss_scale),
+            "memory_lambda": float(config.memory_lambda),
+            "lambda": float(config.loss_scale),
+            "alpha": float(config.alpha),
+            "beta": float(config.beta),
+            "opportunity_cost": float(config.opportunity_cost),
             "correct_choice": int(batch.correct_choice[trial]),
             "correct_action": int(batch.correct_action[trial]),
             "coherence": float(batch.coherence[trial]),
@@ -1232,6 +1381,7 @@ def simulation_rows(config: RunConfig, batch: EvidenceBatch, transitions: Eviden
             "total_opportunity_cost": float(np.sum(transitions.opportunity_cost_paid[:, trial])),
             "total_memory_cost": float(np.sum(transitions.memory_cost_paid[:, trial])),
             "total_kl_paid": float(np.sum(transitions.paid_kl[:, trial])),
+            "choice_at_end_only": bool(config.choice_at_end_only),
             "decision_cumulative_evidence": float(transitions.cumulative_evidence[terminal_step, trial]),
             "decision_oracle_cumulative_llr": float(transitions.oracle_cumulative_llr[terminal_step, trial]),
         }
@@ -1250,6 +1400,10 @@ def simulation_rows(config: RunConfig, batch: EvidenceBatch, transitions: Eviden
             row[f"policy_continue_t{step}"] = float(transitions.probs[t, trial, CONTINUE])
             row[f"policy_choose_a_t{step}"] = float(transitions.probs[t, trial, CHOOSE_A])
             row[f"policy_choose_b_t{step}"] = float(transitions.probs[t, trial, CHOOSE_B])
+            if full_policy_transitions is not None:
+                row[f"full_policy_continue_t{step}"] = float(full_policy_transitions.probs[t, trial, CONTINUE])
+                row[f"full_policy_choose_a_t{step}"] = float(full_policy_transitions.probs[t, trial, CHOOSE_A])
+                row[f"full_policy_choose_b_t{step}"] = float(full_policy_transitions.probs[t, trial, CHOOSE_B])
             row[f"value_pred_t{step}"] = float(transitions.value_pred[t, trial])
             row[f"action_policy_entropy_t{step}"] = float(transitions.entropy[t, trial])
             for dim in range(min(config.latent_dim, 16)):
@@ -1341,7 +1495,7 @@ def validate_task_generator(config: RunConfig):
 
 def parse_args() -> RunConfig:
     parser = argparse.ArgumentParser()
-    parser.add_argument("lambda_string", nargs="?", default="100.0")
+    parser.add_argument("loss_scale_string", nargs="?", default="100.0")
     parser.add_argument("alpha_string", nargs="?", default="0.0")
     parser.add_argument("beta_string", nargs="?", default="1000.0")
     parser.add_argument("model_dir", nargs="?", default="outputs/jax_models_evi")
@@ -1385,18 +1539,90 @@ def parse_args() -> RunConfig:
     parser.add_argument("--max-observations-before-stop", type=int, default=int(os.environ.get("MAX_OBSERVATIONS_BEFORE_STOP", "10")))
     parser.add_argument("--coherence-values", default=os.environ.get("COHERENCE_VALUES", "0,0.05,0.1,0.2,0.4,0.8"))
     parser.add_argument("--observation-noise-std", type=float, default=float(os.environ.get("OBSERVATION_NOISE_STD", "1.0")))
-    parser.add_argument("--correct-reward", type=float, default=1.0)
+    parser.add_argument("--correct-reward", type=float, default=float(os.environ.get("CORRECT_REWARD", "5.0")))
     parser.add_argument("--incorrect-reward", type=float, default=0.0)
     parser.add_argument("--kl-start-multiplier", type=float, default=float(os.environ.get("KL_START_MULTIPLIER", "1.0")))
     parser.add_argument("--kl-annealing-epochs", type=int, default=int(os.environ.get("KL_ANNEALING_EPOCHS", "0")))
+    parser.add_argument(
+        "--critic-huber-delta",
+        type=float,
+        default=float(os.environ.get("CRITIC_HUBER_DELTA", "10.0")),
+        help=(
+            "Use Huber loss for critic errors with this delta. Set <= 0 for "
+            "legacy squared-error critic loss. Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--advantage-clip",
+        type=float,
+        default=float(os.environ.get("ADVANTAGE_CLIP", "10.0")),
+        help=(
+            "Clip normalized PPO advantages to +/- this value. Set <= 0 to "
+            "disable advantage clipping. Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--learning-rate",
+        "--peak-learning-rate",
+        "--lr",
+        dest="learning_rate",
+        type=float,
+        default=float(os.environ.get("JAX_LEARNING_RATE", "5e-4")),
+        help="Peak AdamW learning rate for cosine decay. Default: 5e-4.",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        "--learning-rate-floor",
+        "--lr-floor",
+        dest="min_learning_rate",
+        type=float,
+        default=None if "JAX_MIN_LEARNING_RATE" not in os.environ else float(os.environ["JAX_MIN_LEARNING_RATE"]),
+        help="Cosine-decay floor. Default: 0.1 * --learning-rate.",
+    )
+    parser.add_argument(
+        "--memory-lambda",
+        "--kl-lambda",
+        type=float,
+        default=None if "MEMORY_LAMBDA" not in os.environ else float(os.environ["MEMORY_LAMBDA"]),
+        help=(
+            "Direct coefficient on the paid KL memory loss. If omitted, the beta "
+            "positional value is used directly. This replaces the older 1 / beta "
+            "memory weighting convention."
+        ),
+    )
+    parser.add_argument(
+        "--pay-kl-on-stop",
+        "--pay-memory-cost-on-stop",
+        action="store_true",
+        default=os.environ.get("PAY_KL_ON_STOP", "").strip().lower() in {"1", "true", "yes", "on"},
+        help=(
+            "Pay the evidence-observation KL even when the current decision is terminal "
+            "choose_a/choose_b. By default the final observation before stop is free, "
+            "matching older evidence checkpoints. Enabled runs add _stop_paid to model "
+            "and simulation filenames."
+        ),
+    )
+    parser.add_argument(
+        "--choice-at-end-only",
+        "--observer-only",
+        "--observer-end-choice",
+        action="store_true",
+        default=os.environ.get("CHOICE_AT_END_ONLY", "").strip().lower() in {"1", "true", "yes", "on"},
+        help=(
+            "Train/evaluate as a fixed-duration observer: continue actions are the "
+            "only legal actions before --max-observations-before-stop, and terminal "
+            "choose_a/choose_b actions are legal only after the final observation. "
+            "Enabled runs add _observer_endchoice to model and simulation filenames."
+        ),
+    )
     parser.add_argument("--validate-task", action="store_true")
     args = parser.parse_args()
-    lambda_values = parse_float_list(args.lambda_string)
+    loss_scale_values = parse_float_list(args.loss_scale_string)
     alpha_values = parse_float_list(args.alpha_string)
     beta_values = parse_float_list(args.beta_string)
     opportunity_values = parse_float_list(args.opportunity_cost_string)
-    if not (len(lambda_values) == len(alpha_values) == len(beta_values) == len(opportunity_values) == 1):
-        raise ValueError("evidence_accumulation.py expects one lambda/alpha/beta/opportunity per process.")
+    if not (len(loss_scale_values) == len(alpha_values) == len(beta_values) == len(opportunity_values) == 1):
+        raise ValueError("evidence_accumulation.py expects one loss_scale/alpha/beta/opportunity per process.")
     max_observations = max(int(args.max_observations_before_stop), 1)
     num_steps = int(args.num_steps or max_observations)
     if num_steps != max_observations:
@@ -1416,9 +1642,10 @@ def parse_args() -> RunConfig:
         raise ValueError("--ppo-minibatches must evenly divide num_envs * return_target_rollouts.")
     steps_per_epoch = int(args.steps_per_epoch or (200 * 200 * num_steps))
     return RunConfig(
-        lambda_=lambda_values[0],
+        loss_scale=loss_scale_values[0],
         alpha=alpha_values[0],
         beta=beta_values[0],
+        memory_lambda=float(args.memory_lambda) if args.memory_lambda is not None else beta_values[0],
         model_dir=str(args.model_dir),
         epochs=int(args.epochs),
         input_type=str(args.input_type),
@@ -1455,6 +1682,14 @@ def parse_args() -> RunConfig:
         incorrect_reward=float(args.incorrect_reward),
         kl_start_multiplier=max(float(args.kl_start_multiplier), 0.0),
         kl_annealing_epochs=max(int(args.kl_annealing_epochs), 0),
+        critic_huber_delta=max(float(args.critic_huber_delta), 0.0),
+        advantage_clip=max(float(args.advantage_clip), 0.0),
+        learning_rate=max(float(args.learning_rate), 0.0),
+        min_learning_rate=(
+            None if args.min_learning_rate is None else max(float(args.min_learning_rate), 0.0)
+        ),
+        pay_kl_on_stop=bool(args.pay_kl_on_stop),
+        choice_at_end_only=bool(args.choice_at_end_only),
     )
 
 

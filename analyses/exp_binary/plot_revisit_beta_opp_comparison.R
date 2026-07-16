@@ -14,12 +14,14 @@ usage <- function() {
     "Usage:\n",
     "  Rscript analyses/exp_binary/plot_revisit_beta_opp_comparison.R <tree> [options]\n\n",
     "Preset trees are read from analyses/exp_binary/revisit_plot_presets.csv.\n",
-    "The script loads the <tree>,beta row with opportunity=0 and the <tree>,opportunity row with beta=1000,\n",
+    "The script loads the <tree>,beta/memory-lambda row with opportunity=0 and the <tree>,opportunity row with fixed memory lambda,\n",
     "then plots the requested revisit behavior diagnostics in one comparison folder.\n\n",
     "Options:\n",
     "  --preset-file PATH          Preset CSV path.\n",
-    "  --vary-beta-values LIST     Beta values for the beta-vary family; all other params come from the preset.\n",
-    "                              Alias: --beta-values, --betas, --vary-betas.\n",
+    "  --vary-memory-lambda-values LIST\n",
+    "                              Direct paid-KL lambda values for the memory-lambda-vary family; all other params come from the preset.\n",
+    "                              Aliases: --memory-lambda-values, --memory-lambdas, --vary-lambda-values,\n",
+    "                              --vary-beta-values, --beta-values, --betas, --vary-betas.\n",
     "  --vary-opportunity-values LIST\n",
     "                              Opportunity costs for the opportunity-vary family; all other params come from the preset.\n",
     "                              Alias: --opportunity-values, --opportunities, --opportunity-costs, --vary-opps.\n",
@@ -34,7 +36,7 @@ usage <- function() {
     "  --help                      Show this message.\n\n",
     "Example:\n",
     "  Rscript analyses/exp_binary/plot_revisit_beta_opp_comparison.R default \\\n",
-    "    --vary-beta-values \"2,4,6,8,10\" \\\n",
+    "    --vary-memory-lambda-values \"2,4,6,8,10\" \\\n",
     "    --vary-opportunity-values \"0.02,0.04,0.08,0.1\" \\\n",
     "    --min-samples 25\n",
     sep = ""
@@ -109,7 +111,17 @@ args <- preset_file_option$args
 
 beta_values_option <- extract_named_option(
   args,
-  c("--vary-beta-values", "--vary-betas", "--beta-values", "--betas"),
+  c(
+    "--vary-memory-lambda-values",
+    "--vary-lambda-values",
+    "--memory-lambda-values",
+    "--memory-lambdas",
+    "--lambdas",
+    "--vary-beta-values",
+    "--vary-betas",
+    "--beta-values",
+    "--betas"
+  ),
   default = NULL
 )
 args <- beta_values_option$args
@@ -155,6 +167,16 @@ parse_csv_values <- function(value) {
   out <- unlist(strsplit(as.character(value), ",", fixed = TRUE), use.names = FALSE)
   out <- trimws(out)
   out[nzchar(out)]
+}
+
+preset_scalar <- function(row, new_name, legacy_name = NULL) {
+  if (new_name %in% names(row)) {
+    return(trim_string(row[[new_name]][[1]]))
+  }
+  if (!is.null(legacy_name) && legacy_name %in% names(row)) {
+    return(trim_string(row[[legacy_name]][[1]]))
+  }
+  stop(sprintf("Preset is missing required column %s.", new_name))
 }
 
 num_tokens <- function(value) {
@@ -204,45 +226,59 @@ parse_revisit_filename_index <- function() {
     return(data.frame())
   }
   basenames <- basename(files)
-  pattern <- paste0(
-    "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)",
-    "_expansion_([^_]+)_variant_([^_]+)_seed_([0-9]+)_(.+)_rnn_([^_]+)_latent_([^_]+)",
-    "_revisit_maxobs_([0-9]+)(?:_obs_sigma_([^_]+))?",
-    "(?:_klstart_[^_]+_klanneal_[^_]+)?(_(?:q|v)critic)?(?:_visitedidx)?_uniform\\.csv$"
+  common_tail <- paste0(
+    "_opportunity_([^_]+)_expansion_([^_]+)_variant_([^_]+)_seed_([0-9]+)",
+    "_(.+)_rnn_([^_]+)_latent_([^_]+)_revisit_maxobs_([0-9]+)",
+    "(?:_obs_sigma_([^_]+))?(?:_klstart_[^_]+_klanneal_[^_]+)?",
+    "(_(?:q|v)critic)?(?:_stop_paid)?(?:_observer_endchoice)?(?:_visitedidx)?_uniform\\.csv$"
   )
-  matches <- regexec(pattern, basenames, perl = TRUE)
-  parts <- regmatches(basenames, matches)
-  keep <- lengths(parts) > 0L
-  if (!any(keep)) {
+  patterns <- list(
+    new = paste0("^loss_scale_([^_]+)_alpha_([^_]+)_lambda_([^_]+)", common_tail),
+    legacy = paste0("^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)", common_tail)
+  )
+  parsed <- lapply(names(patterns), function(style) {
+    matches <- regexec(patterns[[style]], basenames, perl = TRUE)
+    parts <- regmatches(basenames, matches)
+    keep <- lengths(parts) > 0L
+    if (!any(keep)) {
+      return(data.frame())
+    }
+    local_parts <- parts[keep]
+    local_files <- files[keep]
+    part_at <- function(index) {
+      vapply(local_parts, function(x) {
+        if (length(x) >= index && !is.na(x[[index]])) x[[index]] else ""
+      }, character(1))
+    }
+    sigma_token <- part_at(13L)
+    sigma_token[!nzchar(sigma_token)] <- "0"
+    critic_token <- part_at(14L)
+    data.frame(
+      file = local_files,
+      lambda = suppressWarnings(as.numeric(part_at(2L))),       # legacy internal: loss_scale
+      loss_scale = suppressWarnings(as.numeric(part_at(2L))),
+      alpha = suppressWarnings(as.numeric(part_at(3L))),
+      beta = suppressWarnings(as.numeric(part_at(4L))),         # legacy internal: memory_lambda
+      memory_lambda = suppressWarnings(as.numeric(part_at(4L))),
+      opportunity = suppressWarnings(as.numeric(part_at(5L))),
+      expansion = part_at(6L),
+      variant = part_at(7L),
+      seed = suppressWarnings(as.numeric(part_at(8L))),
+      tree_label = part_at(9L),
+      rnn_units = part_at(10L),
+      latent_dim = part_at(11L),
+      max_observations = part_at(12L),
+      sigma = suppressWarnings(as.numeric(sigma_token)),
+      critic = ifelse(grepl("vcritic", critic_token, fixed = TRUE), "value", "q"),
+      filename_style = style,
+      stringsAsFactors = FALSE
+    )
+  })
+  parsed <- Filter(function(x) nrow(x) > 0L, parsed)
+  if (length(parsed) == 0L) {
     return(data.frame())
   }
-  parts <- parts[keep]
-  files <- files[keep]
-  part_at <- function(index) {
-    vapply(parts, function(x) {
-      if (length(x) >= index && !is.na(x[[index]])) x[[index]] else ""
-    }, character(1))
-  }
-  sigma_token <- part_at(13L)
-  sigma_token[!nzchar(sigma_token)] <- "0"
-  critic_token <- part_at(14L)
-  out <- data.frame(
-    file = files,
-    lambda = suppressWarnings(as.numeric(part_at(2L))),
-    alpha = suppressWarnings(as.numeric(part_at(3L))),
-    beta = suppressWarnings(as.numeric(part_at(4L))),
-    opportunity = suppressWarnings(as.numeric(part_at(5L))),
-    expansion = part_at(6L),
-    variant = part_at(7L),
-    seed = suppressWarnings(as.numeric(part_at(8L))),
-    tree_label = part_at(9L),
-    rnn_units = part_at(10L),
-    latent_dim = part_at(11L),
-    max_observations = part_at(12L),
-    sigma = suppressWarnings(as.numeric(sigma_token)),
-    critic = ifelse(grepl("vcritic", critic_token, fixed = TRUE), "value", "q"),
-    stringsAsFactors = FALSE
-  )
+  out <- do.call(rbind, parsed)
   out
 }
 
@@ -317,7 +353,7 @@ tree_name <- normalize_tree_name(tree_arg)
 beta_row <- preset_data[preset_data$tree == tree_name & preset_data$vary == "beta", , drop = FALSE]
 opp_row <- preset_data[preset_data$tree == tree_name & preset_data$vary == "opportunity", , drop = FALSE]
 if (nrow(beta_row) == 0L || nrow(opp_row) == 0L) {
-  stop(sprintf("Need both beta and opportunity rows for tree=%s in %s.", tree_name, preset_file))
+  stop(sprintf("Need both beta/memory-lambda and opportunity rows for tree=%s in %s.", tree_name, preset_file))
 }
 beta_row <- beta_row[1L, , drop = FALSE]
 opp_row <- opp_row[1L, , drop = FALSE]
@@ -333,16 +369,20 @@ expansion_decision_version <- trim_string(shared$expansion_decision_version[[1]]
 model_variant <- trim_string(shared$model_variant[[1]])
 rnn_units <- trim_string(shared$rnn_units_arg[[1]])
 latent_dim <- trim_string(shared$latent_dim_arg[[1]])
-lambda_arg <- trim_string(shared$lambda_arg[[1]])
+lambda_arg <- preset_scalar(shared, "loss_scale_arg", "lambda_arg")
 alpha_arg <- trim_string(shared$alpha_arg[[1]])
 source_arg <- trim_string(shared$simulation_source_arg[[1]])
 max_observations <- trim_string(shared$max_observations_arg[[1]])
 seed_values <- if (!is.null(seed_values_option$value)) parse_csv_values(seed_values_option$value) else parse_csv_values(shared$seed_arg[[1]])
 sigma_values <- if (!is.null(sigma_values_option$value)) parse_csv_values(sigma_values_option$value) else parse_csv_values(shared$sigma_arg[[1]])
-beta_values <- if (!is.null(beta_values_option$value)) parse_csv_values(beta_values_option$value) else parse_csv_values(beta_row$beta_arg[[1]])
+beta_values <- if (!is.null(beta_values_option$value)) {
+  parse_csv_values(beta_values_option$value)
+} else {
+  parse_csv_values(preset_scalar(beta_row, "memory_lambda_arg", "beta_arg"))
+}
 opportunity_values <- if (!is.null(opportunity_values_option$value)) parse_csv_values(opportunity_values_option$value) else parse_csv_values(opp_row$opportunity_arg[[1]])
 beta_family_opportunity <- trim_string(beta_row$opportunity_arg[[1]])
-opportunity_family_beta <- trim_string(opp_row$beta_arg[[1]])
+opportunity_family_beta <- preset_scalar(opp_row, "memory_lambda_arg", "beta_arg")
 base_input_dir <- if (!is.null(input_dir_option$value)) input_dir_option$value else shared$input_dir[[1]]
 input_dir <- if (tolower(source_arg) == "jax" && basename(base_input_dir) == "simulations") {
   file.path(dirname(base_input_dir), "jax_simulations")
@@ -577,7 +617,7 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
       for (beta_token in beta_tokens) {
         for (opportunity_token in opportunity_tokens) {
           for (seed_token in seed_tokens) {
-            base <- sprintf(
+            legacy_base <- sprintf(
               "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_variant_%s_seed_%s_%s_rnn_%s_latent_%s_revisit_maxobs_%s",
               lambda_token,
               alpha_token,
@@ -591,19 +631,35 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
               latent_dim,
               max_observations
             )
+            new_base <- sprintf(
+              "loss_scale_%s_alpha_%s_lambda_%s_opportunity_%s_expansion_%s_variant_%s_seed_%s_%s_rnn_%s_latent_%s_revisit_maxobs_%s",
+              lambda_token,
+              alpha_token,
+              beta_token,
+              opportunity_token,
+              expansion_decision_version,
+              model_variant,
+              seed_token,
+              tree_label,
+              rnn_units,
+              latent_dim,
+              max_observations
+            )
             sigma_num <- suppressWarnings(as.numeric(sigma_value))
-            for (critic_suffix in sampled_lambda_critic_file_suffixes()) {
-              if (is.finite(sigma_num) && abs(sigma_num) < 1e-12) {
-                suffixes <- visited_lstm_suffix_variants(c(
-                  critic_suffix,
-                  paste0("_obs_sigma_0", critic_suffix),
-                  paste0("_obs_sigma_0.0", critic_suffix)
-                ))
-                candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
-              } else {
-                for (sigma_token in sigma_tokens) {
-                  suffixes <- visited_lstm_suffix_variants(paste0("_obs_sigma_", sigma_token, critic_suffix))
+            for (base in c(new_base, legacy_base)) {
+              for (critic_suffix in sampled_lambda_critic_file_suffixes()) {
+                if (is.finite(sigma_num) && abs(sigma_num) < 1e-12) {
+                  suffixes <- visited_lstm_suffix_variants(c(
+                    critic_suffix,
+                    paste0("_obs_sigma_0", critic_suffix),
+                    paste0("_obs_sigma_0.0", critic_suffix)
+                  ))
                   candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
+                } else {
+                  for (sigma_token in sigma_tokens) {
+                    suffixes <- visited_lstm_suffix_variants(paste0("_obs_sigma_", sigma_token, critic_suffix))
+                    candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
+                  }
                 }
               }
             }
@@ -665,7 +721,7 @@ build_file_manifest <- function() {
           local_rows[[length(local_rows) + 1L]] <- data.frame(
             family = family,
             parameter_value = as_num(parameter_value),
-            parameter_label = if (family == "beta") paste0("beta=", num_label(parameter_value)) else paste0("opp=", num_label(parameter_value)),
+            parameter_label = if (family == "beta") paste0("lambda=", num_label(parameter_value)) else paste0("opp=", num_label(parameter_value)),
             beta = as_num(beta_value),
             opportunity = as_num(opportunity_value),
             seed = as_num(seed_value),
@@ -1086,7 +1142,7 @@ stop_kl_sigma_summary <- summarize_metric(
 )
 
 run_folder <- sprintf(
-  "%s_beta_vs_opportunity%s_%s",
+  "%s_memory_lambda_vs_opportunity%s_%s",
   tree_label,
   if (identical(sampled_lambda_critic, "value")) "_vcritic" else "",
   format(Sys.time(), "%Y%m%d_%H%M%S")
@@ -1148,7 +1204,7 @@ panel_center_adj <- function(panel_widths, legend_width = comparison_legend_widt
 format_ticks <- function(x) vapply(x, num_label, character(1))
 
 family_title <- function(family) {
-  if (identical(family, "beta")) "Beta varies (opportunity = 0)" else "Opportunity varies (beta = 1000)"
+  if (identical(family, "beta")) "Memory lambda varies (opportunity = 0)" else "Opportunity varies (fixed memory lambda)"
 }
 
 family_color_values <- function(family, params) {
@@ -1157,7 +1213,7 @@ family_color_values <- function(family, params) {
     return(character())
   }
   palette <- if (identical(family, "beta")) {
-    # Lower beta should be darker.
+    # Lower memory lambda should be darker.
     grDevices::colorRampPalette(c("#00441b", "#238b45", "#74c476"))
   } else {
     # Higher VAE opportunity cost should be darker.
@@ -1327,7 +1383,7 @@ plot_sigma_panel_lines <- function(summary_data, x_col, y_col, file_name, xlab, 
     params <- sort(unique(params[is.finite(params)]))
     for (param in params) {
       legend_items[[length(legend_items) + 1L]] <- list(
-        label = if (identical(family, "beta")) paste0("beta ", num_label(param)) else paste0("opp ", num_label(param)),
+        label = if (identical(family, "beta")) paste0("lambda ", num_label(param)) else paste0("opp ", num_label(param)),
         col = series_color(family, param),
         pch = series_pch(family)
       )
@@ -1488,7 +1544,7 @@ plot_sigma_panel_lines_by_total_timestep <- function(summary_data, x_col, y_col,
     params <- sort(unique(params[is.finite(params)]))
     for (param in params) {
       legend_items[[length(legend_items) + 1L]] <- list(
-        label = if (identical(family, "beta")) paste0("beta ", num_label(param)) else paste0("opp ", num_label(param)),
+        label = if (identical(family, "beta")) paste0("lambda ", num_label(param)) else paste0("opp ", num_label(param)),
         col = series_color(family, param),
         pch = series_pch(family)
       )
@@ -1572,7 +1628,7 @@ plot_sigma_summary <- function(summary_data, y_col, file_name, ylab) {
     params <- sort(unique(params[is.finite(params)]))
     for (param in params) {
       legend_items[[length(legend_items) + 1L]] <- list(
-        label = if (identical(family, "beta")) paste0("beta ", num_label(param)) else paste0("opp ", num_label(param)),
+        label = if (identical(family, "beta")) paste0("lambda ", num_label(param)) else paste0("opp ", num_label(param)),
         col = series_color(family, param),
         pch = series_pch(family)
       )
