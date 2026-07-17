@@ -553,8 +553,10 @@ class EvidenceVAE(nn.Module):
 
     def prior(self, num_observations: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         idx = jnp.clip(num_observations - 1, 0, self.max_observations - 1)
-        mu = self.prior_mu[idx]
-        logvar = self.prior_logvar[idx]
+        prior_mu = jnp.asarray(self.prior_mu)
+        prior_logvar = jnp.asarray(self.prior_logvar)
+        mu = prior_mu[idx]
+        logvar = prior_logvar[idx]
         var = jnp.exp(logvar) + 1e-6
         return mu, logvar, var
 

@@ -134,6 +134,18 @@ selected_revisit_plots_option <- extract_flag_option(
 )
 args <- selected_revisit_plots_option$args
 selected_revisit_plots_only <- selected_revisit_plots_option$found
+node_coverage_aux_coef_option <- extract_named_option(
+  args,
+  c("--node-coverage-aux-coef", "--aux-coef"),
+  default = NULL
+)
+args <- node_coverage_aux_coef_option$args
+node_coverage_aux_epochs_option <- extract_named_option(
+  args,
+  c("--node-coverage-aux-epochs", "--aux-epochs"),
+  default = NULL
+)
+args <- node_coverage_aux_epochs_option$args
 critic_option <- extract_named_option(
   args,
   c("--sampled-lambda-critic", "--critic", "--critic-type", "--critic-mode"),
@@ -160,6 +172,7 @@ normalize_preset_vary <- function(value) {
   key <- tolower(trim_string(value))
   aliases <- c(
     "beta" = "beta", "betas" = "beta", "memory" = "beta", "memory_cost" = "beta",
+    "lambda" = "beta", "lambdas" = "beta", "memory_lambda" = "beta", "memory-lambda" = "beta",
     "opportunity" = "opportunity", "opp" = "opportunity", "opportunity_cost" = "opportunity",
     "gamma" = "opportunity", "time" = "opportunity", "time_cost" = "opportunity"
   )
@@ -170,12 +183,28 @@ normalize_preset_vary <- function(value) {
 }
 
 revisit_preset_file <- file.path(script_dir, "revisit_plot_presets.csv")
-legacy_arg_columns <- c(
-  "beta_arg", "lambda_arg", "alpha_arg", "opportunity_arg",
-  "input_dir", "results_dir", "tree_size", "input_type",
-  "expansion_decision_version", "model_variant", "tree_config",
-  "seed_arg", "rnn_units_arg", "latent_dim_arg", "simulation_source_arg",
-  "max_observations_arg", "sigma_arg", "optimal_dir", "optimal_opportunity_arg"
+revisit_preset_node_coverage_aux_coef <- NULL
+revisit_preset_node_coverage_aux_epochs <- NULL
+preset_arg_column_specs <- list(
+  c("memory_lambda_arg", "beta_arg"),
+  c("loss_scale_arg", "lambda_arg"),
+  c("alpha_arg"),
+  c("opportunity_arg"),
+  c("input_dir"),
+  c("results_dir"),
+  c("tree_size"),
+  c("input_type"),
+  c("expansion_decision_version"),
+  c("model_variant"),
+  c("tree_config"),
+  c("seed_arg"),
+  c("rnn_units_arg"),
+  c("latent_dim_arg"),
+  c("simulation_source_arg"),
+  c("max_observations_arg"),
+  c("sigma_arg"),
+  c("optimal_dir"),
+  c("optimal_opportunity_arg")
 )
 
 read_revisit_presets <- function(path) {
@@ -183,7 +212,14 @@ read_revisit_presets <- function(path) {
     return(data.frame())
   }
   presets <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
-  missing_columns <- setdiff(c("tree", "vary", legacy_arg_columns), names(presets))
+  missing_columns <- c(setdiff(c("tree", "vary"), names(presets)), vapply(
+    preset_arg_column_specs,
+    function(spec) {
+      if (any(spec %in% names(presets))) "" else paste(spec, collapse = " or ")
+    },
+    character(1)
+  ))
+  missing_columns <- missing_columns[nzchar(missing_columns)]
   if (length(missing_columns) > 0L) {
     stop(sprintf(
       "Preset file %s is missing required column(s): %s",
@@ -253,7 +289,17 @@ apply_revisit_preset_args <- function(args) {
   }
 
   preset <- presets[match_idx[[1]], , drop = FALSE]
-  preset_args <- unname(vapply(legacy_arg_columns, function(col) {
+  optional_preset_value <- function(column, default) {
+    if (!column %in% names(preset)) {
+      return(default)
+    }
+    value <- preset[[column]][[1]]
+    if (is.na(value) || !nzchar(trim_string(value))) default else as.character(value)
+  }
+  revisit_preset_node_coverage_aux_coef <<- optional_preset_value("node_coverage_aux_coef_arg", "0")
+  revisit_preset_node_coverage_aux_epochs <<- optional_preset_value("node_coverage_aux_epochs_arg", "0")
+  preset_args <- unname(vapply(preset_arg_column_specs, function(spec) {
+    col <- spec[spec %in% names(preset)][[1]]
     value <- preset[[col]][[1]]
     if (is.na(value)) "" else as.character(value)
   }, character(1)))
@@ -304,6 +350,20 @@ max_observations_arg <- get_arg(16, "10")
 sigma_arg <- get_arg(17, "0")
 optimal_dir <- get_arg(18, "analyses/exp_binary/results/bayesian_revisit_2node")
 optimal_opportunity_arg <- get_arg(19, opportunity_arg)
+node_coverage_aux_coef_arg <- if (!is.null(node_coverage_aux_coef_option$value)) {
+  trim_string(node_coverage_aux_coef_option$value)
+} else if (!is.null(revisit_preset_node_coverage_aux_coef)) {
+  trim_string(revisit_preset_node_coverage_aux_coef)
+} else {
+  "0"
+}
+node_coverage_aux_epochs_arg <- if (!is.null(node_coverage_aux_epochs_option$value)) {
+  trim_string(node_coverage_aux_epochs_option$value)
+} else if (!is.null(revisit_preset_node_coverage_aux_epochs)) {
+  trim_string(revisit_preset_node_coverage_aux_epochs)
+} else {
+  "0"
+}
 
 normalize_expansion_decision_version <- function(version) {
   key <- tolower(trimws(as.character(version)))
@@ -373,6 +433,11 @@ message(sprintf(
   "Sampled-lambda critic file mode: %s%s",
   sampled_lambda_critic,
   if (identical(sampled_lambda_critic, "q")) " (legacy/no _vcritic suffix)" else " (_vcritic suffix)"
+))
+message(sprintf(
+  "Node coverage aux file mode: coef=%s epochs=%s",
+  node_coverage_aux_coef_arg,
+  node_coverage_aux_epochs_arg
 ))
 if (isTRUE(selected_revisit_plots_only)) {
   message("Selected revisit plot mode: writing only the core KL/entropy/reward plots.")
@@ -735,6 +800,41 @@ sampled_lambda_critic_file_suffixes <- function() {
   if (identical(sampled_lambda_critic, "value")) "_vcritic" else c("", "_qcritic")
 }
 
+stop_paid_suffix_variants <- function(suffixes) {
+  unique(c(suffixes, paste0(suffixes, "_stop_paid")))
+}
+
+node_coverage_suffix_variants <- function(suffixes) {
+  coef_num <- suppressWarnings(as.numeric(node_coverage_aux_coef_arg))
+  if (!is.finite(coef_num) || abs(coef_num) < 1e-12) {
+    return(unique(suffixes))
+  }
+  nodecov_suffixes <- as.vector(outer(
+    value_candidates(node_coverage_aux_coef_arg),
+    value_candidates(node_coverage_aux_epochs_arg),
+    function(coef_token, epochs_token) paste0("_nodecov_", coef_token, "_anneal_", epochs_token)
+  ))
+  unique(as.vector(outer(suffixes, nodecov_suffixes, paste0)))
+}
+
+filename_node_coverage_aux_values <- function(path) {
+  matches <- regexec("_nodecov_([^_]+)_anneal_([^_]+)", basename(path), perl = TRUE)
+  pieces <- regmatches(basename(path), matches)[[1]]
+  if (length(pieces) < 3L) {
+    return(c(coef = 0, epochs = 0))
+  }
+  values <- suppressWarnings(as.numeric(pieces[2:3]))
+  values[!is.finite(values)] <- 0
+  stats::setNames(values, c("coef", "epochs"))
+}
+
+node_coverage_aux_file_matches <- function(path) {
+  requested <- suppressWarnings(as.numeric(c(node_coverage_aux_coef_arg, node_coverage_aux_epochs_arg)))
+  requested[!is.finite(requested)] <- 0
+  found <- filename_node_coverage_aux_values(path)
+  all(abs(found - requested) < 1e-8)
+}
+
 visited_lstm_suffix_variants <- function(suffixes) {
   unique(c(suffixes, paste0(suffixes, "_visitedidx")))
 }
@@ -745,6 +845,8 @@ revisit_optional_suffix_regex <- function() {
     "(_klstart_[^_]+_klanneal_[^_]+)?",
     "(_nodecov_[^_]+_anneal_[^_]+)?",
     "(_(?:q|v)critic)?",
+    "(_stop_paid)?",
+    "(_observer_endchoice)?",
     "(_visitedidx)?"
   )
 }
@@ -757,33 +859,46 @@ numeric_file_match <- function(lambda_value, alpha_value, beta_value, opportunit
   }
   files <- list.files(input_dir, full.names = TRUE)
   files <- files[vapply(files, critic_file_matches, logical(1))]
+  files <- files[vapply(files, node_coverage_aux_file_matches, logical(1))]
   for (tree_label_candidate in simulation_tree_file_labels()) {
     for (variant_file_segment in variant_file_segments) {
-      pattern <- paste0(
-        "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
-        "expansion_", expansion_decision_version, "_", variant_file_segment,
-        "seed_", seed, "_", tree_label_candidate,
-        "_revisit_maxobs_([^_]+)",
-        revisit_optional_suffix_regex(),
-        "_", input_type, "\\.csv$"
+      patterns <- c(
+        paste0(
+          "^loss_scale_([^_]+)_alpha_([^_]+)_lambda_([^_]+)_opportunity_([^_]+)_",
+          "expansion_", expansion_decision_version, "_", variant_file_segment,
+          "seed_", seed, "_", tree_label_candidate,
+          "_revisit_maxobs_([^_]+)",
+          revisit_optional_suffix_regex(),
+          "_", input_type, "\\.csv$"
+        ),
+        paste0(
+          "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
+          "expansion_", expansion_decision_version, "_", variant_file_segment,
+          "seed_", seed, "_", tree_label_candidate,
+          "_revisit_maxobs_([^_]+)",
+          revisit_optional_suffix_regex(),
+          "_", input_type, "\\.csv$"
+        )
       )
-      matches <- regexec(pattern, basename(files))
-      pieces <- regmatches(basename(files), matches)
-      for (i in seq_along(pieces)) {
-        if (length(pieces[[i]]) == 0) {
-          next
-        }
-        found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
-        found_maxobs <- suppressWarnings(as.numeric(pieces[[i]][6]))
-        if (any(is.na(found)) || is.na(found_maxobs)) {
-          next
-        }
-        if (
-          all(abs(found - requested) < 1e-8) &&
-            abs(found_maxobs - requested_maxobs) < 1e-8 &&
-            sigma_matches(files[[i]], sigma_value)
-        ) {
-          return(files[[i]])
+      for (pattern in patterns) {
+        matches <- regexec(pattern, basename(files))
+        pieces <- regmatches(basename(files), matches)
+        for (i in seq_along(pieces)) {
+          if (length(pieces[[i]]) == 0) {
+            next
+          }
+          found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
+          found_maxobs <- suppressWarnings(as.numeric(pieces[[i]][6]))
+          if (any(is.na(found)) || is.na(found_maxobs)) {
+            next
+          }
+          if (
+            all(abs(found - requested) < 1e-8) &&
+              abs(found_maxobs - requested_maxobs) < 1e-8 &&
+              sigma_matches(files[[i]], sigma_value)
+          ) {
+            return(files[[i]])
+          }
         }
       }
     }
@@ -807,25 +922,44 @@ simulation_path <- function(lambda_value, alpha_value, beta_value, opportunity_v
                     } else {
                       paste0("_obs_sigma_", sigma_candidate, critic_suffix)
                     }
-                    suffixes <- visited_lstm_suffix_variants(suffixes)
+                    suffixes <- node_coverage_suffix_variants(suffixes)
+                    suffixes <- visited_lstm_suffix_variants(stop_paid_suffix_variants(suffixes))
                     for (suffix in suffixes) {
-                      file_name <- sprintf(
-                        "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%s_revisit_maxobs_%s%s_%s.csv",
-                        lambda_candidate,
-                        alpha_candidate,
-                        beta_candidate,
-                        opportunity_candidate,
-                        expansion_decision_version,
-                        variant_file_segment,
-                        seed,
-                        tree_label_candidate,
-                        maxobs_candidate,
-                        suffix,
-                        input_type
+                      file_names <- c(
+                        sprintf(
+                          "loss_scale_%s_alpha_%s_lambda_%s_opportunity_%s_expansion_%s_%sseed_%d_%s_revisit_maxobs_%s%s_%s.csv",
+                          lambda_candidate,
+                          alpha_candidate,
+                          beta_candidate,
+                          opportunity_candidate,
+                          expansion_decision_version,
+                          variant_file_segment,
+                          seed,
+                          tree_label_candidate,
+                          maxobs_candidate,
+                          suffix,
+                          input_type
+                        ),
+                        sprintf(
+                          "lambda_%s_alpha_%s_beta_%s_opportunity_%s_expansion_%s_%sseed_%d_%s_revisit_maxobs_%s%s_%s.csv",
+                          lambda_candidate,
+                          alpha_candidate,
+                          beta_candidate,
+                          opportunity_candidate,
+                          expansion_decision_version,
+                          variant_file_segment,
+                          seed,
+                          tree_label_candidate,
+                          maxobs_candidate,
+                          suffix,
+                          input_type
+                        )
                       )
-                      file_path <- file.path(input_dir, file_name)
-                      if (file.exists(file_path)) {
-                        return(file_path)
+                      for (file_name in file_names) {
+                        file_path <- file.path(input_dir, file_name)
+                        if (file.exists(file_path)) {
+                          return(file_path)
+                        }
                       }
                     }
                   }
@@ -848,40 +982,53 @@ matching_simulation_files <- function(lambda_value, alpha_value, beta_value, opp
   }
   files <- list.files(input_dir, full.names = TRUE)
   files <- files[vapply(files, critic_file_matches, logical(1))]
+  files <- files[vapply(files, node_coverage_aux_file_matches, logical(1))]
   rows <- list()
   for (tree_label_candidate in simulation_tree_file_labels()) {
     for (variant_file_segment in variant_file_segments) {
-      pattern <- paste0(
-        "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
-        "expansion_", expansion_decision_version, "_", variant_file_segment,
-        "seed_([0-9]+)_", tree_label_candidate,
-        "_revisit_maxobs_([^_]+)",
-        revisit_optional_suffix_regex(),
-        "_", input_type, "\\.csv$"
+      patterns <- c(
+        paste0(
+          "^loss_scale_([^_]+)_alpha_([^_]+)_lambda_([^_]+)_opportunity_([^_]+)_",
+          "expansion_", expansion_decision_version, "_", variant_file_segment,
+          "seed_([0-9]+)_", tree_label_candidate,
+          "_revisit_maxobs_([^_]+)",
+          revisit_optional_suffix_regex(),
+          "_", input_type, "\\.csv$"
+        ),
+        paste0(
+          "^lambda_([^_]+)_alpha_([^_]+)_beta_([^_]+)_opportunity_([^_]+)_",
+          "expansion_", expansion_decision_version, "_", variant_file_segment,
+          "seed_([0-9]+)_", tree_label_candidate,
+          "_revisit_maxobs_([^_]+)",
+          revisit_optional_suffix_regex(),
+          "_", input_type, "\\.csv$"
+        )
       )
-      matches <- regexec(pattern, basename(files))
-      pieces <- regmatches(basename(files), matches)
-      for (i in seq_along(pieces)) {
-        if (length(pieces[[i]]) == 0) {
-          next
-        }
-        found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
-        seed_value <- suppressWarnings(as.integer(pieces[[i]][6]))
-        found_maxobs <- suppressWarnings(as.numeric(pieces[[i]][7]))
-        if (any(is.na(found)) || is.na(seed_value) || is.na(found_maxobs)) {
-          next
-        }
-        if (
-          all(abs(found - requested) < 1e-8) &&
-            abs(found_maxobs - requested_maxobs) < 1e-8 &&
-            sigma_matches(files[[i]], sigma_value)
-        ) {
-          rows[[length(rows) + 1L]] <- data.frame(
-            path = files[[i]],
-            seed = seed_value,
-            sigma = sigma_value,
-            stringsAsFactors = FALSE
-          )
+      for (pattern in patterns) {
+        matches <- regexec(pattern, basename(files))
+        pieces <- regmatches(basename(files), matches)
+        for (i in seq_along(pieces)) {
+          if (length(pieces[[i]]) == 0) {
+            next
+          }
+          found <- suppressWarnings(as.numeric(pieces[[i]][2:5]))
+          seed_value <- suppressWarnings(as.integer(pieces[[i]][6]))
+          found_maxobs <- suppressWarnings(as.numeric(pieces[[i]][7]))
+          if (any(is.na(found)) || is.na(seed_value) || is.na(found_maxobs)) {
+            next
+          }
+          if (
+            all(abs(found - requested) < 1e-8) &&
+              abs(found_maxobs - requested_maxobs) < 1e-8 &&
+              sigma_matches(files[[i]], sigma_value)
+          ) {
+            rows[[length(rows) + 1L]] <- data.frame(
+              path = files[[i]],
+              seed = seed_value,
+              sigma = sigma_value,
+              stringsAsFactors = FALSE
+            )
+          }
         }
       }
     }

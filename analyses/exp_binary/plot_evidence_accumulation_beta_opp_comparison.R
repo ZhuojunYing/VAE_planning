@@ -536,6 +536,29 @@ read_csv_fast <- function(path, select = NULL) {
   dat
 }
 
+rbind_fill <- function(frames) {
+  frames <- frames[!vapply(frames, is.null, logical(1))]
+  frames <- frames[vapply(frames, nrow, integer(1)) > 0L]
+  if (length(frames) == 0L) {
+    return(data.frame())
+  }
+  if (length(frames) == 1L) {
+    return(as.data.frame(frames[[1L]], stringsAsFactors = FALSE))
+  }
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    return(as.data.frame(data.table::rbindlist(frames, fill = TRUE, use.names = TRUE)))
+  }
+  all_cols <- unique(unlist(lapply(frames, names), use.names = FALSE))
+  frames <- lapply(frames, function(dat) {
+    missing_cols <- setdiff(all_cols, names(dat))
+    for (col in missing_cols) {
+      dat[[col]] <- NA
+    }
+    dat[, all_cols, drop = FALSE]
+  })
+  do.call(rbind, unname(frames))
+}
+
 parse_evidence_filename_index <- function(input_dir) {
   files <- list.files(input_dir, pattern = "_evidence\\.csv$", recursive = TRUE, full.names = TRUE)
   files <- files[!grepl("_evidence_summary\\.csv$", basename(files))]
@@ -648,7 +671,7 @@ parse_evidence_filename_index <- function(input_dir) {
   if (length(parsed_list) == 0L) {
     return(data.frame())
   }
-  do.call(rbind, parsed_list)
+  rbind_fill(parsed_list)
 }
 
 filter_numeric_option <- function(index, column, value, label, tol = 1e-8) {
@@ -759,7 +782,7 @@ load_one_evidence_file <- function(path, meta) {
     required_candidates <- c(required_candidates, grep("^cumulative_evidence_t[0-9]+$", columns, value = TRUE))
   }
   timestep_columns <- grep(
-    "^(evidence_sample|cumulative_evidence|policy_continue|policy_choose_a|policy_choose_b|kl_d|action|stop)_t[0-9]+$|^(z_mu|z_logvar|z_sigma|prior_mu|prior_logvar|prior_sigma)_[0-9]+_t[0-9]+$",
+    "^(evidence_sample|cumulative_evidence|policy_continue|policy_choose_a|policy_choose_b|full_policy_continue|full_policy_choose_a|full_policy_choose_b|kl_d|action|stop)_t[0-9]+$|^(z_mu|z_logvar|z_sigma|prior_mu|prior_logvar|prior_sigma)_[0-9]+_t[0-9]+$",
     columns,
     value = TRUE
   )
@@ -1140,7 +1163,7 @@ build_timestep_data <- function(dat) {
   if (piece_i == 0L) {
     return(empty_timestep_data())
   }
-  do.call(rbind, pieces[seq_len(piece_i)])
+  rbind_fill(pieces[seq_len(piece_i)])
 }
 
 empty_response_locked_data <- function() {
@@ -1231,7 +1254,7 @@ build_response_locked_data <- function(dat, max_steps_before_stop = 10L) {
   if (piece_i == 0L) {
     return(empty_response_locked_data())
   }
-  do.call(rbind, pieces[seq_len(piece_i)])
+  rbind_fill(pieces[seq_len(piece_i)])
 }
 
 build_full_policy_target_response_data <- function(dat, max_steps_before_stop = 10L) {
@@ -1298,7 +1321,7 @@ build_full_policy_target_response_data <- function(dat, max_steps_before_stop = 
   if (piece_i == 0L) {
     return(data.frame())
   }
-  do.call(rbind, pieces[seq_len(piece_i)])
+  rbind_fill(pieces[seq_len(piece_i)])
 }
 
 build_response_metric_data <- function(dat) {
@@ -1338,7 +1361,7 @@ build_response_metric_data <- function(dat) {
   if (piece_i == 0L) {
     return(data.frame())
   }
-  do.call(rbind, pieces[seq_len(piece_i)])
+  rbind_fill(pieces[seq_len(piece_i)])
 }
 
 select_response_locked_coherence <- function(values, requested = NULL) {
@@ -1877,7 +1900,7 @@ loaded <- vector("list", nrow(manifest))
 for (i in seq_len(nrow(manifest))) {
   loaded[[i]] <- load_one_evidence_file(manifest$file[[i]], manifest[i, , drop = FALSE])
 }
-trial_data <- do.call(rbind, loaded)
+trial_data <- rbind_fill(loaded)
 trial_data$family <- ifelse(parameter_equal(trial_data$opportunity, fixed_opp), "beta", "opportunity")
 trial_data$parameter_value <- ifelse(trial_data$family == "beta", trial_data$memory_lambda, trial_data$opportunity)
 trial_data$parameter_label <- ifelse(
@@ -2730,6 +2753,8 @@ plot_coherence_overlay_panel <- function(summary_data, family, param, x_lim, y_l
                                          coherence_values, coherence_colors,
                                          xlab, ylab, main = "",
                                          x_col = "relative_timestep",
+                                         y_col = "value",
+                                         sem_col = NULL,
                                          vline = 0,
                                          hline = 0) {
   panel_data <- summary_data[
@@ -2759,20 +2784,32 @@ plot_coherence_overlay_panel <- function(summary_data, family, param, x_lim, y_l
   if (!is.null(vline)) {
     abline(v = vline, col = "grey55", lty = 2, lwd = 0.8)
   }
+  if (!x_col %in% names(panel_data) || !y_col %in% names(panel_data)) {
+    box()
+    return(invisible(NULL))
+  }
+  if (is.null(sem_col)) {
+    sem_col <- paste0(y_col, "_sem")
+  }
   for (coherence_value in coherence_values) {
     line_data <- panel_data[parameter_equal(panel_data$coherence, coherence_value), , drop = FALSE]
     if (nrow(line_data) == 0L) next
     line_data <- line_data[order(as_num(line_data[[x_col]])), , drop = FALSE]
     x <- as_num(line_data[[x_col]])
-    y <- as_num(line_data$value)
+    y <- as_num(line_data[[y_col]])
+    keep <- is.finite(x) & is.finite(y)
+    if (!any(keep)) next
+    x <- x[keep]
+    y <- y[keep]
     col <- coherence_colors[[as.character(coherence_value)]]
     lines(x, y, col = col, lwd = 1.3)
     points(x, y, col = col, pch = 16, cex = 0.65)
-    if ("value_sem" %in% names(line_data)) {
-      draw_error_bars(x, y, line_data$value_sem, col)
+    if (sem_col %in% names(line_data)) {
+      draw_error_bars(x, y, line_data[[sem_col]][keep], col)
     }
   }
   box()
+  invisible(NULL)
 }
 
 save_response_locked_coherence_overlay_plots <- function() {
@@ -2915,7 +2952,10 @@ save_response_locked_target_probability_overlay_plots <- function() {
   if (nrow(full_policy_target_response_summary) == 0L ||
       length(delta_coherence_values) == 0L ||
       !"coherence" %in% names(full_policy_target_response_summary)) {
-    message("Skipping response-locked target-choice probability overlay: missing full_policy_* rows.")
+    message(
+      "Skipping response-locked target-choice probability overlay: missing full_policy_* rows. ",
+      "Regenerate evidence simulation CSVs with the current simulator so full_policy_choose_a/b_t* columns are written."
+    )
     return(invisible(NULL))
   }
   metric_summary <- full_policy_target_response_summary
@@ -3010,6 +3050,7 @@ save_response_locked_target_probability_overlay_plots <- function() {
           xlab = "Steps relative\nto stopping",
           ylab = "P(target | choose)",
           main = sprintf("lambda = %s", num_label(beta_params[[row_i]])),
+          y_col = "p_target_given_choice",
           hline = 0.5
         )
       } else {
@@ -3028,6 +3069,7 @@ save_response_locked_target_probability_overlay_plots <- function() {
           xlab = "Steps relative\nto stopping",
           ylab = "P(target | choose)",
           main = sprintf("opp = %s", num_label(opp_params[[row_i]])),
+          y_col = "p_target_given_choice",
           hline = 0.5
         )
       } else {

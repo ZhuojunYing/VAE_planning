@@ -29,6 +29,12 @@ usage <- function() {
     "  --seeds LIST                Override seed values.\n",
     "  --output-root DIR           Override output root. Default is preset results_dir.\n",
     "  --input-dir DIR             Override simulation input dir.\n",
+    "  --memory-node-coverage-aux-coef VALUE\n",
+    "  --memory-node-coverage-aux-epochs VALUE\n",
+    "                              Override node coverage aux settings for the memory-lambda-vary family.\n",
+    "  --opportunity-node-coverage-aux-coef VALUE\n",
+    "  --opportunity-node-coverage-aux-epochs VALUE\n",
+    "                              Override node coverage aux settings for the opportunity-vary family.\n",
     "  --sampled-lambda-critic q|value\n",
     "                              Simulation filename mode. q is default and matches legacy files without _vcritic.\n",
     "                              value/v matches files with the _vcritic suffix. Aliases: --critic, --critic-type.\n",
@@ -146,6 +152,30 @@ output_root_option <- extract_named_option(args, c("--output-root", "--results-d
 args <- output_root_option$args
 input_dir_option <- extract_named_option(args, c("--input-dir"), default = NULL)
 args <- input_dir_option$args
+memory_node_coverage_aux_coef_option <- extract_named_option(
+  args,
+  c("--memory-node-coverage-aux-coef", "--memory-aux-coef", "--beta-node-coverage-aux-coef", "--beta-aux-coef"),
+  default = NULL
+)
+args <- memory_node_coverage_aux_coef_option$args
+memory_node_coverage_aux_epochs_option <- extract_named_option(
+  args,
+  c("--memory-node-coverage-aux-epochs", "--memory-aux-epochs", "--beta-node-coverage-aux-epochs", "--beta-aux-epochs"),
+  default = NULL
+)
+args <- memory_node_coverage_aux_epochs_option$args
+opportunity_node_coverage_aux_coef_option <- extract_named_option(
+  args,
+  c("--opportunity-node-coverage-aux-coef", "--opportunity-aux-coef", "--opp-node-coverage-aux-coef", "--opp-aux-coef"),
+  default = NULL
+)
+args <- opportunity_node_coverage_aux_coef_option$args
+opportunity_node_coverage_aux_epochs_option <- extract_named_option(
+  args,
+  c("--opportunity-node-coverage-aux-epochs", "--opportunity-aux-epochs", "--opp-node-coverage-aux-epochs", "--opp-aux-epochs"),
+  default = NULL
+)
+args <- opportunity_node_coverage_aux_epochs_option$args
 critic_option <- extract_named_option(
   args,
   c("--sampled-lambda-critic", "--critic", "--critic-type", "--critic-mode"),
@@ -177,6 +207,22 @@ preset_scalar <- function(row, new_name, legacy_name = NULL) {
     return(trim_string(row[[legacy_name]][[1]]))
   }
   stop(sprintf("Preset is missing required column %s.", new_name))
+}
+
+preset_scalar_or <- function(row, new_name, legacy_name = NULL, default = "0") {
+  if (new_name %in% names(row)) {
+    value <- trim_string(row[[new_name]][[1]])
+    if (!is.na(value) && nzchar(value)) {
+      return(value)
+    }
+  }
+  if (!is.null(legacy_name) && legacy_name %in% names(row)) {
+    value <- trim_string(row[[legacy_name]][[1]])
+    if (!is.na(value) && nzchar(value)) {
+      return(value)
+    }
+  }
+  default
 }
 
 num_tokens <- function(value) {
@@ -214,6 +260,23 @@ sampled_lambda_critic_file_suffixes <- function() {
   if (identical(sampled_lambda_critic, "value")) "_vcritic" else c("", "_qcritic")
 }
 
+stop_paid_suffix_variants <- function(suffixes) {
+  unique(c(suffixes, paste0(suffixes, "_stop_paid")))
+}
+
+node_coverage_suffix_variants <- function(suffixes, coef_value, epochs_value) {
+  coef_num <- suppressWarnings(as.numeric(coef_value))
+  if (!is.finite(coef_num) || abs(coef_num) < 1e-12) {
+    return(unique(suffixes))
+  }
+  nodecov_suffixes <- as.vector(outer(
+    num_tokens(coef_value),
+    num_tokens(epochs_value),
+    function(coef_token, epochs_token) paste0("_nodecov_", coef_token, "_anneal_", epochs_token)
+  ))
+  unique(as.vector(outer(suffixes, nodecov_suffixes, paste0)))
+}
+
 visited_lstm_suffix_variants <- function(suffixes) {
   unique(c(suffixes, paste0(suffixes, "_visitedidx")))
 }
@@ -230,6 +293,7 @@ parse_revisit_filename_index <- function() {
     "_opportunity_([^_]+)_expansion_([^_]+)_variant_([^_]+)_seed_([0-9]+)",
     "_(.+)_rnn_([^_]+)_latent_([^_]+)_revisit_maxobs_([0-9]+)",
     "(?:_obs_sigma_([^_]+))?(?:_klstart_[^_]+_klanneal_[^_]+)?",
+    "(?:_nodecov_([^_]+)_anneal_([^_]+))?",
     "(_(?:q|v)critic)?(?:_stop_paid)?(?:_observer_endchoice)?(?:_visitedidx)?_uniform\\.csv$"
   )
   patterns <- list(
@@ -252,7 +316,13 @@ parse_revisit_filename_index <- function() {
     }
     sigma_token <- part_at(13L)
     sigma_token[!nzchar(sigma_token)] <- "0"
-    critic_token <- part_at(14L)
+    nodecov_coef_token <- part_at(14L)
+    nodecov_epochs_token <- part_at(15L)
+    nodecov_coef <- suppressWarnings(as.numeric(nodecov_coef_token))
+    nodecov_epochs <- suppressWarnings(as.numeric(nodecov_epochs_token))
+    nodecov_coef[!is.finite(nodecov_coef)] <- 0
+    nodecov_epochs[!is.finite(nodecov_epochs)] <- 0
+    critic_token <- part_at(16L)
     data.frame(
       file = local_files,
       lambda = suppressWarnings(as.numeric(part_at(2L))),       # legacy internal: loss_scale
@@ -269,6 +339,8 @@ parse_revisit_filename_index <- function() {
       latent_dim = part_at(11L),
       max_observations = part_at(12L),
       sigma = suppressWarnings(as.numeric(sigma_token)),
+      node_coverage_aux_coef = nodecov_coef,
+      node_coverage_aux_epochs = nodecov_epochs,
       critic = ifelse(grepl("vcritic", critic_token, fixed = TRUE), "value", "q"),
       filename_style = style,
       stringsAsFactors = FALSE
@@ -383,6 +455,26 @@ beta_values <- if (!is.null(beta_values_option$value)) {
 opportunity_values <- if (!is.null(opportunity_values_option$value)) parse_csv_values(opportunity_values_option$value) else parse_csv_values(opp_row$opportunity_arg[[1]])
 beta_family_opportunity <- trim_string(beta_row$opportunity_arg[[1]])
 opportunity_family_beta <- preset_scalar(opp_row, "memory_lambda_arg", "beta_arg")
+beta_family_node_coverage_aux_coef <- if (!is.null(memory_node_coverage_aux_coef_option$value)) {
+  trim_string(memory_node_coverage_aux_coef_option$value)
+} else {
+  preset_scalar_or(beta_row, "node_coverage_aux_coef_arg", default = "0")
+}
+beta_family_node_coverage_aux_epochs <- if (!is.null(memory_node_coverage_aux_epochs_option$value)) {
+  trim_string(memory_node_coverage_aux_epochs_option$value)
+} else {
+  preset_scalar_or(beta_row, "node_coverage_aux_epochs_arg", default = "0")
+}
+opportunity_family_node_coverage_aux_coef <- if (!is.null(opportunity_node_coverage_aux_coef_option$value)) {
+  trim_string(opportunity_node_coverage_aux_coef_option$value)
+} else {
+  preset_scalar_or(opp_row, "node_coverage_aux_coef_arg", default = "0")
+}
+opportunity_family_node_coverage_aux_epochs <- if (!is.null(opportunity_node_coverage_aux_epochs_option$value)) {
+  trim_string(opportunity_node_coverage_aux_epochs_option$value)
+} else {
+  preset_scalar_or(opp_row, "node_coverage_aux_epochs_arg", default = "0")
+}
 base_input_dir <- if (!is.null(input_dir_option$value)) input_dir_option$value else shared$input_dir[[1]]
 input_dir <- if (tolower(source_arg) == "jax" && basename(base_input_dir) == "simulations") {
   file.path(dirname(base_input_dir), "jax_simulations")
@@ -398,6 +490,13 @@ message(sprintf(
   "Sampled-lambda critic file mode: %s%s",
   sampled_lambda_critic,
   if (identical(sampled_lambda_critic, "q")) " (legacy/no _vcritic suffix)" else " (_vcritic suffix)"
+))
+message(sprintf(
+  "Node coverage aux file mode: memory-lambda family coef=%s epochs=%s; opportunity family coef=%s epochs=%s",
+  beta_family_node_coverage_aux_coef,
+  beta_family_node_coverage_aux_epochs,
+  opportunity_family_node_coverage_aux_coef,
+  opportunity_family_node_coverage_aux_epochs
 ))
 
 tree_label <- if (tree_config %in% c("", "default")) {
@@ -604,7 +703,16 @@ terminal_binary_choice_entropy_for_timestep <- function(trial_data, timestep, ti
   entropy
 }
 
-find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_value, seed_value, sigma_value) {
+find_sim_file <- function(
+  lambda_value,
+  alpha_value,
+  beta_value,
+  opportunity_value,
+  seed_value,
+  sigma_value,
+  node_coverage_aux_coef = "0",
+  node_coverage_aux_epochs = "0"
+) {
   lambda_tokens <- num_tokens(lambda_value)
   alpha_tokens <- num_tokens(alpha_value)
   beta_tokens <- num_tokens(beta_value)
@@ -649,15 +757,27 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
             for (base in c(new_base, legacy_base)) {
               for (critic_suffix in sampled_lambda_critic_file_suffixes()) {
                 if (is.finite(sigma_num) && abs(sigma_num) < 1e-12) {
-                  suffixes <- visited_lstm_suffix_variants(c(
+                  suffixes <- c(
                     critic_suffix,
                     paste0("_obs_sigma_0", critic_suffix),
                     paste0("_obs_sigma_0.0", critic_suffix)
-                  ))
+                  )
+                  suffixes <- node_coverage_suffix_variants(
+                    suffixes,
+                    node_coverage_aux_coef,
+                    node_coverage_aux_epochs
+                  )
+                  suffixes <- visited_lstm_suffix_variants(stop_paid_suffix_variants(suffixes))
                   candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
                 } else {
                   for (sigma_token in sigma_tokens) {
-                    suffixes <- visited_lstm_suffix_variants(paste0("_obs_sigma_", sigma_token, critic_suffix))
+                    suffixes <- paste0("_obs_sigma_", sigma_token, critic_suffix)
+                    suffixes <- node_coverage_suffix_variants(
+                      suffixes,
+                      node_coverage_aux_coef,
+                      node_coverage_aux_epochs
+                    )
+                    suffixes <- visited_lstm_suffix_variants(stop_paid_suffix_variants(suffixes))
                     candidates <- c(candidates, file.path(input_dir, paste0(base, suffixes, "_", input_type, ".csv")))
                   }
                 }
@@ -681,6 +801,14 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
     opportunity_num <- as_num(opportunity_value)
     seed_num <- as_num(seed_value)
     sigma_num <- as_num(sigma_value)
+    nodecov_coef_num <- as_num(node_coverage_aux_coef)
+    nodecov_epochs_num <- as_num(node_coverage_aux_epochs)
+    if (!is.finite(nodecov_coef_num)) {
+      nodecov_coef_num <- 0
+    }
+    if (!is.finite(nodecov_epochs_num)) {
+      nodecov_epochs_num <- 0
+    }
     tol <- 1e-8
     matches <- is.finite(index$lambda) & abs(index$lambda - lambda_num) <= tol &
       is.finite(index$alpha) & abs(index$alpha - alpha_num) <= tol &
@@ -694,6 +822,8 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
       index$rnn_units == rnn_units &
       index$latent_dim == latent_dim &
       index$max_observations == max_observations &
+      is.finite(index$node_coverage_aux_coef) & abs(index$node_coverage_aux_coef - nodecov_coef_num) <= tol &
+      is.finite(index$node_coverage_aux_epochs) & abs(index$node_coverage_aux_epochs - nodecov_epochs_num) <= tol &
       index$critic == sampled_lambda_critic
     if (any(matches)) {
       return(index$file[which(matches)[[1L]]])
@@ -705,7 +835,14 @@ find_sim_file <- function(lambda_value, alpha_value, beta_value, opportunity_val
 build_file_manifest <- function() {
   rows <- list()
   missing <- 0L
-  add_family <- function(family, parameter_values, beta_value_fun, opportunity_value_fun) {
+  add_family <- function(
+    family,
+    parameter_values,
+    beta_value_fun,
+    opportunity_value_fun,
+    node_coverage_aux_coef,
+    node_coverage_aux_epochs
+  ) {
     local_rows <- list()
     local_missing <- 0L
     for (parameter_value in parameter_values) {
@@ -713,7 +850,16 @@ build_file_manifest <- function() {
       opportunity_value <- opportunity_value_fun(parameter_value)
       for (seed_value in seed_values) {
         for (sigma_value in sigma_values) {
-          path <- find_sim_file(lambda_arg, alpha_arg, beta_value, opportunity_value, seed_value, sigma_value)
+          path <- find_sim_file(
+            lambda_arg,
+            alpha_arg,
+            beta_value,
+            opportunity_value,
+            seed_value,
+            sigma_value,
+            node_coverage_aux_coef,
+            node_coverage_aux_epochs
+          )
           if (is.na(path)) {
             local_missing <- local_missing + 1L
             next
@@ -724,6 +870,8 @@ build_file_manifest <- function() {
             parameter_label = if (family == "beta") paste0("lambda=", num_label(parameter_value)) else paste0("opp=", num_label(parameter_value)),
             beta = as_num(beta_value),
             opportunity = as_num(opportunity_value),
+            node_coverage_aux_coef = as_num(node_coverage_aux_coef),
+            node_coverage_aux_epochs = as_num(node_coverage_aux_epochs),
             seed = as_num(seed_value),
             sigma = as_num(sigma_value),
             file = path,
@@ -738,13 +886,17 @@ build_file_manifest <- function() {
     "beta",
     beta_values,
     beta_value_fun = function(parameter_value) parameter_value,
-    opportunity_value_fun = function(parameter_value) beta_family_opportunity
+    opportunity_value_fun = function(parameter_value) beta_family_opportunity,
+    node_coverage_aux_coef = beta_family_node_coverage_aux_coef,
+    node_coverage_aux_epochs = beta_family_node_coverage_aux_epochs
   )
   opp_manifest <- add_family(
     "opportunity",
     opportunity_values,
     beta_value_fun = function(parameter_value) opportunity_family_beta,
-    opportunity_value_fun = function(parameter_value) parameter_value
+    opportunity_value_fun = function(parameter_value) parameter_value,
+    node_coverage_aux_coef = opportunity_family_node_coverage_aux_coef,
+    node_coverage_aux_epochs = opportunity_family_node_coverage_aux_epochs
   )
   rows <- c(beta_manifest$rows, opp_manifest$rows)
   missing <- beta_manifest$missing + opp_manifest$missing
